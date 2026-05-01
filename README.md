@@ -15,13 +15,15 @@ correctly under modern Windows clients.
 | **Set up** the dev/test environment | [`docs/SETUP.md`](docs/SETUP.md) |
 | **Author or run** lab scenarios | [`docs/LAB-TESTING.md`](docs/LAB-TESTING.md) |
 | Understand the **original sketch** that drove the design | [`docs/sketch-smb1-smb3-proxy.sh`](docs/sketch-smb1-smb3-proxy.sh) |
-| Understand the **three-repo split** | [`../samba-addc-appliance/docs/REPO-SPLIT.md`](../samba-addc-appliance/docs/REPO-SPLIT.md) |
+| Understand the **sibling-repo split** | [`../dev-commons/REPO-SPLIT.md`](../dev-commons/REPO-SPLIT.md) |
+| Look up **shared coding/docs/test conventions** | [`../dev-commons/STYLE.md`](../dev-commons/STYLE.md) |
 
 The proxy appliance is exercised against the same Windows Server 2025
 forest that the [`samba-addc-appliance`](../samba-addc-appliance/) sibling
-joins. The lab is built from four sibling repositories living next to each
+joins. The lab is built from five sibling repositories living next to each
 other on disk:
 
+- [`dev-commons`](../dev-commons/) — cross-cutting docs, templates, tooling
 - [`lab-kit`](../lab-kit/) — reusable appliance lab orchestration
 - [`lab-router`](../lab-router/) — simple reusable lab router VM
 - [`samba-addc-appliance`](../samba-addc-appliance/) — Samba AD DC member

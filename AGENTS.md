@@ -5,6 +5,12 @@ repository. It should be safe for Claude Code, Codex, local agents, or other
 tools to read. Vendor-specific notes are explicitly marked and should not be
 treated as general project requirements.
 
+**General conventions, project narrative, and shared decisions live in
+the sibling repo [`../dev-commons/`](../dev-commons/).** Read at least
+[`../dev-commons/CONTEXT.md`](../dev-commons/CONTEXT.md) and
+[`../dev-commons/STYLE.md`](../dev-commons/STYLE.md) before substantive
+work here. This file covers what's specific to `smb-proxy-appliance`.
+
 ## Project Purpose
 
 Build and test an **SMB1↔SMB3 protocol-version proxy appliance** on Debian
