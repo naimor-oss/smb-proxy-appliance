@@ -48,6 +48,7 @@ DOMAIN_STATIC_MAC="${DOMAIN_STATIC_MAC:-00155D0A0A1E}"
 LEGACY_STATIC_MAC="${LEGACY_STATIC_MAC:-}"
 
 FORCE=0
+DEPLOY_ONLY=0
 
 usage() {
     cat <<USAGE
@@ -64,6 +65,12 @@ Flags:
                          (default: $DOMAIN)
   -k, --pubkey FILE      SSH public key (default: $SSH_PUBKEY)
   -f, --force            Remove the VM and its diff VHDX first if present
+      --deploy-only      Stop after the host-agnostic 'deploy-master'
+                         snapshot. Skip the firstboot pass and the
+                         'golden-image' snapshot — useful when the
+                         build's only purpose is to produce dist
+                         artifacts (lab/export-deploy-master.sh) for
+                         testing in a different hypervisor environment.
   -h, --help             Show this
 
 Environment overrides: HV_HOST, HV_USER, ISO_DIR_MAC, GOLDEN_CHECKPOINT,
@@ -81,6 +88,7 @@ while [[ $# -gt 0 ]]; do
         -d|--domain)     DOMAIN="$2";            shift 2 ;;
         -k|--pubkey)     SSH_PUBKEY="$2";        shift 2 ;;
         -f|--force)      FORCE=1; shift ;;
+        --deploy-only)   DEPLOY_ONLY=1; shift ;;
         -h|--help)       usage; exit 0 ;;
         *) echo "unknown arg: $1" >&2; usage >&2; exit 2 ;;
     esac
@@ -178,6 +186,17 @@ fi
 
 ssh_host "Checkpoint-VM -Name '$VM_NAME' -SnapshotName 'deploy-master'"
 say "checkpoint 'deploy-master' created (host-agnostic, pre-firstboot)"
+
+if [[ $DEPLOY_ONLY -eq 1 ]]; then
+    echo
+    echo "--deploy-only requested: stopping after deploy-master."
+    echo "Snapshots on '$VM_NAME':"
+    echo "  deploy-master   host-agnostic, ship-this-one"
+    echo
+    echo "Next:"
+    echo "  lab/export-deploy-master.sh   # produce dist artifacts"
+    exit 0
+fi
 
 step "8. boot once to fire smbproxy-firstboot (Hyper-V tailoring)"
 ssh_host "Start-VM -Name '$VM_NAME'"
