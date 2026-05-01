@@ -1507,6 +1507,151 @@ MOTDEOF
 chmod +x /etc/update-motd.d/15-smbproxy-net-status
 
 #===============================================================================
+# 21B. SR-IOV VF KERNEL-PANIC WORKAROUND (ixgbevf)
+#===============================================================================
+# FIXME(remove-when-fixed): Defensive blacklist of `ixgbevf` (Intel 10G VF
+# driver). Background: Linux 6.12 (Debian trixie kernel 6.12.74) panics
+# very early in `ixgbevf_negotiate_api()` on at least one combination of
+# host firmware ("Hyper-V UEFI Release v4.1 09/25/2025") and Intel
+# 82599/X540/X550 PFs when Hyper-V passes the SR-IOV virtual function
+# through to the guest. Symptom on the affected host:
+#
+#   RIP: 0010:0x0
+#   Call Trace: ixgbevf_negotiate_api+0x66 -> ixgbevf_probe+0x2ff ->
+#               local_pci_probe -> work_for_cpu_fn
+#   Kernel panic - not syncing: Fatal exception in interrupt
+#
+# Outcome: VM never finishes booting on hosts that expose the VF.
+#
+# This appliance does not need raw NIC passthrough — the synthetic
+# `hv_netvsc` (or virtio-net on KVM, vmxnet3 on VMware) NIC is the
+# expected datapath, and SMB1<->SMB3 proxy throughput is nowhere near
+# what would justify SR-IOV. Blacklisting `ixgbevf` is therefore safe
+# and the operator-side workaround (set IovWeight 0 on the Hyper-V
+# vNIC) becomes optional rather than mandatory.
+#
+# How to remove or improve this in the future:
+#   1. When Debian ships a kernel where ixgbevf has been verified
+#      against this firmware combination (track LKML / Debian
+#      kernel-team bug for ixgbevf NULL-deref in negotiate_api),
+#      drop /etc/modprobe.d/smbproxy-blacklist-ixgbevf.conf and
+#      `update-initramfs -u`.
+#   2. If the appliance ever genuinely needs SR-IOV passthrough for
+#      throughput (it shouldn't — the WS2008 backend is SMB1, capped
+#      at single-digit Gb/s practically), narrow the blacklist to a
+#      modprobe.d match against the specific buggy device-id combo
+#      instead of the whole driver.
+#   3. Replace this defensive workaround with a Debian backport of
+#      the upstream fix once one lands. Ideally the appliance should
+#      not need to know about device-driver bugs.
+log "Installing SR-IOV VF kernel-panic workaround (ixgbevf blacklist)..."
+cat > /etc/modprobe.d/smbproxy-blacklist-ixgbevf.conf <<'BLEOF'
+# FIXME(remove-when-fixed): see prepare-image.sh §21B for the full
+# story. Short version: Linux 6.12 + Hyper-V UEFI v4.1 09/25/2025 +
+# Intel 82599/X540/X550 PF panics in ixgbevf_negotiate_api when the
+# SR-IOV VF is passed through. Appliance does not need passthrough —
+# synthetic NIC is fine. Remove this file + `update-initramfs -u`
+# once the kernel/firmware combo is verified working again.
+blacklist ixgbevf
+BLEOF
+chmod 644 /etc/modprobe.d/smbproxy-blacklist-ixgbevf.conf
+
+# Rebuild initramfs so the blacklist takes effect even if the panic
+# would have happened before / during the initramfs phase. Fail soft —
+# `update-initramfs` can warn about missing firmware on a freshly
+# prepared image; that's not fatal here.
+update-initramfs -u || log "  warning: update-initramfs returned non-zero (continuing)"
+
+# Runtime detector: walks PCI to spot any Ethernet device the kernel
+# left unbound (most often: this blacklist suppressing the SR-IOV VF
+# the host is offering). Used by the MOTD warning below and safe to
+# call from anywhere — read-only sysfs walk, no kernel calls.
+log "Installing smbproxy-detect-unbound-nic helper..."
+cat > /usr/local/sbin/smbproxy-detect-unbound-nic <<'DETEOF'
+#!/usr/bin/env bash
+# smbproxy-detect-unbound-nic — print one line per unbound Ethernet
+# PCI device. Format: "BDF VENDOR:DEVICE [vendor-name] [device-name]".
+# Exit 0 with empty output if everything is bound.
+#
+# Used to surface the ixgbevf-blacklist-suppressing-an-active-VF case
+# in the MOTD without re-implementing the detection logic in the MOTD
+# generator. See prepare-image.sh §21B for the why.
+set -u
+PATH=/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
+shopt -s nullglob
+for d in /sys/bus/pci/devices/*; do
+    class=$(cat "$d/class" 2>/dev/null || echo)
+    # Class 0x020000 = Ethernet controller. Match the high two bytes.
+    [[ "${class:0:6}" == "0x0200" ]] || continue
+    [[ -e "$d/driver" ]] && continue          # already bound; nothing to flag
+    bdf=$(basename "$d")
+    vid=$(cat "$d/vendor" 2>/dev/null | sed 's/^0x//')
+    did=$(cat "$d/device" 2>/dev/null | sed 's/^0x//')
+    name=""
+    if command -v lspci >/dev/null 2>&1; then
+        name=$(lspci -s "$bdf" 2>/dev/null | sed 's/^[^ ]* //')
+    fi
+    printf '%s %s:%s %s\n' "$bdf" "$vid" "$did" "${name:-(unknown)}"
+done
+DETEOF
+chmod +x /usr/local/sbin/smbproxy-detect-unbound-nic
+
+# MOTD addition: only renders when the detector returns lines. The
+# 16-* prefix puts it right under the 15-* network status block.
+log "Installing smbproxy-vf-warning MOTD generator..."
+cat > /etc/update-motd.d/16-smbproxy-vf-warning <<'MOTDEOF'
+#!/bin/sh
+# Surface the SR-IOV-VF-blacklisted-but-active-on-host case in the
+# login banner. Silent when no unbound NIC is present.
+unbound=$(/usr/local/sbin/smbproxy-detect-unbound-nic 2>/dev/null)
+[ -z "$unbound" ] && exit 0
+
+# ANSI red for the banner border so it's visually distinct from the
+# normal status block. Falls back to plain text on terminals without
+# color, which is fine — the message body is still readable.
+RED=$(printf '\033[1;31m'); RST=$(printf '\033[0m')
+
+printf '\n'
+printf '%s======================================================================%s\n' "$RED" "$RST"
+printf '%s  WARNING: SR-IOV / passthrough NIC detected but unbound%s\n' "$RED" "$RST"
+printf '%s======================================================================%s\n' "$RED" "$RST"
+printf '  This appliance has an Ethernet PCI device that the kernel did NOT\n'
+printf '  bind a driver to. The most common cause is that the hypervisor is\n'
+printf '  exposing an SR-IOV virtual function (typically Intel ixgbevf) to\n'
+printf '  this VM, and the appliance has the matching driver blacklisted as\n'
+printf '  a workaround for an early-boot kernel panic on certain Hyper-V\n'
+printf '  UEFI firmware revisions.\n'
+printf '\n'
+printf '  Unbound device(s):\n'
+printf '%s\n' "$unbound" | sed 's/^/    /'
+printf '\n'
+printf '  Why it matters:\n'
+printf '    - The synthetic vNIC (hv_netvsc / virtio-net / vmxnet3) is in\n'
+printf '      use instead. SMB1<->SMB3 proxy traffic operates normally.\n'
+printf '    - SR-IOV optimizations and the dedicated bandwidth they would\n'
+printf '      have provided are NOT in effect.\n'
+printf '    - Without the blacklist, this VM would kernel-panic at boot on\n'
+printf '      affected hosts.\n'
+printf '\n'
+printf '  How to silence this warning:\n'
+printf '    Hyper-V (recommended):\n'
+printf '      Set-VMNetworkAdapter -VMName <name> -IovWeight 0\n'
+printf '      then reboot the VM. The PCI device disappears and this\n'
+printf '      banner clears automatically on next login.\n'
+printf '    Other hypervisors:\n'
+printf '      detach the SR-IOV VF / disable passthrough on the vNIC.\n'
+printf '\n'
+printf '  Background and forward path:\n'
+printf '    /etc/modprobe.d/smbproxy-blacklist-ixgbevf.conf and the\n'
+printf '    "21B. SR-IOV VF KERNEL-PANIC WORKAROUND" section of the\n'
+printf '    appliance source describe the bug and the conditions under\n'
+printf '    which the blacklist can be removed.\n'
+printf '%s======================================================================%s\n' "$RED" "$RST"
+printf '\n'
+MOTDEOF
+chmod +x /etc/update-motd.d/16-smbproxy-vf-warning
+
+#===============================================================================
 # 22. FINAL CLEANUP
 #===============================================================================
 log "Final cleanup..."
