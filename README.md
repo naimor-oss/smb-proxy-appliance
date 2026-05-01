@@ -42,6 +42,12 @@ other on disk:
 | `lab/export-deploy-master.sh` | Release-time export: Hyper-V snapshot → vhdx + qcow2 + vmdk + ova + SHA256SUMS. |
 | `lab/hyperv/New-SmbProxyTestVM.ps1` | Creates the dual-NIC proxy VM (Lab-NAT + LegacyZone). |
 | `lab/scenarios/smoke-prepared-image.sh` | Verifies a freshly reverted `golden-image` is a clean, unprovisioned proxy base. |
+| `lab/scenarios/bootstrap-network.sh` | Headless equivalent of `smbproxy-init`'s NIC-roles + legacy-IP step. Used as a `pre_hook` by every downstream scenario. |
+| `lab/scenarios/join-domain.sh` | Joins `lab.test` via `smbproxy-sconfig --join-domain`. AD cleanup respects `--no-cleanup` / `--dry-cleanup`. |
+| `lab/scenarios/backend-mount.sh` | Mounts the WS2008 SP2 share via `--configure-backend`. Reads `SC_BACKEND_PASS` from `lab/backend-creds.env` (gitignored). |
+| `lab/scenarios/frontend-share.sh` | Composes bootstrap + join + backend, then `--configure-frontend` + `--apply-firewall`. Verifies SMB3 + Kerberos access. |
+| `lab/scenarios/end-to-end.sh` | Single-shot release-gate test. Optional WS2008 read/write roundtrip via `SC_WRITE_ROUNDTRIP=1`. |
+| `lab/backend-creds.env.example` | Template for the gitignored `lab/backend-creds.env` (set `SC_BACKEND_PASS` for backend / frontend / end-to-end scenarios). |
 | `lab/templates/cloud-init/` | NoCloud seed templates (meta-data, network-config matching by domain MAC, user-data with operator pubkeys). |
 | `lab/keys/` | Operator SSH pubkeys baked into the image at build time. See `lab/keys/README.md`. |
 | `docs/SETUP.md` | Mac + Hyper-V environment setup, LegacyZone vSwitch, dnsmasq reservation. |

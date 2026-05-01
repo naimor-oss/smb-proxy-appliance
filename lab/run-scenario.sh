@@ -8,9 +8,13 @@
 #     scenarios/<name>.sh
 #   - set LAB_ENV to lab/proxy.env
 #   - forward flags to the lab-kit runner
+#   - translate proxy-specific flags (--no-cleanup, --dry-cleanup,
+#     --backend-creds FILE) into env vars that scenarios read in
+#     their pre_hook
 #
 # All the actual stage/reset/push pipeline lives in lab-kit. Scenarios own
-# any cleanup they need via a pre_hook.
+# any AD- or backend-side cleanup via a pre_hook, because not every
+# scenario needs the same cleanup (e.g. smoke-prepared-image skips it).
 #
 # Expected sibling checkout layout:
 #   Debian-SAMBA/
@@ -32,10 +36,18 @@ Usage: lab/run-scenario.sh <scenario> [flags]
        lab/run-scenario.sh --list
 
 Flags forwarded to lab-kit runner:
-  --no-stage      skip copying helper scripts to the host share
-  --no-reset      skip VM revert
-  --no-push       skip scp of appliance scripts
-  --verify-only   run verify() only (implies all --no-* above)
+  --no-stage              skip copying helper scripts to the host share
+  --no-reset              skip VM revert
+  --no-push               skip scp of appliance scripts
+  --verify-only           run verify() only (implies all --no-* above)
+
+Proxy-specific flags (consumed by scenario pre_hooks):
+  --no-cleanup            set SC_SKIP_CLEANUP=1 (skip WS2025 AD cleanup)
+  --dry-cleanup           set SC_DRY_CLEANUP=1 (inspect only)
+  --backend-creds FILE    source FILE before running; expected to set
+                          SC_BACKEND_PASS for backend-mount / frontend
+                          / end-to-end scenarios. Default if unset:
+                          lab/backend-creds.env (gitignored).
 
 Scenarios in $SCRIPT_DIR/scenarios:
 USAGE
@@ -53,6 +65,7 @@ fi
 
 SCENARIO=""
 FORWARD=()
+BACKEND_CREDS_FILE="$SCRIPT_DIR/backend-creds.env"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -63,6 +76,12 @@ while [[ $# -gt 0 ]]; do
             exit 0 ;;
         --no-stage|--no-reset|--no-push|--verify-only)
             FORWARD+=("$1") ;;
+        --no-cleanup)
+            export SC_SKIP_CLEANUP=1 ;;
+        --dry-cleanup)
+            export SC_DRY_CLEANUP=1 ;;
+        --backend-creds)
+            BACKEND_CREDS_FILE="$2"; shift ;;
         -*)
             echo "Unknown flag: $1" >&2; usage >&2; exit 2 ;;
         *)
@@ -76,6 +95,15 @@ done
 
 SCENARIO_FILE="$SCRIPT_DIR/scenarios/$SCENARIO.sh"
 [[ -f "$SCENARIO_FILE" ]] || { echo "No such scenario: $SCENARIO_FILE" >&2; exit 2; }
+
+# Source backend creds if the file exists. Scenarios that need
+# SC_BACKEND_PASS read it; scenarios that don't are unaffected. The
+# file is gitignored by the *creds* glob in .gitignore.
+if [[ -f "$BACKEND_CREDS_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$BACKEND_CREDS_FILE"
+    [[ -n "${SC_BACKEND_PASS:-}" ]] && export SC_BACKEND_PASS
+fi
 
 # cd to repo root so LAB_STAGE_SOURCES and LAB_PUSH_FILES globs in
 # proxy.env resolve against the expected layout.

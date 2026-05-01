@@ -1,0 +1,101 @@
+# lab/scenarios/end-to-end.sh — single-shot release-gate test that
+# walks the whole appliance through a green-field deployment:
+#
+#   bootstrap network → AD cleanup → join lab.test → backend cifs
+#   mount → frontend SMB3 share + firewall → roundtrip access.
+#
+# Sourced by lab/run-scenario.sh. Has access to ssh_host / ssh_vm /
+# scp_to_vm / say / step helpers and the LAB_HV_* / LAB_VM_* variables.
+#
+# This composes the four upstream scenarios. Source order matters —
+# frontend-share itself sources join-domain and backend-mount, which
+# in turn source bootstrap-network. All do_* helpers are then in
+# scope here, and we just call them sequentially in run_scenario.
+#
+# Verification: the full frontend-share verify() (renamed before
+# redefining, so we can reuse it) plus an opt-in WS2008 read/write
+# roundtrip through the proxy.
+#
+# Overridable via env (see upstream scenarios for the full list):
+#   SC_REALM, SC_NETBIOS, SC_DC, SC_PASS, SC_ADMIN
+#   SC_BACKEND_PASS (must be set; see backend-mount.sh)
+#   SC_BACKEND_IP/SHARE/USER/DOMAIN/MOUNT
+#   SC_FRONT_SHARE, SC_FRONT_GROUP, SC_FRONT_FORCE_USER
+#   SC_WRITE_ROUNDTRIP=1     opt-in: write a uniquely-named test file
+#                            through the proxy, read it back, delete.
+#                            Off by default to keep the shared WS2008
+#                            backend strictly read-only during tests.
+
+source "$(dirname "${BASH_SOURCE[0]}")/frontend-share.sh"
+
+# Capture the upstream verify() before we redefine our own, so we can
+# call it as part of the end-to-end check. The eval/declare/sed dance
+# is the standard bash idiom for "rename a function".
+eval "$(declare -f verify | sed '1s/^verify/_frontend_verify/')"
+
+pre_hook() {
+    step "bootstrap network (NIC roles + legacy IP)"
+    bootstrap_network
+    do_ad_cleanup_proxy
+    require_backend_pass
+}
+
+run_scenario() {
+    step "1/4 join domain ($SC_REALM via $SC_DC)"
+    do_join_domain
+
+    step "2/4 configure backend cifs mount (//$SC_BACKEND_IP/$SC_BACKEND_SHARE)"
+    do_configure_backend
+
+    step "3/4 configure frontend SMB3 share [$SC_FRONT_SHARE]"
+    do_configure_frontend
+
+    step "4/4 apply nftables ruleset"
+    do_apply_firewall
+}
+
+verify() {
+    local rc=0
+
+    step "frontend verification (smb.conf, testparm, ss, nft, smbclient -L)"
+    _frontend_verify || rc=1
+
+    say "smbproxy-sconfig --status reflects fully provisioned state"
+    local out
+    out=$(ssh_vm 'sudo smbproxy-sconfig --status' 2>&1 || true)
+    echo "$out"
+    grep -qE '^joined:[[:space:]]+yes'          <<< "$out" || rc=1
+    grep -qE '^backend_active:[[:space:]]+yes'  <<< "$out" || rc=1
+    grep -qE "^frontend_share:[[:space:]]+${SC_FRONT_SHARE}" <<< "$out" || rc=1
+    grep -qE '^smbd:[[:space:]]+(active|running)' <<< "$out" || rc=1
+    grep -qE '^winbind:[[:space:]]+(active|running)' <<< "$out" || rc=1
+
+    say "backend mount path is readable through the proxy's local view"
+    out=$(ssh_vm "sudo ls '$SC_BACKEND_MOUNT' 2>&1 | head -10" || true)
+    echo "$out"
+    if grep -qiE 'permission denied|i/o error|cannot access' <<< "$out"; then
+        say "backend mount is up but not readable"; rc=1
+    fi
+
+    if [[ "${SC_WRITE_ROUNDTRIP:-0}" == "1" ]]; then
+        say "WS2008 write roundtrip (opt-in via SC_WRITE_ROUNDTRIP=1)"
+        # Unique filename so concurrent runs don't collide and so it's
+        # obviously a test artifact if cleanup is interrupted. The proxy
+        # mount uses uid=$SC_FORCE_USER so writes go out as that user.
+        local probe=".smb-proxy-roundtrip-$(date -u +%Y%m%dT%H%M%SZ)-$$.tmp"
+        out=$(ssh_vm "sudo bash -c '
+            set -e
+            f=\"$SC_BACKEND_MOUNT/$probe\"
+            echo proxy-end-to-end-marker > \"\$f\"
+            cat \"\$f\"
+            rm -f \"\$f\"
+            echo OK
+        '" 2>&1 || true)
+        echo "$out"
+        grep -qE '^OK$' <<< "$out" || { say "write roundtrip did not complete"; rc=1; }
+    else
+        say "WS2008 write roundtrip skipped (set SC_WRITE_ROUNDTRIP=1 to enable)"
+    fi
+
+    return "$rc"
+}

@@ -43,7 +43,34 @@ The generic pipeline (from `lab-kit`) is:
 7. `post_hook`.
 8. Transcript is written to `test-results/<scenario>-<timestamp>.log`.
 
-## Existing Scenario
+## Existing Scenarios
+
+The implemented scenarios compose by sourcing each other. Each one is
+runnable on its own from a freshly reverted `golden-image`; downstream
+scenarios drive the upstream pipeline as their `pre_hook`.
+
+```text
+bootstrap-network ── used by ──► join-domain
+                              └► backend-mount
+                              └► frontend-share ── used by ──► end-to-end
+
+frontend-share already pulls in join-domain + backend-mount.
+end-to-end is frontend-share + smbproxy-sconfig --status check
+   + optional WS2008 read/write roundtrip (SC_WRITE_ROUNDTRIP=1).
+```
+
+Backend credentials handling: scenarios that need the WS2008 password
+read it from `SC_BACKEND_PASS`. `lab/run-scenario.sh` automatically
+sources `lab/backend-creds.env` (gitignored by `*creds*` in
+`.gitignore`) before invoking the scenario, so the local workflow is:
+
+```bash
+cp lab/backend-creds.env.example lab/backend-creds.env
+$EDITOR lab/backend-creds.env       # set SC_BACKEND_PASS to the real value
+```
+
+The original credential is in `docs/sketch-smb1-smb3-proxy.sh`. Never
+copy it into a scenario file.
 
 ### `smoke-prepared-image`
 
@@ -86,104 +113,186 @@ Iterate only on verification:
 lab/run-scenario.sh smoke-prepared-image --verify-only
 ```
 
-## Important Tests To Add
+### `bootstrap-network`
 
-The following tests are the highest-value next additions, in roughly
-the order they should be implemented.
+Purpose: headless equivalent of the `smbproxy-init` wizard's "assign
+NIC roles + bring up legacy NIC" step. Without this, every subsequent
+scenario fails because there's no roles file and the legacy NIC has
+no IP.
 
-### 1. NIC role assignment: `assign-nic-roles`
+What it does:
 
-Purpose: verify `smbproxy-sconfig` (or a future headless variant)
-records NIC roles correctly so subsequent steps know which interface
-talks to AD vs. the WS2008 backend.
+- Identifies the domain NIC by its current IP (`LAB_VM_IP` =
+  10.10.10.30) and the legacy NIC as the only other ethernet.
+- Writes `/etc/smbproxy/nic-roles.env` in the format the wizard
+  produces.
+- Writes `/etc/netplan/60-smbproxy-init.yaml` with the legacy NIC
+  pinned to `SC_LEGACY_CIDR` (default 172.29.137.10/24, gateway-less,
+  DNS-less). Domain NIC stanza keeps DHCP.
+- `netplan apply`.
 
-Assertions:
+Verification:
 
-- After role assignment, `/etc/smbproxy/nic-roles.env` contains both
-  `DOMAIN_NIC_NAME` and `LEGACY_NIC_NAME` with valid kernel interface
-  names that resolve to MAC addresses present on the VM.
-- The legacy NIC has the static IP set to a 172.29.137.0/24 address
-  with no default route through it.
-- The domain NIC retains its DHCP-assigned `10.10.10.30`.
-- `smbproxy-sconfig --status` reflects both names.
+- `nic-roles.env` populated with both names + MACs.
+- Netplan file is mode 0600.
+- Domain NIC still has 10.10.10.30; legacy NIC has the configured
+  CIDR.
+- Default route does NOT go via the legacy NIC.
+- LegacyZone reachability (informational ping; the cifs mount in
+  `backend-mount` is the authoritative test).
 
-Needed script support: a headless `smbproxy-sconfig --assign-roles`
-subcommand that takes `--domain-mac` / `--legacy-mac` flags. Until
-that exists, this scenario can pre-write `/etc/smbproxy/nic-roles.env`
-directly and then drive `smbproxy-sconfig --apply-firewall`.
+Run:
 
-### 2. Domain join: `join-domain`
+```bash
+lab/run-scenario.sh bootstrap-network
+```
 
-Purpose: prove the proxy can join the WS2025 forest as a member
+### `join-domain`
+
+Purpose: join the proxy to the WS2025 forest the samba-addc-appliance
+lab already runs (`lab.test` / WS2025-DC1 @ 10.10.10.10) as a member
 server.
 
-Assertions:
+`pre_hook` runs `bootstrap_network` and removes the `smbproxy-1`
+computer account from WS2025-DC1. The cleanup respects
+`--no-cleanup` (sets `SC_SKIP_CLEANUP=1`) and `--dry-cleanup` (sets
+`SC_DRY_CLEANUP=1`), the same way the samba sibling's `join-dc` does.
 
-- `smbproxy-sconfig --join-domain` against `lab.test` /
-  `WS2025-DC1@10.10.10.10` / `Administrator` succeeds.
-- `net ads info -P` reports a live KDC.
-- `wbinfo -t` (trust check) succeeds.
-- `wbinfo -u | head` returns at least the AD Administrator account.
-- `kinit Administrator@LAB.TEST` and `klist` succeed.
-- `/etc/krb5.conf` no longer mentions `YOURREALM.LAN`.
-- chrony's time source is the WS2025 DC, not a public pool.
+`run_scenario` drives `smbproxy-sconfig --join-domain` headlessly,
+piping `SC_PASS` to `--pass-stdin` so the password never lands in a
+process listing on the VM.
 
-Pre-hook: remove the `smbproxy-1` computer account from AD so a
-re-join doesn't hit "object already exists":
+Verification:
 
-```powershell
-ssh_host "pwsh -Command \"Get-ADComputer -Identity 'smbproxy-1' -ErrorAction SilentlyContinue | Remove-ADComputer -Confirm:\$false\""
-```
+- `smbproxy-sconfig --status` shows `joined: yes` and the right realm.
+- `smbd` and `winbind` are active.
+- `net ads info -P` reports a live KDC for the upper-cased realm.
+- `wbinfo -t` (trust check) succeeds and `wbinfo -u` lists at least
+  Administrator.
+- `kinit Administrator@LAB.TEST` succeeds and `klist` shows the
+  krbtgt entry.
+- `/etc/krb5.conf` no longer mentions `YOURREALM.LAN`; default_realm
+  is the deployed realm.
+- chrony's source is the DC (or its FQDN), not a public pool.
+- `smb.conf` reflects `realm=lab.test`, `workgroup=LAB`,
+  `security=ads`.
+- `Get-ADComputer smbproxy-1` succeeds on WS2025-DC1.
 
 Run:
 
 ```bash
 lab/run-scenario.sh join-domain
+lab/run-scenario.sh join-domain --dry-cleanup    # inspect AD without removing
+lab/run-scenario.sh join-domain --no-cleanup     # skip AD cleanup entirely
 ```
 
-### 3. Backend mount: `backend-mount-ws2008`
+### `backend-mount`
 
-Purpose: prove the SMB1 cifs mount of the WS2008 share comes up with
-the locking-correct options.
+Purpose: mount the WS2008 SP2 share with the locking-correct options
+and prove the cifs client honors them.
 
-Assertions:
+Requires `SC_BACKEND_PASS` in the environment — see
+`lab/backend-creds.env.example` for the recommended `lab/backend-creds.env`
+workflow. The scenario fails fast in `pre_hook` with a clear error if
+the password is unset.
 
-- `smbproxy-sconfig --configure-backend` against `172.29.137.1` /
-  `ProfitFab$` / `pfuser` / `LEGACY` succeeds.
-- `mount | grep cifs` shows `vers=1.0`, `nobrl`, `cache=none`,
-  `serverino`.
-- Reading a known-good file under the mount succeeds.
-- `smbstatus -L` lists no leases or oplocks for that mount.
+`pre_hook` runs `bootstrap_network` only; backend mount is independent
+of AD join (cifs uses username/password, not Kerberos), so this
+scenario is safe to run on a non-joined proxy.
 
-Backend password handling: scenarios that need the WS2008 password
-read it from `SC_BACKEND_PASS` or, if unset, source
-`lab/backend-creds.env` (gitignored by `*creds*` in `.gitignore`).
-Never bake the password into a scenario file. Example:
+`run_scenario` drives `smbproxy-sconfig --configure-backend` with
+`--pass-stdin`, then triggers the systemd automount by `ls`-ing the
+mount path.
+
+Verification:
+
+- `/etc/samba/.legacy_creds` is mode 0600 root:root with the right
+  username and domain (the password is never echoed).
+- The fstab line carries `vers=1.0`, `nobrl`, `cache=none`,
+  `serverino`, `x-systemd.automount`.
+- Force-user account exists with `/usr/sbin/nologin`.
+- The live cifs mount has the same options.
+- The mount is readable and contains at least one entry (an empty
+  share is warned about, not a failure — fresh labs may legitimately
+  be empty).
+- `deploy.env` persisted the backend coordinates.
+
+Run:
 
 ```bash
-# lab/backend-creds.env  (gitignored)
-SC_BACKEND_PASS='replace-me'
+lab/run-scenario.sh backend-mount
 ```
 
-### 4. Frontend share: `frontend-share-publish`
+### `frontend-share`
 
-Purpose: prove the published SMB3 frontend share is reachable from
-WS2025 with the strict-locking semantics intact.
+Purpose: publish the SMB3 frontend share + apply the firewall, and
+prove the share answers SMB3 + Kerberos with the strict-locking
+stanza intact.
 
-Assertions:
+`pre_hook` composes `bootstrap_network`, `do_ad_cleanup_proxy`,
+`require_backend_pass`, `do_join_domain`, then `do_configure_backend`
+— effectively reproducing the upstream three scenarios in sequence
+before touching the frontend.
 
-- `smbproxy-sconfig --configure-frontend` succeeds with a sample share
-  name and AD group.
-- `testparm -s` reports no global-parameter-in-share-section warnings
-  and the share has `oplocks = no`, `level2 oplocks = no`,
-  `strict locking = yes`, `kernel oplocks = no`, `posix locking = yes`,
-  `force user = pfuser`, `valid users = @"LAB\<group>"`.
-- `smbclient //10.10.10.30/<share> -k` from `samba-dc1` (which is
-  Kerberos-authenticated against `lab.test`) lists the share contents.
-- A SMB3-only client mount from WS2025-DC1 succeeds; an SMB1 client
-  attempt is rejected.
+`run_scenario` drives `smbproxy-sconfig --configure-frontend` with
+the share name, AD group, and force-user, then `--apply-firewall`.
 
-### 5. `.TPS` lock concentration: `tps-lock-isolation`
+Verification:
+
+- The `[$SC_FRONT_SHARE]` block exists in `smb.conf` with `oplocks=no`,
+  `level2 oplocks=no`, `strict locking=yes`, `kernel oplocks=no`,
+  `posix locking=yes`, `force user=pfuser`, the configured `path`,
+  and the `valid users = @"LAB\Domain Users"` ACL.
+- `testparm -s` reports no warnings/errors.
+- `smbd` is listening on 445/tcp; nmbd-style 137/138 sockets are not
+  open.
+- nftables ruleset is loaded.
+- A localhost-from-proxy `smbclient -k -L //$LAB_VM_IP -m SMB3`
+  (after a `kinit Administrator@LAB.TEST`) lists the share — proving
+  the SMB3 + Kerberos path end to end. A true cross-host check from
+  WS2025-DC1 / samba-dc1 belongs in a future
+  `Verify-FrontendShare.ps1` helper.
+- `deploy.env` persisted the frontend coordinates.
+
+Run:
+
+```bash
+lab/run-scenario.sh frontend-share
+```
+
+### `end-to-end`
+
+Purpose: single-shot release-gate test. Composes
+bootstrap → AD cleanup → join → backend → frontend + firewall →
+roundtrip access in one continuous scenario flow (instead of split
+across pre_hook + run_scenario), so the runner log shows the whole
+green-field deployment as one timeline.
+
+Reuses the `frontend-share` verify (renamed to `_frontend_verify` via
+the standard `eval $(declare -f ... | sed)` pattern) and adds:
+
+- `smbproxy-sconfig --status` shows `joined: yes`,
+  `backend_active: yes`, the configured `frontend_share`, and active
+  `smbd` + `winbind`.
+- `ls $SC_BACKEND_MOUNT` is readable.
+- Optional WS2008 read/write roundtrip when `SC_WRITE_ROUNDTRIP=1`:
+  writes a uniquely-named test file (`.smb-proxy-roundtrip-<ts>-<pid>.tmp`)
+  through the proxy, reads it back, deletes it. Off by default to
+  keep the shared production WS2008 backend strictly read-only during
+  test runs.
+
+Run:
+
+```bash
+lab/run-scenario.sh end-to-end
+SC_WRITE_ROUNDTRIP=1 lab/run-scenario.sh end-to-end
+```
+
+## Important Tests To Add
+
+The following tests are the highest-value next additions.
+
+### 1. `.TPS` lock concentration: `tps-lock-isolation`
 
 Purpose: prove the proxy is genuinely the single arbiter of byte-range
 locks against the WS2008 backend.
@@ -200,7 +309,7 @@ Assertions:
   shell + `openfiles /query`) shows only the proxy's session, with no
   byte-range lock churn.
 
-### 6. Hardening compatibility: `hardening-ws2025`
+### 2. Hardening compatibility: `hardening-ws2025`
 
 Purpose: prove the appliance keeps up with WS2025 security posture.
 
@@ -214,22 +323,18 @@ Assertions:
 - Kerberos uses strong encryption.
 - `testparm -s` clean.
 
-### 7. Firewall apply: `firewall-apply`
+### 3. Firewall apply: `firewall-apply`
 
-Purpose: prove `--apply-firewall` produces a working nftables ruleset
-that lets SMB3 in on the domain NIC, lets SMB1 *out* on the legacy
-NIC, and blocks everything else.
+Purpose: deeper assertions on the nftables ruleset than `frontend-share`
+already does. Beyond "ruleset is loaded", verify:
 
-Assertions:
-
-- `nft list ruleset` after `smbproxy-sconfig --apply-firewall` matches
-  the rendered template.
+- `nft list ruleset` matches the rendered template byte-for-byte.
 - `ss -tnlp` shows `smbd` listening on 445 of the domain NIC only.
 - An SSH from `samba-dc1` to `smbproxy-1:22` succeeds; an SSH from a
   pretend-WS2008 (using a temp listener on the LegacyZone segment) is
   rejected.
 
-### 8. WS2008 unreachable resilience: `ws2008-down-recovery`
+### 4. WS2008 unreachable resilience: `ws2008-down-recovery`
 
 Purpose: prove the proxy degrades gracefully when the backend goes
 away and recovers when it returns.
@@ -244,11 +349,25 @@ Assertions:
   remote-fs.target` (or the systemd-automount equivalent) re-attaches
   cleanly without restarting `smbd`.
 
-### 9. End-to-end: `end-to-end`
+### 5. Cross-host frontend access: `verify-from-ws2025`
 
-Compose the above into a single sequenced scenario for release-gate
-testing: assign roles → join → backend mount → frontend share →
-firewall → smoke a `.TPS` access from a WS2025-side client.
+Purpose: prove the SMB3 frontend share is reachable from a real
+Windows client, not just from the proxy itself.
+
+Add a `lab/hyperv/Verify-FrontendShare.ps1` helper that runs on the
+Hyper-V host, talks to WS2025-DC1 via PSRemoting (or to the host
+directly if it's domain-joined), and:
+
+- Resolves `smbproxy-1.lab.test` and pings 445/tcp on it.
+- `Get-SmbConnection` after a `New-SmbMapping` to the share with
+  Kerberos credentials.
+- Lists directory contents.
+- Confirms an SMB1-only attempt is refused.
+
+Then add a `verify-from-ws2025` scenario that calls the script via
+`ssh_host` and asserts on its output, similar to how
+`samba-addc-appliance/lab/scenarios/join-dc.sh` consumes
+`Verify-JoinFromWS2025.ps1`.
 
 ## Scenario Template
 

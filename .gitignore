@@ -50,3 +50,6 @@ lab/keys/*
 # should be ignored on principle.
 *creds*
 !docs/**/*creds*
+# The *.example template is intentionally tracked so the docs can
+# point new operators at it. It MUST contain placeholder values only.
+!lab/backend-creds.env.example
