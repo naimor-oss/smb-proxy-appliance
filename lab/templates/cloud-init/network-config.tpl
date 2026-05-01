@@ -22,3 +22,13 @@ ethernets:
       macaddress: "@@DOMAIN_MAC_COLON@@"
     dhcp4: true
     dhcp6: false
+    # Force a MAC-based DHCP client-id instead of systemd-networkd's
+    # default DUID. Without this, dnsmasq sees the DUID as the
+    # client-id and refuses to match the MAC-only `dhcp-host=`
+    # reservation, handing out a dynamic-pool address instead of the
+    # reserved one. Affects build-time only — at deploy time the
+    # operator typically picks a static IP via the smbproxy-init
+    # wizard, but leaving this here keeps DHCP-friendly deployments
+    # behaving deterministically against any reservation-aware
+    # server.
+    dhcp-identifier: mac
