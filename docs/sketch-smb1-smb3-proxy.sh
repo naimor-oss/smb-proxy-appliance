@@ -27,7 +27,7 @@ WS2008_IP="172.29.137.1"    # Dedicated Link IP
 WS2008_SHARE="ProfitFab$"
 WS2008_DOMAIN="LEGACY"
 WS2008_USER="pfuser"
-WS2008_PASS="tasgo4-mUwsik-cedruw"
+WS2008_PASS="<ROTATED-2026-05-01-see-internal-vault>"  # original literal removed; cred rotated in production. See dev-commons/PUBLISH-CHECKLIST.md.
 
 # WS2025 Active Directory Domain (Frontend)
 DOMAIN_FQDN="naimor.naimorinc.com"
