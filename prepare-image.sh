@@ -377,8 +377,8 @@ log "Setting login banner..."
 cat > /etc/motd << 'MOTDEOF'
 
   ╔═══════════════════════════════════════════════════════╗
-  ║     SMB1↔SMB3 Protocol-Version Proxy Appliance        ║
-  ║              Debian 13 (Trixie) Appliance             ║
+  ║              SMB1↔SMB3 Protocol Gateway               ║
+  ║                  Debian 13 (Trixie)                   ║
   ╠═══════════════════════════════════════════════════════╣
   ║  Run 'sudo smbproxy-sconfig' to configure this host.  ║
   ╚═══════════════════════════════════════════════════════╝
@@ -761,7 +761,7 @@ log "  $nic_count ethernet NIC(s) detected"
 # Write the motd snippet.
 {
     echo
-    echo "=== SMB1↔SMB3 Proxy Appliance: first-boot host integration ==="
+    echo "=== First-boot host detection (SMB gateway) ==="
     echo "Detected: $VIRT"
     printf '%s\n' "$INSTALLED_NOTE" | sed 's/^/  /'
     printf '%s\n' "$RECS"
@@ -1474,8 +1474,8 @@ DET=/var/lib/smbproxy-init-detected.env
 ROLES=/etc/smbproxy/nic-roles.env
 [ -r "$DET" ]   && . "$DET"   2>/dev/null
 [ -r "$ROLES" ] && . "$ROLES" 2>/dev/null
-printf '\n  SMB1↔SMB3 Proxy Appliance\n'
-printf '  -------------------------\n'
+printf '\n  SMB1↔SMB3 Protocol Gateway\n'
+printf '  --------------------------\n'
 printf '  Hostname:    %s\n' "$(hostnamectl hostname 2>/dev/null || hostname)"
 if [ -n "$DOMAIN_NIC_NAME" ]; then
     printf '  Domain NIC:  %s (mac=%s)\n' "$DOMAIN_NIC_NAME" "$DOMAIN_NIC_MAC"
@@ -1615,19 +1615,19 @@ printf '\n'
 printf '%s======================================================================%s\n' "$RED" "$RST"
 printf '%s  WARNING: SR-IOV / passthrough NIC detected but unbound%s\n' "$RED" "$RST"
 printf '%s======================================================================%s\n' "$RED" "$RST"
-printf '  This appliance has an Ethernet PCI device that the kernel did NOT\n'
+printf '  This server has an Ethernet PCI device that the kernel did NOT\n'
 printf '  bind a driver to. The most common cause is that the hypervisor is\n'
 printf '  exposing an SR-IOV virtual function (typically Intel ixgbevf) to\n'
-printf '  this VM, and the appliance has the matching driver blacklisted as\n'
-printf '  a workaround for an early-boot kernel panic on certain Hyper-V\n'
-printf '  UEFI firmware revisions.\n'
+printf '  this VM, and the matching driver is blacklisted as a workaround\n'
+printf '  for an early-boot kernel panic on certain Hyper-V UEFI firmware\n'
+printf '  revisions.\n'
 printf '\n'
 printf '  Unbound device(s):\n'
 printf '%s\n' "$unbound" | sed 's/^/    /'
 printf '\n'
 printf '  Why it matters:\n'
 printf '    - The synthetic vNIC (hv_netvsc / virtio-net / vmxnet3) is in\n'
-printf '      use instead. SMB1<->SMB3 proxy traffic operates normally.\n'
+printf '      use instead. Network traffic operates normally.\n'
 printf '    - SR-IOV optimizations and the dedicated bandwidth they would\n'
 printf '      have provided are NOT in effect.\n'
 printf '    - Without the blacklist, this VM would kernel-panic at boot on\n'
@@ -1641,11 +1641,9 @@ printf '      banner clears automatically on next login.\n'
 printf '    Other hypervisors:\n'
 printf '      detach the SR-IOV VF / disable passthrough on the vNIC.\n'
 printf '\n'
-printf '  Background and forward path:\n'
-printf '    /etc/modprobe.d/smbproxy-blacklist-ixgbevf.conf and the\n'
-printf '    "21B. SR-IOV VF KERNEL-PANIC WORKAROUND" section of the\n'
-printf '    appliance source describe the bug and the conditions under\n'
-printf '    which the blacklist can be removed.\n'
+printf '  Background:\n'
+printf '    /etc/modprobe.d/smbproxy-blacklist-ixgbevf.conf describes the\n'
+printf '    bug and the conditions under which the blacklist can be removed.\n'
 printf '%s======================================================================%s\n' "$RED" "$RST"
 printf '\n'
 MOTDEOF
