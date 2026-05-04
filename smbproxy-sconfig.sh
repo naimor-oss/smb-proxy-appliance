@@ -333,25 +333,23 @@ main_menu() {
         fqdn=$(get_fqdn)
         realm_str=$(get_realm_status)
         smbd_str=$(get_smbd_status)
-        backend_str=$(get_backend_status)
-        front_str="${FRONT_SHARE:-(unset)}"
+        local shares_str; shares_str=$(get_shares_status)
 
         local domain_nic_str="${DOMAIN_NIC_NAME:-NOT-ASSIGNED}"
         local legacy_nic_str="${LEGACY_NIC_NAME:-NOT-ASSIGNED}"
 
         local choice
         choice=$(whiptail --title "SMB1↔SMB3 Proxy [$hostname] v${VERSION}" \
-            --menu "\n  Host: $fqdn\n  NICs: domain=$domain_nic_str  legacy=$legacy_nic_str\n  Realm: $realm_str  smbd: $smbd_str\n  Backend: $backend_str\n  Frontend share: $front_str\n" \
+            --menu "\n  Host: $fqdn\n  NICs: domain=$domain_nic_str  legacy=$legacy_nic_str\n  Realm: $realm_str  smbd: $smbd_str\n  Shares: $shares_str\n" \
             $WT_HEIGHT $WT_WIDTH $WT_MENU_HEIGHT \
             "1" "System Configuration" \
             "2" "NIC Roles" \
             "3" "Domain Operations (join / leave)" \
-            "4" "Backend SMB1 Mount (WS2008)" \
-            "5" "Frontend SMB3 Share (AD-joined clients)" \
-            "6" "Firewall (nftables)" \
-            "7" "Diagnostics & Sanity Check" \
-            "8" "Service Management" \
-            "9" "Reboot / Shutdown" \
+            "4" "Proxied Shares (add / edit / remove / mount)" \
+            "5" "Firewall (nftables)" \
+            "6" "Diagnostics & Sanity Check" \
+            "7" "Service Management" \
+            "8" "Reboot / Shutdown" \
             "Q" "Exit" \
             3>&1 1>&2 2>&3) || return
 
@@ -359,12 +357,11 @@ main_menu() {
             1) menu_system_config ;;
             2) menu_nic_roles ;;
             3) menu_domain_ops ;;
-            4) menu_backend ;;
-            5) menu_frontend ;;
-            6) menu_firewall ;;
-            7) menu_diagnostics ;;
-            8) menu_services ;;
-            9) menu_power ;;
+            4) menu_shares ;;
+            5) menu_firewall ;;
+            6) menu_diagnostics ;;
+            7) menu_services ;;
+            8) menu_power ;;
             Q|q) clear; exit 0 ;;
         esac
     done
@@ -1144,6 +1141,528 @@ run_testparm() {
     testparm -s 2>&1 | head -200 > "$out"
     whiptail --title "testparm -s" --scrolltext --textbox "$out" "$WT_HEIGHT" "$WT_WIDTH"
     rm -f "$out"
+}
+
+#===============================================================================
+# 5M. PROXIED SHARES (MULTI-SHARE)
+#
+# This section supersedes the singleton §4 / §5 menus for the TUI. The
+# operator now manages an arbitrary number of proxied shares from one
+# place — each share has its own backend creds, mount, fstab line,
+# smb.conf section, AD access group, and local force-user (per the
+# multi-share data model in load_share / save_share above).
+#
+# §4 / §5 functions are retained because the headless CLI dispatcher
+# still calls configure_backend / configure_frontend; B3 retires those
+# call paths, after which §4 / §5 can be deleted entirely.
+#===============================================================================
+
+# Status summary string for the main menu header. Format adapts to the
+# count: zero shares → "(none)"; small N → comma-separated names; many
+# → first three + count.
+get_shares_status() {
+    local names; names=$(list_shares 2>/dev/null)
+    if [[ -z "$names" ]]; then
+        echo "(none configured)"
+        return
+    fi
+    local count first
+    count=$(echo "$names" | wc -l | tr -d ' ')
+    if [[ "$count" -le 3 ]]; then
+        echo "$count: $(echo "$names" | paste -sd ', ' -)"
+    else
+        first=$(echo "$names" | head -3 | paste -sd ', ' -)
+        echo "$count: $first, ..."
+    fi
+}
+
+# pick_share emits the chosen SHARE_NAME on stdout and returns 0; rc=1
+# when the operator cancels or no shares exist. Caller decides whether
+# absence is an error or a normal "do nothing" case.
+pick_share() {
+    local prompt="${1:-Pick a share:}"
+    local names menu_args=()
+    names=$(list_shares 2>/dev/null) || return 1
+    [[ -n "$names" ]] || return 1
+    while IFS= read -r n; do
+        # Whiptail menu wants tag/item pairs. Tag = SHARE_NAME, item =
+        # a brief status string so the operator can tell shares apart
+        # when they have many.
+        load_share "$n" 2>/dev/null
+        local mp_status="unmounted"
+        if [[ -n "$BACKEND_MOUNT" ]] && backend_mount_active "$BACKEND_MOUNT" 2>/dev/null; then
+            mp_status="mounted"
+        fi
+        menu_args+=("$n" "${BACKEND_IP:-?}/${n}  ${mp_status}")
+    done <<< "$names"
+    whiptail --title "Pick a proxied share" --notags \
+        --menu "$prompt" \
+        "$WT_HEIGHT" "$WT_WIDTH" "$WT_MENU_HEIGHT" \
+        "${menu_args[@]}" 3>&1 1>&2 2>&3
+}
+
+# shares_list_status renders a textbox showing every share's current
+# state: backend IP/share, mount path, mount status, smb.conf section
+# present?, AD group, force-user. Read-only.
+shares_list_status() {
+    local out=/tmp/smbproxy-shares.$$
+    {
+        local names
+        names=$(list_shares 2>/dev/null)
+        if [[ -z "$names" ]]; then
+            echo "No proxied shares configured."
+            echo
+            echo "Add one from the Proxied Shares menu."
+        else
+            echo "Configured proxied shares:"
+            echo
+            local n
+            while IFS= read -r n; do
+                load_share "$n" 2>/dev/null
+                printf '== %s ==\n' "$n"
+                printf '  backend:        //%s/%s\n' "${BACKEND_IP:-?}" "$n"
+                printf '  backend user:   %s (domain: %s)\n' \
+                    "${BACKEND_USER:-?}" "${BACKEND_DOMAIN:-?}"
+                printf '  mount point:    %s' "${BACKEND_MOUNT:-?}"
+                if backend_mount_active "${BACKEND_MOUNT:-/dev/null}" 2>/dev/null; then
+                    printf '  [mounted]\n'
+                else
+                    printf '  [unmounted]\n'
+                fi
+                printf '  AD access:      %s\n' "${FRONT_GROUP:-?}"
+                printf '  force user:     %s\n' "${FRONT_FORCE_USER:-?}"
+                if grep -qE "^\[$n\]" "$SMB_CONF" 2>/dev/null; then
+                    printf '  smb.conf:       [%s] section present\n' "$n"
+                else
+                    printf '  smb.conf:       [%s] section MISSING\n' "$n"
+                fi
+                echo
+            done <<< "$names"
+        fi
+    } > "$out"
+    whiptail --title "Proxied shares: status" --scrolltext --textbox "$out" "$WT_HEIGHT" "$WT_WIDTH"
+    rm -f "$out"
+}
+
+# configure_share is the unified per-share writer. Operates on the
+# per-share globals (SHARE_NAME, BACKEND_IP, BACKEND_USER,
+# BACKEND_DOMAIN, BACKEND_MOUNT, BACKEND_PASS, FRONT_GROUP,
+# FRONT_FORCE_USER) and writes:
+#   - per-share creds file (mode 0600 root:root)
+#   - per-share fstab line (replacing any prior with same mount point)
+#   - per-share smb.conf section (replacing any prior [SHARE_NAME])
+#   - per-share env file via save_share()
+# Frontend pieces are skipped if not domain-joined (the operator can
+# add the share's backend pre-join and publish the frontend later).
+# BACKEND_PASS is consumed and then unset — never persisted to disk.
+# Returns 0 on success, 2 on missing required fields, 4 on testparm
+# rejection.
+configure_share() {
+    [[ -n "$SHARE_NAME" && -n "$BACKEND_IP" && -n "$BACKEND_USER" \
+        && -n "${BACKEND_PASS:-}" && -n "$BACKEND_DOMAIN" \
+        && -n "$BACKEND_MOUNT" && -n "$FRONT_FORCE_USER" ]] \
+        || return 2
+
+    # Local backend force-user must exist before we set the cifs
+    # uid/gid mount options against it.
+    if ! id "$FRONT_FORCE_USER" &>/dev/null; then
+        useradd -M -s /usr/sbin/nologin "$FRONT_FORCE_USER"
+    fi
+    if ! getent group "$FRONT_FORCE_USER" >/dev/null 2>&1; then
+        groupadd "$FRONT_FORCE_USER" 2>/dev/null || true
+    fi
+
+    install -d -o root -g root -m 0755 "$(dirname "$BACKEND_MOUNT")"
+    install -d -o "$FRONT_FORCE_USER" -g "$FRONT_FORCE_USER" -m 0755 \
+        "$BACKEND_MOUNT" 2>/dev/null \
+        || install -d -m 0755 "$BACKEND_MOUNT"
+
+    # Per-share creds file. NEVER log this file's contents.
+    local creds; creds=$(share_creds_file "$SHARE_NAME")
+    install -d -o root -g root -m 0755 "$CREDS_DIR"
+    umask 077
+    cat > "$creds" <<EOF
+username=${BACKEND_USER}
+password=${BACKEND_PASS}
+domain=${BACKEND_DOMAIN}
+EOF
+    chmod 0600 "$creds"
+    chown root:root "$creds"
+    umask 022
+
+    # fstab entry — see configure_backend (legacy) for the rationale on
+    # vers=1.0 / nobrl / cache=none / x-systemd.automount.
+    local fu_uid fu_gid
+    fu_uid=$(id -u "$FRONT_FORCE_USER")
+    fu_gid=$(id -g "$FRONT_FORCE_USER")
+    local fstab_line="//${BACKEND_IP}/${SHARE_NAME} ${BACKEND_MOUNT} cifs credentials=${creds},vers=1.0,cache=none,serverino,nobrl,uid=${fu_uid},gid=${fu_gid},file_mode=0660,dir_mode=0770,_netdev,x-systemd.automount,x-systemd.requires=network-online.target 0 0"
+    sed -i "\| ${BACKEND_MOUNT} cifs |d" /etc/fstab
+    echo "$fstab_line" >> /etc/fstab
+    systemctl daemon-reload
+
+    # Frontend smb.conf section — only if domain-joined and FRONT_GROUP
+    # is set. Operator can add a share's backend before joining and
+    # publish the frontend afterward.
+    if is_joined && [[ -n "$FRONT_GROUP" ]]; then
+        # Strip any prior [SHARE_NAME] section, then append fresh.
+        awk -v sname="[$SHARE_NAME]" '
+            BEGIN { in_share=0 }
+            $0 == sname { in_share=1; next }
+            /^\[/ && in_share { in_share=0 }
+            !in_share { print }
+        ' "$SMB_CONF" > "${SMB_CONF}.new"
+
+        cat >> "${SMB_CONF}.new" <<EOF
+
+[${SHARE_NAME}]
+    path = ${BACKEND_MOUNT}
+    read only = no
+    guest ok = no
+    valid users = @"${FRONT_GROUP}"
+
+    # All AD identities authenticated to this share are mapped to
+    # ${FRONT_FORCE_USER}, whose creds in ${creds} authenticate the
+    # cifs mount to the WS2008 backend.
+    force user = ${FRONT_FORCE_USER}
+    force group = ${FRONT_FORCE_USER}
+
+    # Strict locking for ISAM/.TPS multi-user databases; do NOT relax
+    # without reading AGENTS.md first.
+    oplocks = no
+    level2 oplocks = no
+    strict locking = yes
+    kernel oplocks = no
+    posix locking = yes
+EOF
+
+        if ! testparm -s "${SMB_CONF}.new" >/dev/null 2>/tmp/smbproxy-tp.$$; then
+            rm -f "${SMB_CONF}.new"
+            return 4
+        fi
+        mv "${SMB_CONF}.new" "$SMB_CONF"
+        chmod 0644 "$SMB_CONF"
+        systemctl reload smbd 2>/dev/null || systemctl restart smbd
+    fi
+
+    # Persist non-credential fields (BACKEND_PASS is intentionally
+    # NOT in this list; save_share() doesn't touch creds).
+    save_share
+
+    BACKEND_PASS=""; unset BACKEND_PASS
+    return 0
+}
+
+# shares_add_wizard — TUI flow to create a new share end-to-end.
+# Prompts for SHARE_NAME first; subsequent dialogs all carry
+# "Share: $SHARE_NAME" in the body so the operator never has to look
+# at the title bar for context (per dev-commons/STYLE.md §3 / §15).
+shares_add_wizard() {
+    local existing_names
+    existing_names=$(list_shares 2>/dev/null)
+
+    # Initial share name. Reject collisions; allow $-suffixes; reject
+    # path-hostile characters that would make the safe-name ambiguous.
+    local SHARE_NAME=""
+    while true; do
+        SHARE_NAME=$(whiptail --title "Add proxied share" \
+            --inputbox "Choose the share's name.\n\nThis is BOTH the WS2008 backend share name AND the published\nSMB3 share name (operator picks one; it appears at both ends).\nTrailing \$ marks it hidden in network browsing.\n\nExample: ProfitFab\$" \
+            16 70 "" 3>&1 1>&2 2>&3) || return
+        [[ -n "$SHARE_NAME" ]] || { info "Share name cannot be empty."; continue; }
+        # Reject characters that aren't share-name-safe on Windows or
+        # that would break smb.conf section parsing.
+        if [[ "$SHARE_NAME" =~ [/\\\[\]\"\'\<\>] ]]; then
+            info "Share name contains characters not allowed in SMB share names\n(/, \\\\, [, ], <, >, quotes)."
+            continue
+        fi
+        if echo "$existing_names" | grep -qFx "$SHARE_NAME"; then
+            info "A share named '$SHARE_NAME' already exists.\nUse Edit to change it, Remove to delete it first."
+            continue
+        fi
+        break
+    done
+
+    local body_ctx="Share: ${SHARE_NAME}"
+    local BACKEND_IP="" BACKEND_USER="" BACKEND_DOMAIN="" BACKEND_MOUNT=""
+    local BACKEND_PASS="" FRONT_GROUP="" FRONT_FORCE_USER=""
+
+    BACKEND_IP=$(whiptail --title "Add proxied share — backend IP" \
+        --inputbox "${body_ctx}\n\nWS2008 backend IPv4 (LegacyZone-side):" \
+        12 64 "" 3>&1 1>&2 2>&3) || return
+
+    # Note: same BACKEND_IP with a different SHARE_NAME is the
+    # *intended* multi-share case (multiple shares from one backend
+    # with independent creds), so we DON'T warn on (IP, SHARE_NAME)
+    # combinations. Same SHARE_NAME couldn't get here — we rejected
+    # duplicate names above. The only meaningful collision worth
+    # warning on is mount-path overlap, which we check after BACKEND_MOUNT
+    # is collected below.
+
+    BACKEND_USER=$(whiptail --title "Add proxied share — backend user" \
+        --inputbox "${body_ctx}\n\nLocal WS2008 user with read/write access on the share:" \
+        12 64 "" 3>&1 1>&2 2>&3) || return
+    BACKEND_DOMAIN=$(whiptail --title "Add proxied share — backend domain" \
+        --inputbox "${body_ctx}\n\nWS2008 NetBIOS domain (or workgroup) name:" \
+        12 64 "LEGACY" 3>&1 1>&2 2>&3) || return
+
+    local p1 p2
+    p1=$(whiptail --title "Add proxied share — backend password" \
+        --passwordbox "${body_ctx}\n\nPassword for ${BACKEND_USER}:" \
+        12 64 3>&1 1>&2 2>&3) || return
+    p2=$(whiptail --title "Add proxied share — confirm password" \
+        --passwordbox "${body_ctx}\n\nConfirm password for ${BACKEND_USER}:" \
+        12 64 3>&1 1>&2 2>&3) || return
+    [[ "$p1" == "$p2" ]] || { info "Passwords don't match."; return; }
+    BACKEND_PASS="$p1"
+
+    BACKEND_MOUNT=$(whiptail --title "Add proxied share — local mount point" \
+        --inputbox "${body_ctx}\n\nLocal mount point on the proxy:" \
+        12 64 "$(share_default_mount "$SHARE_NAME")" 3>&1 1>&2 2>&3) || { BACKEND_PASS=""; return; }
+
+    # Mount-path collision check. The default mount path is derived
+    # from SHARE_NAME so a default-vs-default collision is impossible
+    # (we already rejected duplicate SHARE_NAMEs); the operator gets
+    # here only if they typed a custom path that overlaps another
+    # share's. Warn-but-allow per the user's stated preference.
+    local n other_mount
+    while IFS= read -r n; do
+        [[ -z "$n" ]] && continue
+        other_mount=$( load_share "$n" 2>/dev/null; printf '%s' "${BACKEND_MOUNT:-}" )
+        if [[ -n "$other_mount" && "$other_mount" == "$BACKEND_MOUNT" ]]; then
+            yesno "Mount path '${BACKEND_MOUNT}' is already used by share '${n}'.\n\nAdding this share will REPLACE that share's fstab entry.\nThe other share's smb.conf section is left alone but will\npoint at a path that no longer mounts what it expects.\n\nProceed anyway?" \
+                || { BACKEND_PASS=""; return; }
+            break
+        fi
+    done <<< "$existing_names"
+
+    if is_joined; then
+        FRONT_GROUP=$(whiptail --title "Add proxied share — AD access group" \
+            --inputbox "${body_ctx}\n\nAD security group authorized to use this share.\nFormat: DOMAIN_SHORT\\Group Name (e.g. ${DOMAIN_SHORT:-LAB}\\${SHARE_NAME%\$} Users).\nThe @\"\" wrapper in smb.conf is added automatically." \
+            14 74 "${DOMAIN_SHORT:-DOMAIN}\\${SHARE_NAME%\$} Users" 3>&1 1>&2 2>&3) || { BACKEND_PASS=""; return; }
+    else
+        info "Not domain-joined — backend will be configured but the\nfrontend [smb.conf] section is skipped. Re-run Edit after\njoining the domain to publish the share."
+    fi
+
+    FRONT_FORCE_USER=$(whiptail --title "Add proxied share — local force-user" \
+        --inputbox "${body_ctx}\n\nLocal Linux account that owns the cifs mount AND that AD\nidentities authenticated to this share are mapped to on the\nway out to WS2008. Created if absent (system user, nologin)." \
+        14 74 "${BACKEND_USER}" 3>&1 1>&2 2>&3) || { BACKEND_PASS=""; return; }
+
+    yesno "Apply share '${SHARE_NAME}'?\n\n  backend://${BACKEND_IP}/${SHARE_NAME} -> ${BACKEND_MOUNT}\n  WS2008 user: ${BACKEND_DOMAIN}\\${BACKEND_USER}\n  AD access:   ${FRONT_GROUP:-(skipped — not joined)}\n  force user:  ${FRONT_FORCE_USER}" \
+        || { BACKEND_PASS=""; return; }
+
+    if configure_share; then
+        info "Share '${SHARE_NAME}' configured.\n\nUse 'Mount / unmount a share' to mount it, or just access\n${BACKEND_MOUNT} — automount triggers."
+    else
+        local rc=$?
+        info "configure_share failed (rc=$rc).\n  rc=2: missing required field\n  rc=4: testparm rejected the smb.conf — see /tmp/smbproxy-tp.*"
+    fi
+    BACKEND_PASS=""
+}
+
+# shares_edit_picker — pick a share, then a per-field edit menu. Body
+# of every field-edit dialog carries "Share: $name".
+shares_edit_picker() {
+    local name
+    name=$(pick_share "Pick a share to edit:") || return
+    [[ -n "$name" ]] || return
+    load_share "$name" || { info "Share '$name' state file missing."; return; }
+    local body_ctx="Share: ${name}"
+
+    while true; do
+        local choice
+        choice=$(whiptail --title "Edit share: $name" \
+            --menu "${body_ctx}\n\n  backend://${BACKEND_IP:-?}/${name} -> ${BACKEND_MOUNT:-?}\n  AD group: ${FRONT_GROUP:-(unset)}\n  force user: ${FRONT_FORCE_USER:-?}\n\nPick a field to update:" \
+            "$WT_HEIGHT" "$WT_WIDTH" 8 \
+            "1" "Backend password (most common edit)" \
+            "2" "AD access group (FRONT_GROUP)" \
+            "3" "Local force-user (FRONT_FORCE_USER)" \
+            "4" "Backend IP (BACKEND_IP)" \
+            "5" "Backend user (BACKEND_USER)" \
+            "6" "Backend domain (BACKEND_DOMAIN)" \
+            "B" "Back" \
+            3>&1 1>&2 2>&3) || return
+
+        case "$choice" in
+            1)
+                local p1 p2
+                p1=$(whiptail --title "Edit share: $name — new password" \
+                    --passwordbox "${body_ctx}\n\nNew password for ${BACKEND_USER}:" 12 64 \
+                    3>&1 1>&2 2>&3) || continue
+                p2=$(whiptail --title "Edit share: $name — confirm" \
+                    --passwordbox "${body_ctx}\n\nConfirm:" 12 64 \
+                    3>&1 1>&2 2>&3) || continue
+                [[ "$p1" == "$p2" ]] || { info "Passwords don't match."; continue; }
+                BACKEND_PASS="$p1"
+                if configure_share; then
+                    info "Password updated for '$name'."
+                else
+                    info "configure_share failed (rc=$?)"
+                fi
+                BACKEND_PASS=""
+                ;;
+            2)
+                FRONT_GROUP=$(whiptail --title "Edit share: $name — AD group" \
+                    --inputbox "${body_ctx}\n\nAD security group authorized:" 12 70 \
+                    "$FRONT_GROUP" 3>&1 1>&2 2>&3) || continue
+                save_share
+                # Need a re-write of smb.conf, which configure_share does.
+                # But it requires BACKEND_PASS — re-prompt.
+                local p
+                p=$(whiptail --title "Edit share: $name — confirm with password" \
+                    --passwordbox "${body_ctx}\n\nRe-enter backend password to apply (creds file is\nrewritten to keep state consistent):" 13 64 \
+                    3>&1 1>&2 2>&3) || continue
+                BACKEND_PASS="$p"
+                configure_share && info "AD group updated for '$name'." || info "configure_share failed (rc=$?)"
+                BACKEND_PASS=""
+                ;;
+            3)
+                FRONT_FORCE_USER=$(whiptail --title "Edit share: $name — force-user" \
+                    --inputbox "${body_ctx}\n\nLocal Linux force-user account:" 12 70 \
+                    "$FRONT_FORCE_USER" 3>&1 1>&2 2>&3) || continue
+                local p
+                p=$(whiptail --title "Edit share: $name — confirm with password" \
+                    --passwordbox "${body_ctx}\n\nRe-enter backend password to apply:" 12 64 \
+                    3>&1 1>&2 2>&3) || continue
+                BACKEND_PASS="$p"
+                configure_share && info "Force-user updated for '$name'." || info "configure_share failed (rc=$?)"
+                BACKEND_PASS=""
+                ;;
+            4)
+                BACKEND_IP=$(whiptail --title "Edit share: $name — backend IP" \
+                    --inputbox "${body_ctx}\n\nWS2008 backend IPv4:" 12 64 \
+                    "$BACKEND_IP" 3>&1 1>&2 2>&3) || continue
+                local p
+                p=$(whiptail --title "Edit share: $name — confirm with password" \
+                    --passwordbox "${body_ctx}\n\nRe-enter backend password to apply:" 12 64 \
+                    3>&1 1>&2 2>&3) || continue
+                BACKEND_PASS="$p"
+                configure_share && info "Backend IP updated for '$name'." || info "configure_share failed (rc=$?)"
+                BACKEND_PASS=""
+                ;;
+            5)
+                BACKEND_USER=$(whiptail --title "Edit share: $name — backend user" \
+                    --inputbox "${body_ctx}\n\nWS2008 user with r/w access:" 12 64 \
+                    "$BACKEND_USER" 3>&1 1>&2 2>&3) || continue
+                local p
+                p=$(whiptail --title "Edit share: $name — new password" \
+                    --passwordbox "${body_ctx}\n\nNew password for ${BACKEND_USER}:" 12 64 \
+                    3>&1 1>&2 2>&3) || continue
+                BACKEND_PASS="$p"
+                configure_share && info "Backend user updated for '$name'." || info "configure_share failed (rc=$?)"
+                BACKEND_PASS=""
+                ;;
+            6)
+                BACKEND_DOMAIN=$(whiptail --title "Edit share: $name — backend domain" \
+                    --inputbox "${body_ctx}\n\nWS2008 NetBIOS domain or workgroup:" 12 64 \
+                    "$BACKEND_DOMAIN" 3>&1 1>&2 2>&3) || continue
+                local p
+                p=$(whiptail --title "Edit share: $name — confirm with password" \
+                    --passwordbox "${body_ctx}\n\nRe-enter backend password to apply:" 12 64 \
+                    3>&1 1>&2 2>&3) || continue
+                BACKEND_PASS="$p"
+                configure_share && info "Backend domain updated for '$name'." || info "configure_share failed (rc=$?)"
+                BACKEND_PASS=""
+                ;;
+            B|b) return ;;
+        esac
+    done
+}
+
+shares_remove_picker() {
+    local name
+    name=$(pick_share "Pick a share to REMOVE:") || return
+    [[ -n "$name" ]] || return
+    yesno "Remove share '${name}'?\n\nThis will:\n  - umount it (best-effort)\n  - strip its fstab line\n  - strip its [${name}] section from smb.conf\n  - delete its state file and creds file\n  - reload smbd\n\nThe operator-side data on the WS2008 backend is NOT touched." \
+        || return
+    if remove_share "$name"; then
+        info "Share '${name}' removed."
+    else
+        info "remove_share returned non-zero (rc=$?). Inspect /var/log/syslog."
+    fi
+}
+
+shares_mount_picker() {
+    local name
+    name=$(pick_share "Pick a share to mount/unmount:") || return
+    [[ -n "$name" ]] || return
+    load_share "$name" || { info "Share '$name' state file missing."; return; }
+    [[ -n "$BACKEND_MOUNT" ]] || { info "Share '$name' has no mount point set."; return; }
+
+    local body_ctx="Share: ${name}    mount: ${BACKEND_MOUNT}"
+    local active="no"
+    backend_mount_active "$BACKEND_MOUNT" 2>/dev/null && active="yes"
+
+    local choice
+    choice=$(whiptail --title "Mount: $name" \
+        --menu "${body_ctx}\n  currently mounted: ${active}" \
+        16 "$WT_WIDTH" 5 \
+        "1" "Mount now" \
+        "2" "Unmount now" \
+        "3" "List share contents (read-only)" \
+        "B" "Back" \
+        3>&1 1>&2 2>&3) || return
+    case "$choice" in
+        1)
+            if [[ "$active" == "yes" ]]; then info "Already mounted."; return; fi
+            if mount "$BACKEND_MOUNT" 2>&1 | tee /tmp/smbproxy-mount.$$; then
+                info "Mounted '$name' at ${BACKEND_MOUNT}."
+            else
+                whiptail --title "mount failed: $name" --textbox /tmp/smbproxy-mount.$$ 18 "$WT_WIDTH"
+            fi
+            rm -f /tmp/smbproxy-mount.$$
+            ;;
+        2)
+            if [[ "$active" != "yes" ]]; then info "Not mounted."; return; fi
+            if umount "$BACKEND_MOUNT" 2>&1 | tee /tmp/smbproxy-umount.$$; then
+                info "Unmounted '$name'."
+            else
+                whiptail --title "umount failed: $name" --textbox /tmp/smbproxy-umount.$$ 18 "$WT_WIDTH"
+            fi
+            rm -f /tmp/smbproxy-umount.$$
+            ;;
+        3)
+            if [[ "$active" != "yes" ]]; then
+                if ! mount "$BACKEND_MOUNT"; then
+                    info "Cannot mount '$name' — see system logs."
+                    return
+                fi
+            fi
+            local out=/tmp/smbproxy-ls.$$
+            ls -lah "$BACKEND_MOUNT" 2>&1 | head -200 > "$out"
+            whiptail --title "Share contents: $name (${BACKEND_MOUNT})" \
+                --scrolltext --textbox "$out" "$WT_HEIGHT" "$WT_WIDTH"
+            rm -f "$out"
+            ;;
+    esac
+}
+
+menu_shares() {
+    while true; do
+        load_deploy
+        local header; header="Shares: $(get_shares_status)"
+        local choice
+        choice=$(whiptail --title "Proxied Shares" \
+            --menu "${header}" \
+            "$WT_HEIGHT" "$WT_WIDTH" 10 \
+            "1" "List shares (status)" \
+            "2" "Add a new proxied share" \
+            "3" "Edit an existing share" \
+            "4" "Remove a share" \
+            "5" "Mount / unmount a share / list contents" \
+            "6" "Show smb.conf" \
+            "7" "Run testparm -s" \
+            "B" "Back" \
+            3>&1 1>&2 2>&3) || return
+        case "$choice" in
+            1) shares_list_status ;;
+            2) shares_add_wizard ;;
+            3) shares_edit_picker ;;
+            4) shares_remove_picker ;;
+            5) shares_mount_picker ;;
+            6) show_smbconf ;;
+            7) run_testparm ;;
+            B|b) return ;;
+        esac
+    done
 }
 
 #===============================================================================
