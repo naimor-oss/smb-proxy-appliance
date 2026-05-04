@@ -1,6 +1,7 @@
-# lab/scenarios/backend-mount.sh — mount the real WS2008 SP2 share
-# at //SC_BACKEND_IP/SC_BACKEND_SHARE through the proxy's cifs client
-# with the locking-correct mount options (vers=1.0, nobrl,
+# lab/scenarios/backend-mount.sh — configure ONE proxied share's
+# backend half via `smbproxy-sconfig --configure-share` (without
+# --group, so smb.conf is not touched), and verify the cifs mount
+# comes up with the locking-correct options (vers=1.0, nobrl,
 # cache=none, serverino).
 #
 # Sourced by lab/run-scenario.sh. Has access to ssh_host / ssh_vm /
@@ -9,7 +10,8 @@
 # pre_hook: bootstrap_network — assigns NIC roles and brings up the
 # legacy NIC IP. Backend mount is independent of AD join (cifs uses
 # username/password creds, not Kerberos), so this scenario does not
-# require the proxy to be domain-joined.
+# require the proxy to be domain-joined and deliberately omits
+# --group from --configure-share to test that "backend-only" path.
 #
 # Backend credentials handling:
 #   - SC_BACKEND_PASS must be set in the runner's environment.
@@ -18,23 +20,26 @@
 #     `SC_BACKEND_PASS='...'` line into that file is the recommended
 #     local workflow.
 #   - This scenario file MUST NOT contain the password. The sketch
-#     in docs/sketch-smb1-smb3-proxy.sh has the original value.
+#     in docs/sketch-smb1-smb3-proxy.sh has the original placeholder.
 #
 # Overridable via env (defaults track the sketch):
-#   SC_BACKEND_IP, SC_BACKEND_SHARE, SC_BACKEND_USER, SC_BACKEND_DOMAIN,
-#   SC_BACKEND_MOUNT, SC_FORCE_USER, SC_BACKEND_PASS
+#   SC_SHARE_NAME         the canonical share name (used at both ends)
+#   SC_BACKEND_IP, SC_BACKEND_USER, SC_BACKEND_DOMAIN, SC_BACKEND_MOUNT
+#   SC_FORCE_USER         local Linux account; defaults to SC_BACKEND_USER
+#   SC_BACKEND_PASS       cifs password (required, not defaulted here)
 
 source "$(dirname "${BASH_SOURCE[0]}")/bootstrap-network.sh"
 
+SC_SHARE_NAME="${SC_SHARE_NAME:-ProfitFab\$}"
 SC_BACKEND_IP="${SC_BACKEND_IP:-172.29.137.1}"
-SC_BACKEND_SHARE="${SC_BACKEND_SHARE:-ProfitFab\$}"
 SC_BACKEND_USER="${SC_BACKEND_USER:-pfuser}"
 SC_BACKEND_DOMAIN="${SC_BACKEND_DOMAIN:-LEGACY}"
-SC_BACKEND_MOUNT="${SC_BACKEND_MOUNT:-/mnt/profitfab}"
+SC_BACKEND_MOUNT="${SC_BACKEND_MOUNT:-/mnt/legacy/ProfitFab_}"
 SC_FORCE_USER="${SC_FORCE_USER:-pfuser}"
 
-# Action functions, also called by downstream scenarios
-# (frontend-share, end-to-end) that source this file.
+# Safe-name derivation matching share_safe_name() in smbproxy-sconfig.
+# Used to predict the on-disk creds file path for the verify checks.
+sanitize() { printf '%s' "${1//[^A-Za-z0-9_]/_}"; }
 
 require_backend_pass() {
     if [[ -z "${SC_BACKEND_PASS:-}" ]]; then
@@ -46,18 +51,30 @@ require_backend_pass() {
     fi
 }
 
+# Action function — also called by downstream scenarios (frontend-share,
+# end-to-end, multi-share) that source this file. Configures the
+# backend half WITHOUT publishing the smb.conf section (no --group).
+# Override SC_GROUP from a downstream scenario to also publish.
 do_configure_backend() {
-    # SC_BACKEND_SHARE may contain a literal '$' (e.g. ProfitFab$).
-    # Quote everything single so the local shell doesn't expand it
-    # before ssh; ssh_vm wraps the whole thing in another layer of
-    # quoting, hence the careful escaping.
-    ssh_vm "echo '$SC_BACKEND_PASS' | sudo smbproxy-sconfig --configure-backend \
-        --ip '$SC_BACKEND_IP' \
-        --share '$SC_BACKEND_SHARE' \
-        --user '$SC_BACKEND_USER' \
-        --domain '$SC_BACKEND_DOMAIN' \
+    local extra=""
+    if [[ -n "${SC_GROUP:-}" ]]; then
+        # Pass --group through too — used by frontend-share / end-to-end /
+        # multi-share scenarios that want a fully-published share rather
+        # than just the cifs mount.
+        extra="--group '$SC_GROUP'"
+    fi
+    # SC_SHARE_NAME may contain a literal '$' (e.g. ProfitFab$). Quote
+    # everything single so the local shell doesn't expand it before ssh;
+    # ssh_vm wraps the whole thing in another layer of quoting.
+    # shellcheck disable=SC2086
+    ssh_vm "echo '$SC_BACKEND_PASS' | sudo smbproxy-sconfig --configure-share \
+        --name '$SC_SHARE_NAME' \
+        --backend-ip '$SC_BACKEND_IP' \
+        --backend-user '$SC_BACKEND_USER' \
+        --backend-domain '$SC_BACKEND_DOMAIN' \
         --mount '$SC_BACKEND_MOUNT' \
         --force-user '$SC_FORCE_USER' \
+        $extra \
         --pass-stdin"
 
     say "trigger automount by accessing the mount point"
@@ -79,13 +96,16 @@ run_scenario() {
 
 verify() {
     local rc=0 out
+    local safe; safe=$(sanitize "$SC_SHARE_NAME")
+    local creds="/etc/samba/.creds-${safe}"
+    local state="/var/lib/smbproxy/shares/${safe}.env"
 
     say "creds file is mode 0600 root:root and contains the right username/domain"
-    out=$(ssh_vm 'sudo stat -c "%a %U %G" /etc/samba/.legacy_creds' 2>&1 || true)
+    out=$(ssh_vm "sudo stat -c '%a %U %G' '$creds'" 2>&1 || true)
     echo "$out"
-    grep -qE '^600 root root' <<< "$out" || { say "wrong perms on creds file"; rc=1; }
+    grep -qE '^600 root root' <<< "$out" || { say "wrong perms on $creds"; rc=1; }
     # Inspect the file's username/domain lines but NEVER print the password.
-    out=$(ssh_vm "sudo grep -E '^(username|domain)=' /etc/samba/.legacy_creds" 2>&1 || true)
+    out=$(ssh_vm "sudo grep -E '^(username|domain)=' '$creds'" 2>&1 || true)
     echo "$out"
     grep -qF "username=${SC_BACKEND_USER}" <<< "$out" || { say "creds username wrong"; rc=1; }
     grep -qF "domain=${SC_BACKEND_DOMAIN}"  <<< "$out" || { say "creds domain wrong"; rc=1; }
@@ -98,17 +118,12 @@ verify() {
     grep -qF "cache=none"   <<< "$out" || { say "fstab missing cache=none";  rc=1; }
     grep -qF "serverino"    <<< "$out" || { say "fstab missing serverino";   rc=1; }
     grep -qF "x-systemd.automount" <<< "$out" || { say "fstab missing automount"; rc=1; }
+    grep -qF "credentials=${creds}" <<< "$out" || { say "fstab points at the wrong creds file"; rc=1; }
 
     say "force-user account exists with nologin shell"
     out=$(ssh_vm "getent passwd '$SC_FORCE_USER'" 2>&1 || true)
     echo "$out"
     grep -qE ':/usr/sbin/nologin$' <<< "$out" || { say "$SC_FORCE_USER missing or has a login shell"; rc=1; }
-
-    say "mount point exists and is owned by force-user"
-    out=$(ssh_vm "stat -c '%U %G' '$SC_BACKEND_MOUNT'" 2>&1 || true)
-    echo "$out"
-    # Owner check is informational — sometimes a fresh mountpoint owned by
-    # root is acceptable when the cifs mount is already on top.
 
     say "cifs mount is live with vers=1.0, nobrl, cache=none, serverino"
     out=$(ssh_vm 'mount | grep "type cifs "' 2>&1 || true)
@@ -124,8 +139,6 @@ verify() {
     if grep -qiE 'permission denied|i/o error|cannot access|no such file' <<< "$out"; then
         say "ls reported an error — mount is up but not readable"; rc=1
     fi
-    # An empty share is suspicious for a real WS2008 backend; warn but
-    # don't fail (the share could legitimately be empty in a fresh lab).
     if [[ -z "$out" ]]; then
         say "  warning: mount is empty (legitimate for a fresh share, suspicious otherwise)"
     fi
@@ -141,13 +154,13 @@ verify() {
         say "  smbd not running yet (frontend-share scenario starts it); skipping smbstatus"
     fi
 
-    say "deploy.env persisted the backend coordinates"
-    out=$(ssh_vm "sudo grep -E '^BACKEND_(IP|SHARE|USER|DOMAIN|MOUNT)=' /var/lib/smbproxy/deploy.env" 2>&1 || true)
+    say "per-share state file persisted the backend coordinates"
+    out=$(ssh_vm "sudo cat '$state'" 2>&1 || true)
     echo "$out"
-    grep -qF "BACKEND_IP=\"${SC_BACKEND_IP}\""       <<< "$out" || rc=1
-    grep -qF "BACKEND_SHARE=\"${SC_BACKEND_SHARE}\"" <<< "$out" || rc=1
-    grep -qF "BACKEND_USER=\"${SC_BACKEND_USER}\""   <<< "$out" || rc=1
-    grep -qF "BACKEND_MOUNT=\"${SC_BACKEND_MOUNT}\"" <<< "$out" || rc=1
+    grep -qF "SHARE_NAME=\"${SC_SHARE_NAME}\""       <<< "$out" || { say "SHARE_NAME wrong"; rc=1; }
+    grep -qF "BACKEND_IP=\"${SC_BACKEND_IP}\""       <<< "$out" || { say "BACKEND_IP wrong"; rc=1; }
+    grep -qF "BACKEND_USER=\"${SC_BACKEND_USER}\""   <<< "$out" || { say "BACKEND_USER wrong"; rc=1; }
+    grep -qF "BACKEND_MOUNT=\"${SC_BACKEND_MOUNT}\"" <<< "$out" || { say "BACKEND_MOUNT wrong"; rc=1; }
 
     return "$rc"
 }
