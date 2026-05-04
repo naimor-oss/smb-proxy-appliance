@@ -46,10 +46,11 @@ other on disk:
 | `lab/scenarios/smoke-prepared-image.sh` | Verifies a freshly reverted `golden-image` is a clean, unprovisioned proxy base. |
 | `lab/scenarios/bootstrap-network.sh` | Headless equivalent of `smbproxy-init`'s NIC-roles + legacy-IP step. Used as a `pre_hook` by every downstream scenario. |
 | `lab/scenarios/join-domain.sh` | Joins `lab.test` via `smbproxy-sconfig --join-domain`. AD cleanup respects `--no-cleanup` / `--dry-cleanup`. |
-| `lab/scenarios/backend-mount.sh` | Mounts the WS2008 SP2 share via `--configure-backend`. Reads `SC_BACKEND_PASS` from `lab/backend-creds.env` (gitignored). |
-| `lab/scenarios/frontend-share.sh` | Composes bootstrap + join + backend, then `--configure-frontend` + `--apply-firewall`. Verifies SMB3 + Kerberos access. |
+| `lab/scenarios/backend-mount.sh` | Configures one share's backend half via `--configure-share` (no `--group`). Reads `SC_BACKEND_PASS` from `lab/backend-creds.env` (gitignored). |
+| `lab/scenarios/frontend-share.sh` | Composes bootstrap + join + full `--configure-share` (with `--group`) + `--apply-firewall`. Verifies SMB3 + Kerberos access. |
+| `lab/scenarios/multi-share.sh` | Configures TWO shares from the same backend with different creds + AD groups; verifies independence; exercises `--remove-share` while another share is configured. |
 | `lab/scenarios/end-to-end.sh` | Single-shot release-gate test. Optional WS2008 read/write roundtrip via `SC_WRITE_ROUNDTRIP=1`. |
-| `lab/backend-creds.env.example` | Template for the gitignored `lab/backend-creds.env` (set `SC_BACKEND_PASS` for backend / frontend / end-to-end scenarios). |
+| `lab/backend-creds.env.example` | Template for the gitignored `lab/backend-creds.env`. Single-share scenarios need `SC_BACKEND_PASS`; `multi-share` also needs `SC_BACKEND_PASS_B`. |
 | `lab/templates/cloud-init/` | NoCloud seed templates (meta-data, network-config matching by domain MAC, user-data with operator pubkeys). |
 | `lab/keys/` | Operator SSH pubkeys baked into the image at build time. See `lab/keys/README.md`. |
 | `docs/SETUP.md` | Mac + Hyper-V environment setup, LegacyZone vSwitch, dnsmasq reservation. |

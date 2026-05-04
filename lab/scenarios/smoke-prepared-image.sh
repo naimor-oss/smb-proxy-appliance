@@ -54,7 +54,11 @@ verify() {
     fi
 
     say "no backend cifs creds file in the image"
-    ssh_vm 'test ! -e /etc/samba/.legacy_creds && test ! -e /etc/samba/.ws2008_creds' || { say "credential file present in golden image"; rc=1; }
+    # Multi-share lays creds at /etc/samba/.creds-<safe>; legacy
+    # singleton path /etc/samba/.legacy_creds and the original
+    # sketch's /etc/samba/.ws2008_creds are also checked for
+    # belt-and-suspenders.
+    ssh_vm 'sudo bash -c "shopt -s nullglob; f=(/etc/samba/.creds-* /etc/samba/.legacy_creds /etc/samba/.ws2008_creds); [[ \${#f[@]} -eq 0 ]]"' || { say "credential file present in golden image"; rc=1; }
 
     say "no backend cifs mount active"
     out=$(ssh_vm 'mount | grep -E "type cifs " || true' 2>&1 || true)

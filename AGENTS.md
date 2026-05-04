@@ -15,8 +15,10 @@ work here. This file covers what's specific to `smb-proxy-appliance`.
 
 Build and test an **SMB1↔SMB3 protocol-version proxy appliance** on Debian
 13. The appliance fronts a hardened Windows Server 2008 SP2 file server
-(reachable only over a dedicated point-to-point link) and re-publishes its
-share to a modern Windows Server 2025 forest as an AD-joined SMB3 share.
+(reachable only over a dedicated point-to-point link) and re-publishes
+**one or more of its shares** to a modern Windows Server 2025 forest as
+AD-joined SMB3 shares — each share with independent backend credentials
+and AD access groups.
 
 Primary use case: serving multi-user Clarion `.TPS` (ISAM) database files
 to AD-joined Windows 11 clients while the byte-range locking and oplock
@@ -28,8 +30,9 @@ The appliance has two core scripts:
 - `prepare-image.sh`: one-time Debian image preparation. Vendor-neutral,
   realm-neutral, credential-free. Produces a host-agnostic master image.
 - `smbproxy-sconfig.sh`: whiptail TUI plus headless CLI for NIC role
-  assignment, AD domain join, backend SMB1 mount management, frontend
-  SMB3 share publication, hardening, diagnostics, and service maintenance.
+  assignment, AD domain join, multi-share management (add / edit /
+  remove / mount each proxied share with its own creds + AD group),
+  hardening, diagnostics, and service maintenance.
 
 This repo is a sibling of:
 
@@ -106,17 +109,60 @@ Show NIC role mapping:
 ssh -J nmadmin@server debadmin@<proxy> 'cat /etc/smbproxy/nic-roles.env'
 ```
 
-Verify backend mount + share locks:
+List configured proxied shares + their state:
+
+```bash
+ssh -J nmadmin@server debadmin@<proxy> 'sudo smbproxy-sconfig --list-shares'
+ssh -J nmadmin@server debadmin@<proxy> 'sudo smbproxy-sconfig --status'
+```
+
+Verify backend mounts + share locks (one cifs entry per share):
 
 ```bash
 ssh -J nmadmin@server debadmin@<proxy> 'sudo mount | grep cifs; sudo smbstatus -L'
 ```
+
+## Multi-share data model
+
+Each proxied share has independent state:
+
+- `/var/lib/smbproxy/shares/<safe>.env` — the share's
+  non-credential coordinates (`SHARE_NAME`, `BACKEND_IP`,
+  `BACKEND_USER`, `BACKEND_DOMAIN`, `BACKEND_MOUNT`, `FRONT_GROUP`,
+  `FRONT_FORCE_USER`).
+- `/etc/samba/.creds-<safe>` (mode 0600 root:root) — the cifs
+  username / password / domain for THIS share's backend mount. Each
+  share authenticates to the WS2008 backend with its own account.
+- One line in `/etc/fstab` per share, each pointing at its own
+  creds file.
+- One `[SHARE_NAME]` section in `/etc/samba/smb.conf` per share.
+
+`SHARE_NAME` is used as **both** the WS2008 backend share name and
+the published SMB3 share name (operator picks one name; it appears
+at both ends). `<safe>` is `SHARE_NAME` with non-alphanumeric
+characters replaced by underscore — a `$`-bearing share like
+`ProfitFab$` stores as `ProfitFab_.env` / `.creds-ProfitFab_` on the
+filesystem while the literal name lives in `SHARE_NAME` and in
+`smb.conf`.
+
+Domain-level state (`REALM`, `DOMAIN_SHORT`, `DC_HOST`, `DC_IP`)
+lives in `/var/lib/smbproxy/deploy.env`; nothing share-specific is
+kept there.
 
 ## Development Rules
 
 - Prefer small, reviewable changes.
 - Never bake realm, DC IP, WS2008 IP, share name, or credentials into
   `prepare-image.sh`. They belong in `smbproxy-sconfig`.
+- For any whiptail dialog that operates on **one specific share**
+  (input prompt, password prompt, confirmation yesno), put the share
+  name in the dialog **body**, not just the title. Title-only context
+  is too subtle for an operator working through a multi-share flow.
+  The convention used throughout `menu_shares` is to open the body
+  with `Share: ${SHARE_NAME}` on its own line followed by a blank
+  line and then the prompt. Same rule applies to per-NIC dialogs
+  (the role being assigned goes in the body) and any future
+  per-instance dialog.
 - Never commit `*creds*` files or anything containing the WS2008 backend
   password. The `.gitignore` covers the obvious paths; if you add a new
   one, extend the `.gitignore` rather than rely on memory.
@@ -137,11 +183,15 @@ ssh -J nmadmin@server debadmin@<proxy> 'sudo mount | grep cifs; sudo smbstatus -
   baseline. Do not enable nmbd; the WS2025 forest does not use NetBIOS.
 - Time sync is critical for Kerberos. The proxy's chrony source is the
   WS2025 DC after join (set by `smbproxy-sconfig`), not a public pool.
-- Backend cifs creds live at `/etc/samba/.legacy_creds`, mode 600,
-  owned by root. The frontend share enforces a domain group via
-  `valid users = @"DOMAIN\\Group"` and maps all incoming AD identities
-  to a single local backend user via `force user` — that user is the one
-  whose credentials sit in `.legacy_creds`.
+- Backend cifs creds live at `/etc/samba/.creds-<safe>`, mode 0600,
+  owned by root, **one file per proxied share**. Each frontend
+  share section enforces an AD security group via
+  `valid users = @"DOMAIN\\Group"` and maps all incoming AD
+  identities to a single local backend user via `force user` —
+  that user is the one whose credentials sit in this share's
+  `.creds-<safe>` file. Different shares can use different backend
+  users with different passwords against the same WS2008 server;
+  that's the multi-share model.
 
 ## Private Agent State
 
