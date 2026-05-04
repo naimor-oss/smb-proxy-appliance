@@ -437,9 +437,22 @@ run_updates_now() {
     clear
     echo "[sconfig] apt update..."
     apt-get update
-    echo "[sconfig] apt upgrade..."
-    DEBIAN_FRONTEND=noninteractive apt-get upgrade -y
-    echo "[sconfig] done — press Enter to continue"
+    echo "[sconfig] apt full-upgrade..."
+    echo "[sconfig]   note: full-upgrade can install new dependencies"
+    echo "[sconfig]   (e.g. new kernel packages). Plain 'apt-get upgrade'"
+    echo "[sconfig]   would silently keep them back."
+    echo
+    DEBIAN_FRONTEND=noninteractive apt-get full-upgrade -y
+    echo
+    echo "=============================================================="
+    if [[ -f /var/run/reboot-required ]]; then
+        echo "  REBOOT REQUIRED — a kernel or library that's currently"
+        echo "  loaded was upgraded. Run 'sudo reboot' to apply."
+    else
+        echo "  Done. No reboot required."
+    fi
+    echo "=============================================================="
+    echo "  Press Enter to continue."
     read -r _
 }
 

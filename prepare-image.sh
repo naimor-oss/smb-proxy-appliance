@@ -896,6 +896,23 @@ count_upgrades() {
     if [[ -z "$(ip route show default 2>/dev/null)" ]]; then
         echo "0 0"; return
     fi
+    # Refresh apt indexes if the cache is older than 1h. Without this,
+    # `apt list --upgradable` reports against whatever the cache held
+    # at last refresh — and on a fresh deployment a few days after
+    # image build, the cache is stale and reports 0 even when real
+    # security updates are pending. Throttle so menu re-renders stay
+    # cheap (cold first-boot pays ~30s once; warm re-renders are free).
+    local now mtime cache_age
+    if [[ -f /var/cache/apt/pkgcache.bin ]]; then
+        now=$(date +%s)
+        mtime=$(stat -c %Y /var/cache/apt/pkgcache.bin 2>/dev/null || echo 0)
+        cache_age=$(( now - mtime ))
+    else
+        cache_age=999999
+    fi
+    if (( cache_age > 3600 )); then
+        sudo apt-get update -qq >/dev/null 2>&1 || true
+    fi
     local upg sec
     upg=$(apt list --upgradable 2>/dev/null | grep -cv '^Listing')
     sec=$(apt list --upgradable 2>/dev/null | grep -c -- '-security')
@@ -1300,15 +1317,29 @@ BAN
         "${DET_DEFAULT_IP:-<none>}" "${DET_DEFAULT_GATEWAY:-<none>}"
     [[ -f "$DEFAULT_PWD_MARKER" ]] && \
         echo "  Default password ACTIVE — change before remote use"
+    [[ -f /var/run/reboot-required ]] && \
+        echo "  REBOOT REQUIRED — pick [R] to apply pending kernel/library upgrades"
     echo "=============================================================="
 }
 
 action_update() {
     clear
-    echo "Refreshing apt indexes and applying upgrades..."
-    sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get -y upgrade
+    echo "Refreshing apt indexes and applying upgrades (full-upgrade)..."
+    echo "Note: full-upgrade can install new dependencies (kernels, etc.)."
+    echo "      Plain 'apt-get upgrade' would silently keep them back."
     echo
-    echo "  Done. Press Enter."
+    sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get -y full-upgrade
+    echo
+    echo "=============================================================="
+    if [[ -f /var/run/reboot-required ]]; then
+        echo "  REBOOT REQUIRED — a kernel or library that's currently"
+        echo "  loaded was upgraded. Pick [R] from the menu (or run"
+        echo "  'sudo reboot') to apply the new version."
+    else
+        echo "  Done. No reboot required."
+    fi
+    echo "=============================================================="
+    echo "  Press Enter to return to the menu."
     read -r _
 }
 
