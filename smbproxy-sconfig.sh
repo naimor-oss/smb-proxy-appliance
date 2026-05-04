@@ -392,12 +392,15 @@ reassign_roles() {
     fi
 
     local pick_dom pick_leg
-    pick_dom=$(whiptail --title "Domain NIC" --notags \
-        --menu "Pick the AD-LAN interface." \
+    # Body text repeats the role being assigned so the operator never has
+    # to look at the title bar to know which NIC they're picking. (Per
+    # dev-commons/STYLE.md §7 / §3 — title-only context is too subtle.)
+    pick_dom=$(whiptail --title "Assign role: Domain NIC" --notags \
+        --menu "Assigning the DOMAIN NIC (AD-LAN side).\n\nPick the interface that is on the same network as the Windows DC." \
         $WT_HEIGHT $WT_WIDTH $WT_MENU_HEIGHT \
         "${menu_args[@]}" 3>&1 1>&2 2>&3) || return
-    pick_leg=$(whiptail --title "Legacy NIC" --notags \
-        --menu "Pick the LegacyZone interface (gateway-less)." \
+    pick_leg=$(whiptail --title "Assign role: Legacy NIC" --notags \
+        --menu "Assigning the LEGACY NIC (LegacyZone, gateway-less).\n\nPick the interface that connects to the WS2008 SP2 backend." \
         $WT_HEIGHT $WT_WIDTH $WT_MENU_HEIGHT \
         "${menu_args[@]}" 3>&1 1>&2 2>&3) || return
     if [[ "$pick_dom" == "$pick_leg" ]]; then
@@ -1036,10 +1039,64 @@ install_firewall() {
 }
 
 show_firewall() {
-    local out=/tmp/smbproxy-nft.$$
-    nft list ruleset > "$out" 2>&1
-    whiptail --title "Live nftables ruleset" --scrolltext --textbox "$out" "$WT_HEIGHT" "$WT_WIDTH"
-    rm -f "$out"
+    local full=/tmp/smbproxy-nft-full.$$
+    local view=/tmp/smbproxy-nft-view.$$
+
+    # Capture once, no streaming. nft itself is one-shot — `list ruleset`
+    # emits the current ruleset and exits — so any "never stops" symptom
+    # comes from below, not from nft.
+    if ! nft list ruleset > "$full" 2>&1; then
+        whiptail --title "nftables not loaded" --msgbox \
+            "$(cat "$full")\n\n(use 'Render and install ruleset' first)" \
+            14 "$WT_WIDTH"
+        rm -f "$full"
+        return
+    fi
+
+    # Suppress kernel console messages while the textbox is up. nftables
+    # `log` rules can fire to /dev/console mid-display and look as if the
+    # textbox is endlessly streaming text — the screen fills, you can't
+    # tell where the textbox ended. printk level 3 keeps WARNING+ only,
+    # which is rarely chatty. Restored on exit even if whiptail dies.
+    local prev_printk
+    prev_printk=$(awk '{print $1}' /proc/sys/kernel/printk 2>/dev/null)
+    [[ -n "$prev_printk" ]] && echo 3 > /proc/sys/kernel/printk 2>/dev/null
+    # shellcheck disable=SC2064
+    trap "[[ -n '$prev_printk' ]] && echo $prev_printk > /proc/sys/kernel/printk 2>/dev/null; rm -f '$full' '$view'" RETURN
+
+    # Cap the in-textbox view. Whiptail's --textbox can wedge or trash
+    # the terminal on very large files (anecdotally over a few thousand
+    # lines, with --scrolltext). Showing the head + a pointer to the
+    # full file gives the operator the relevant 99% inline and an exit
+    # path for the long tail.
+    local total
+    total=$(wc -l < "$full" 2>/dev/null | tr -d ' ')
+    {
+        echo "# Live nftables ruleset (first 200 lines of $total)"
+        echo "# Full output saved to: $full  (run 'sudo less $full' on a separate session)"
+        echo
+        head -200 "$full"
+        if [[ "${total:-0}" -gt 200 ]]; then
+            echo
+            echo "# ...output truncated at 200 lines, see $full for the rest..."
+        fi
+    } > "$view"
+
+    # Run whiptail; if it exits non-zero (terminal too small, no curses,
+    # binary garbled output), fall back to a pager so the operator
+    # always gets something useful.
+    if ! whiptail --title "Live nftables ruleset" --scrolltext \
+            --textbox "$view" "$WT_HEIGHT" "$WT_WIDTH" 2>/dev/null; then
+        clear 2>/dev/null || true
+        echo "(whiptail textbox failed; falling back to less. Press 'q' to exit.)" >&2
+        if command -v less >/dev/null 2>&1; then
+            less -F -X "$view" || true
+        else
+            cat "$view"
+            read -rp "press Enter to continue " _ </dev/tty
+        fi
+    fi
+    # Note: trap RETURN handles cleanup including printk restore.
 }
 
 disable_firewall() {
