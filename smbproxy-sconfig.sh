@@ -1031,12 +1031,37 @@ configure_share() {
         && -n "$BACKEND_MOUNT" && -n "$FRONT_FORCE_USER" ]] \
         || return 2
 
-    # Local backend force-user must exist before we set the cifs
-    # uid/gid mount options against it.
-    if ! id "$FRONT_FORCE_USER" &>/dev/null; then
+    # Local backend force-user must exist as a *local* /etc/passwd
+    # entry before we set the cifs uid/gid mount options against it.
+    #
+    # IMPORTANT: check /etc/passwd directly, not via `id` or `getent`.
+    # With `winbind use default domain = yes` (which we set in
+    # do_domain_join), winbind publishes every AD account to NSS under
+    # its bare lowercased name. If the operator picks a force-user
+    # name that happens to also exist in AD, `id NAME` returns the AD
+    # account's UID and useradd is silently skipped — leaving the
+    # share's force-user pointing at the AD account instead of a local
+    # account. The cifs mount then ends up with an AD UID, smb.conf's
+    # `force user` resolves to the AD account, and Samba's tree-connect
+    # path corrupts under the resulting double-mapping. Hit this on
+    # production 2026-05-05 with `force user = AMTOperator` colliding
+    # with NAIMOR\AMTOperator.
+    if grep -q "^${FRONT_FORCE_USER}:" /etc/passwd 2>/dev/null; then
+        : # local account already exists, leave it alone
+    else
+        # Warn loudly if the requested name is published by NSS via
+        # winbind (i.e. an AD account by the same name exists). The
+        # local account we are about to create will shadow the AD one
+        # for getpwnam in nsswitch order (files first), but the
+        # operator should know they picked a colliding name.
+        if id "$FRONT_FORCE_USER" &>/dev/null; then
+            log_join "WARN: requested force-user '${FRONT_FORCE_USER}' also exists as an AD account."
+            log_join "WARN: a local /etc/passwd entry will be created and used; the AD account will be shadowed for"
+            log_join "WARN: getpwnam lookups on this proxy. Consider picking a name that does not collide."
+        fi
         useradd -M -s /usr/sbin/nologin "$FRONT_FORCE_USER"
     fi
-    if ! getent group "$FRONT_FORCE_USER" >/dev/null 2>&1; then
+    if ! grep -q "^${FRONT_FORCE_USER}:" /etc/group 2>/dev/null; then
         groupadd "$FRONT_FORCE_USER" 2>/dev/null || true
     fi
 
@@ -1058,18 +1083,36 @@ EOF
     chown root:root "$creds"
     umask 022
 
-    # fstab entry. The cifs kernel module honors vers=1.0 independent
-    # of Samba's `client min protocol`. Locking is deliberately disabled
-    # at the mount layer (`nobrl`) so all locking is enforced at the
-    # Samba share — see AGENTS.md for the rationale. cache=none avoids
-    # the read cache that could mask conflicts; serverino keeps inode
-    # numbers stable across remounts. x-systemd.automount mounts the
-    # share lazily on first access (so a flaky backend doesn't block
-    # boot).
+    # fstab entry. Mount-option rationale:
+    #   vers=1.0          honored by cifs.ko independent of Samba's
+    #                     `client min protocol = SMB3`; the kernel
+    #                     speaks SMB1 to WS2008 even though Samba
+    #                     speaks SMB3 frontwise.
+    #   nobrl             do not propagate byte-range locks to the
+    #                     backend. Locking is enforced at the Samba
+    #                     share — see AGENTS.md for the rationale.
+    #   cache=none        no read cache; conflicts can't be masked.
+    #   serverino         stable inode numbers across remounts.
+    #   nosharesock       force a separate TCP/SMB session per mount.
+    #                     Without this, two mounts to the same backend
+    #                     with different per-share creds end up
+    #                     multiplexed on one session and the second
+    #                     mount silently uses the first's credentials
+    #                     — defeating per-share creds entirely. The
+    #                     production multi-share test 2026-05-05 hit
+    #                     exactly this; nosharesock is non-optional.
+    #   x-systemd.automount  mount lazily on first access so a flaky
+    #                     backend doesn't block boot.
+    # Resolve to numeric UID/GID locally to lock in the LOCAL account
+    # (per the comment above on default-domain ambiguity).
     local fu_uid fu_gid
-    fu_uid=$(id -u "$FRONT_FORCE_USER")
-    fu_gid=$(id -g "$FRONT_FORCE_USER")
-    local fstab_line="//${BACKEND_IP}/${SHARE_NAME} ${BACKEND_MOUNT} cifs credentials=${creds},vers=1.0,cache=none,serverino,nobrl,uid=${fu_uid},gid=${fu_gid},file_mode=0660,dir_mode=0770,_netdev,x-systemd.automount,x-systemd.requires=network-online.target 0 0"
+    fu_uid=$(awk -F: -v u="$FRONT_FORCE_USER" '$1==u {print $3; exit}' /etc/passwd)
+    fu_gid=$(awk -F: -v u="$FRONT_FORCE_USER" '$1==u {print $4; exit}' /etc/passwd)
+    if [[ -z "$fu_uid" || -z "$fu_gid" ]]; then
+        log_join "ERROR: failed to resolve LOCAL UID/GID for force-user '${FRONT_FORCE_USER}'"
+        return 5
+    fi
+    local fstab_line="//${BACKEND_IP}/${SHARE_NAME} ${BACKEND_MOUNT} cifs credentials=${creds},vers=1.0,cache=none,nosharesock,serverino,nobrl,uid=${fu_uid},gid=${fu_gid},file_mode=0660,dir_mode=0770,_netdev,x-systemd.automount,x-systemd.requires=network-online.target 0 0"
     sed -i "\| ${BACKEND_MOUNT} cifs |d" /etc/fstab
     echo "$fstab_line" >> /etc/fstab
     systemctl daemon-reload
@@ -1078,6 +1121,26 @@ EOF
     # is set. Operator can add a share's backend before joining and
     # publish the frontend afterward.
     if is_joined && [[ -n "$FRONT_GROUP" ]]; then
+        # Resolve the AD group to its SID at config time. SID-based
+        # `valid users` is unambiguous, NSS-independent, and immune
+        # to the `winbind use default domain = yes` parsing quirk that
+        # makes `valid users = @"DOMAIN\Group"` fail to match in
+        # Samba 4.22 on this appliance. wbinfo --name-to-sid output
+        # shape: `<SID> <type-name> (<type-id>)`.
+        local group_sid
+        group_sid=$(wbinfo --name-to-sid="$FRONT_GROUP" 2>/dev/null | awk '{print $1}')
+        if [[ -z "$group_sid" || ! "$group_sid" =~ ^S-1- ]]; then
+            log_join "ERROR: cannot resolve AD group '${FRONT_GROUP}' to a SID via winbind."
+            log_join "ERROR: is the group name correct? Is winbind reachable? (try 'wbinfo --name-to-sid=\"${FRONT_GROUP}\"')"
+            return 6
+        fi
+
+        # Resolve force_user to its LOCAL UID for the same reason as
+        # the cifs uid= option above — `force user = NAME` would be
+        # ambiguous under default-domain mode if the name collides
+        # with an AD account. Numeric UID is unambiguous.
+        # (We already resolved fu_uid above; reuse it.)
+
         # Strip any prior [SHARE_NAME] section, then append fresh.
         awk -v sname="[$SHARE_NAME]" '
             BEGIN { in_share=0 }
@@ -1092,13 +1155,19 @@ EOF
     path = ${BACKEND_MOUNT}
     read only = no
     guest ok = no
-    valid users = @"${FRONT_GROUP}"
+    # AD-side ACL: only members of '${FRONT_GROUP}' (resolved at
+    # config-time to its SID; SID is unambiguous and immune to the
+    # default-domain NSS-name quirk that breaks @"DOMAIN\Group" form).
+    valid users = ${group_sid}
 
     # All AD identities authenticated to this share are mapped to
-    # ${FRONT_FORCE_USER}, whose creds in ${creds} authenticate the
-    # cifs mount to the WS2008 backend.
-    force user = ${FRONT_FORCE_USER}
-    force group = ${FRONT_FORCE_USER}
+    # the LOCAL Linux account uid=${fu_uid} (${FRONT_FORCE_USER}),
+    # whose creds in ${creds} authenticate the cifs mount to the
+    # WS2008 backend. Numeric UID written here so this resolves to
+    # the local account regardless of any AD account by the same
+    # name (default-domain ambiguity defense).
+    force user = ${fu_uid}
+    force group = ${fu_gid}
 
     # Strict locking for ISAM/.TPS multi-user databases; do NOT relax
     # without reading AGENTS.md first.
