@@ -85,9 +85,35 @@ verify() {
     grep -qE 'strict locking[[:space:]]*=[[:space:]]*yes' <<< "$out" || { say "strict locking != yes"; rc=1; }
     grep -qE 'kernel oplocks[[:space:]]*=[[:space:]]*no'  <<< "$out" || { say "kernel oplocks != no"; rc=1; }
     grep -qE 'posix locking[[:space:]]*=[[:space:]]*yes'  <<< "$out" || { say "posix locking != yes"; rc=1; }
-    grep -qF "force user = ${SC_FORCE_USER}"               <<< "$out" || { say "force user wrong";    rc=1; }
     grep -qF "path = ${SC_BACKEND_MOUNT}"                  <<< "$out" || { say "path wrong";          rc=1; }
-    grep -qF "valid users = @\"${SC_GROUP}\""              <<< "$out" || { say "valid users wrong";   rc=1; }
+    # force user / force group / valid users are written numerically (UIDs/GIDs)
+    # and as SIDs respectively, NOT as symbolic AD names. This is the
+    # default-domain ambiguity defense added in configure_share on
+    # 2026-05-05 — symbolic names re-introduce the prod bug where an
+    # AD account by the same name silently captures the mapping.
+    grep -qE '^[[:space:]]*force user[[:space:]]*=[[:space:]]*[0-9]+[[:space:]]*$'  <<< "$out" || { say "force user not a numeric UID";  rc=1; }
+    grep -qE '^[[:space:]]*force group[[:space:]]*=[[:space:]]*[0-9]+[[:space:]]*$' <<< "$out" || { say "force group not a numeric GID"; rc=1; }
+    grep -qE '^[[:space:]]*valid users[[:space:]]*=[[:space:]]*S-1-'                <<< "$out" || { say "valid users not a SID";        rc=1; }
+    # Cross-check that the LOCAL force-user account's UID matches what
+    # smb.conf is writing — catches a stale section pointing at a UID
+    # the local /etc/passwd no longer has.
+    local fu_uid_file fu_uid_smb
+    fu_uid_file=$(ssh_vm "awk -F: -v u='${SC_FORCE_USER}' '\$1==u {print \$3; exit}' /etc/passwd" 2>&1 || true)
+    fu_uid_smb=$(grep -oE 'force user[[:space:]]*=[[:space:]]*[0-9]+' <<< "$out" | grep -oE '[0-9]+$' | head -1)
+    if [[ -n "$fu_uid_file" && -n "$fu_uid_smb" && "$fu_uid_file" != "$fu_uid_smb" ]]; then
+        say "force user UID $fu_uid_smb in smb.conf does not match /etc/passwd UID $fu_uid_file for ${SC_FORCE_USER}"; rc=1
+    fi
+    # Cross-check that the SID in valid users resolves back to the
+    # AD group the operator named.
+    local sid_in_smb sid_resolved
+    sid_in_smb=$(grep -oE 'valid users[[:space:]]*=[[:space:]]*S-1-[0-9-]+' <<< "$out" | awk -F= '{gsub(/^[[:space:]]+|[[:space:]]+$/,"",$2); print $2}')
+    if [[ -n "$sid_in_smb" ]]; then
+        sid_resolved=$(ssh_vm "sudo wbinfo --sid-to-name='$sid_in_smb' 2>/dev/null | awk '{print \$1}'" || true)
+        if [[ -n "$sid_resolved" ]] && ! grep -qiF "${SC_GROUP##*\\\\}" <<< "$sid_resolved"; then
+            say "SID $sid_in_smb resolved to '$sid_resolved' which does not look like ${SC_GROUP}"
+            rc=1
+        fi
+    fi
 
     say "testparm -s reports no warnings"
     out=$(ssh_vm 'sudo testparm -s 2>&1 1>/dev/null' || true)

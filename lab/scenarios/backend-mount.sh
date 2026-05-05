@@ -117,21 +117,33 @@ verify() {
     grep -qF "nobrl"        <<< "$out" || { say "fstab missing nobrl";       rc=1; }
     grep -qF "cache=none"   <<< "$out" || { say "fstab missing cache=none";  rc=1; }
     grep -qF "serverino"    <<< "$out" || { say "fstab missing serverino";   rc=1; }
+    # nosharesock forces a separate TCP/SMB session per cifs mount so
+    # multi-share configs against the same backend don't multiplex onto
+    # one session and reuse the first share's creds. Hit on production
+    # 2026-05-05 — non-optional.
+    grep -qF "nosharesock"  <<< "$out" || { say "fstab missing nosharesock"; rc=1; }
     grep -qF "x-systemd.automount" <<< "$out" || { say "fstab missing automount"; rc=1; }
     grep -qF "credentials=${creds}" <<< "$out" || { say "fstab points at the wrong creds file"; rc=1; }
+    # Numeric uid=/gid= in the fstab line — the configure_share rewrite
+    # resolves to the LOCAL /etc/passwd UID at config time so the
+    # "winbind use default domain = yes" NSS-name ambiguity can't
+    # silently steer the mount at an AD account by the same name.
+    grep -qE 'uid=[0-9]+,gid=[0-9]+' <<< "$out" || { say "fstab uid=/gid= not numeric"; rc=1; }
 
     say "force-user account exists with nologin shell"
     out=$(ssh_vm "getent passwd '$SC_FORCE_USER'" 2>&1 || true)
     echo "$out"
     grep -qE ':/usr/sbin/nologin$' <<< "$out" || { say "$SC_FORCE_USER missing or has a login shell"; rc=1; }
 
-    say "cifs mount is live with vers=1.0, nobrl, cache=none, serverino"
+    say "cifs mount is live with vers=1.0, nobrl, cache=none, serverino, nosharesock"
     out=$(ssh_vm 'mount | grep "type cifs "' 2>&1 || true)
     echo "$out"
     grep -qF " on ${SC_BACKEND_MOUNT} " <<< "$out" || { say "no cifs mount at ${SC_BACKEND_MOUNT}"; rc=1; }
     grep -qE 'vers=1\.0' <<< "$out" || { say "live mount not vers=1.0"; rc=1; }
     grep -qF "nobrl"     <<< "$out" || { say "live mount missing nobrl"; rc=1; }
     grep -qF "cache=none" <<< "$out" || { say "live mount missing cache=none"; rc=1; }
+    # The kernel tends to print this as `nosharesock` in /proc/mounts.
+    grep -qF "nosharesock" <<< "$out" || { say "live mount missing nosharesock"; rc=1; }
 
     say "mount point is readable and contains at least one entry"
     out=$(ssh_vm "sudo ls '$SC_BACKEND_MOUNT' 2>&1 | head -10" || true)

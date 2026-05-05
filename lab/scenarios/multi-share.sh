@@ -163,18 +163,34 @@ verify() {
     fstab_lines=$(grep -c 'cifs ' <<< "$out" 2>/dev/null || echo 0)
     [[ "${fstab_lines:-0}" -ge 2 ]] || { say "expected ≥2 cifs lines in fstab, got $fstab_lines"; rc=1; }
 
-    say "smb.conf has BOTH share sections with their own valid users + force user"
+    say "smb.conf has BOTH share sections with their own (numeric) force user + (SID) valid users"
     for s in "$SC_SHARE_A" "$SC_SHARE_B"; do
         out=$(ssh_vm "sudo grep -n \"^\\[$s\\]\" /etc/samba/smb.conf" 2>&1 || true)
         [[ -n "$out" ]] || { say "smb.conf missing [$s] section"; rc=1; }
     done
-    # Per-section valid-users + force-user content check
-    out=$(ssh_vm "sudo awk -v s='[$SC_SHARE_A]' 'BEGIN{p=0} \$0==s{p=1; print; next} /^\\[/{p=0} p' /etc/samba/smb.conf" 2>&1 || true)
-    grep -qF "valid users = @\"${SC_GROUP_A}\"" <<< "$out" || { say "[$SC_SHARE_A] valid users wrong"; rc=1; }
-    grep -qF "force user = ${SC_FORCE_USER_A}"  <<< "$out" || { say "[$SC_SHARE_A] force user wrong"; rc=1; }
-    out=$(ssh_vm "sudo awk -v s='[$SC_SHARE_B]' 'BEGIN{p=0} \$0==s{p=1; print; next} /^\\[/{p=0} p' /etc/samba/smb.conf" 2>&1 || true)
-    grep -qF "valid users = @\"${SC_GROUP_B}\"" <<< "$out" || { say "[$SC_SHARE_B] valid users wrong"; rc=1; }
-    grep -qF "force user = ${SC_FORCE_USER_B}"  <<< "$out" || { say "[$SC_SHARE_B] force user wrong"; rc=1; }
+    # Per-section content check. force user / force group are written
+    # as numeric LOCAL UID/GID (default-domain ambiguity defense), and
+    # valid users is written as a SID (NSS-independent, immune to the
+    # default-domain @"DOMAIN\Group" parsing quirk in Samba 4.22).
+    local sec_a sec_b uid_a uid_b sid_a sid_b
+    sec_a=$(ssh_vm "sudo awk -v s='[$SC_SHARE_A]' 'BEGIN{p=0} \$0==s{p=1; print; next} /^\\[/{p=0} p' /etc/samba/smb.conf" 2>&1 || true)
+    sec_b=$(ssh_vm "sudo awk -v s='[$SC_SHARE_B]' 'BEGIN{p=0} \$0==s{p=1; print; next} /^\\[/{p=0} p' /etc/samba/smb.conf" 2>&1 || true)
+    grep -qE '^[[:space:]]*force user[[:space:]]*=[[:space:]]*[0-9]+'  <<< "$sec_a" || { say "[$SC_SHARE_A] force user not numeric";  rc=1; }
+    grep -qE '^[[:space:]]*force user[[:space:]]*=[[:space:]]*[0-9]+'  <<< "$sec_b" || { say "[$SC_SHARE_B] force user not numeric";  rc=1; }
+    grep -qE '^[[:space:]]*valid users[[:space:]]*=[[:space:]]*S-1-'   <<< "$sec_a" || { say "[$SC_SHARE_A] valid users not a SID";   rc=1; }
+    grep -qE '^[[:space:]]*valid users[[:space:]]*=[[:space:]]*S-1-'   <<< "$sec_b" || { say "[$SC_SHARE_B] valid users not a SID";   rc=1; }
+    # Cross-check: the two sections MUST have distinct UIDs and SIDs —
+    # the whole point of multi-share is independent identities.
+    uid_a=$(grep -oE 'force user[[:space:]]*=[[:space:]]*[0-9]+' <<< "$sec_a" | grep -oE '[0-9]+$' | head -1)
+    uid_b=$(grep -oE 'force user[[:space:]]*=[[:space:]]*[0-9]+' <<< "$sec_b" | grep -oE '[0-9]+$' | head -1)
+    sid_a=$(grep -oE 'valid users[[:space:]]*=[[:space:]]*S-1-[0-9-]+' <<< "$sec_a" | awk -F= '{gsub(/^[[:space:]]+|[[:space:]]+$/,"",$2); print $2}')
+    sid_b=$(grep -oE 'valid users[[:space:]]*=[[:space:]]*S-1-[0-9-]+' <<< "$sec_b" | awk -F= '{gsub(/^[[:space:]]+|[[:space:]]+$/,"",$2); print $2}')
+    if [[ -n "$uid_a" && "$uid_a" == "$uid_b" ]]; then
+        say "shares A and B share the same force-user UID $uid_a — multi-share independence broken"; rc=1
+    fi
+    if [[ -n "$sid_a" && "$sid_a" == "$sid_b" ]]; then
+        say "shares A and B share the same valid-users SID — distinct AD groups expected"; rc=1
+    fi
 
     say "testparm -s reports no warnings for the combined config"
     out=$(ssh_vm 'sudo testparm -s 2>&1 1>/dev/null' || true)
