@@ -723,6 +723,34 @@ EOF
         return 6
     fi
 
+    # 6b. Register cifs/ SPNs in AD and re-sync into the local keytab.
+    #
+    # `net ads join` registers HOST/<short>, HOST/<fqdn>,
+    # RestrictedKrbHost/<short>, and RestrictedKrbHost/<fqdn> only. It
+    # does NOT register cifs/<short> or cifs/<fqdn>. Older Windows
+    # forests fell back to HOST/ for SMB Kerberos service tickets;
+    # WS2025-hardened forests prefer cifs/ specifically and refuse
+    # the fallback. Without these SPNs the appliance kerb-auths fine
+    # but every Windows client gets a "logon failure" with
+    # "Failed to find cifs/<host>@<REALM>(kvno N) in keytab" in
+    # /var/log/samba/log.smbd. This was real, hit during 2026-05-05
+    # testing.
+    local short_host fqdn
+    short_host=$(hostname -s | tr '[:upper:]' '[:lower:]')
+    fqdn=$(hostname -f | tr '[:upper:]' '[:lower:]')
+    local short_upper
+    short_upper=$(hostname -s | tr '[:lower:]' '[:upper:]')
+    log_join "registering cifs/ SPNs in AD"
+    if ! net ads setspn add "$short_upper" "cifs/${short_host}" -k 2>>"$logf"; then
+        log_join "WARN: failed to register cifs/${short_host} SPN — Windows clients may hit logon failures"
+    fi
+    if ! net ads setspn add "$short_upper" "cifs/${fqdn}" -k 2>>"$logf"; then
+        log_join "WARN: failed to register cifs/${fqdn} SPN — Windows clients may hit logon failures"
+    fi
+    log_join "re-syncing keytab from AD (picks up new cifs/ entries)"
+    net ads keytab create -k >>"$logf" 2>&1 || \
+        log_join "WARN: 'net ads keytab create' failed — keytab may be missing cifs/ keys"
+
     # 7. NSS wiring (winbind-aware passwd/group).
     sed -i 's/^passwd:.*$/passwd:         files systemd winbind/' /etc/nsswitch.conf
     sed -i 's/^group:.*$/group:          files systemd winbind/'  /etc/nsswitch.conf
