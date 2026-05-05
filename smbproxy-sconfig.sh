@@ -657,19 +657,77 @@ EOF
     } > /etc/resolv.conf
     chmod 0644 /etc/resolv.conf
 
-    # 4. chrony — point at the DC and wait briefly for sync. Kerberos is
-    #    intolerant of clock skew (>5 minutes by default).
-    cat > /etc/chrony/chrony.conf <<EOF
-# Managed by smbproxy-sconfig. Time source is the AD DC for the joined
-# realm. Adjust /etc/chrony/sources.d/ if you need additional sources.
-server ${DC_IP} iburst prefer
-driftfile /var/lib/chrony/drift
-makestep 1.0 3
-EOF
+    # 4. chrony — Kerberos is intolerant of clock skew (>5 min by default).
+    #
+    # Source priority, written in this order:
+    #   1. AD PDC emulator. Microsoft convention is that the PDC holds
+    #      the authoritative time for the forest. We discover it via
+    #      DNS (_ldap._tcp.pdc._msdcs.<realm>) rather than assuming
+    #      it's the same as the joined DC, because in many AD
+    #      deployments the PDC role is held by a different DC than
+    #      the one a member server happens to be talking to.
+    #   2. The DC the proxy joined. Often the same as the PDC (in
+    #      single-DC labs) but not always.
+    #   3. Public NTP pool fallback. Critical because in practice
+    #      neither the PDC nor the joined DC always has W32Time
+    #      configured to *serve* NTP — the appliance discovered this
+    #      the hard way during 2026-05-05 testing, where neither AD
+    #      time source responded to NTP UDP/123 and the clock drifted
+    #      ~83 minutes before Kerberos broke. Falling back to a
+    #      public source is dramatically better than letting Kerberos
+    #      die mysteriously.
+    #
+    # Plus `makestep 1.0 3` so chrony will step (not just slew) the
+    # initial offset on a freshly-deployed VM with a wrong clock —
+    # without this directive chrony refuses corrections > 1s, the
+    # behavior the original join code triggered in production.
+    local pdc_host pdc_ip
+    pdc_host=$(host -t SRV "_ldap._tcp.pdc._msdcs.${REALM,,}" 2>/dev/null \
+                | awk '/SRV record/ {gsub(/\.$/, "", $NF); print $NF; exit}')
+    if [[ -n "$pdc_host" ]]; then
+        pdc_ip=$(host -t A "$pdc_host" 2>/dev/null | awk '/has address/ {print $NF; exit}')
+    fi
+    log_join "chrony source policy: PDC=${pdc_host:-(not found via DNS)} ip=${pdc_ip:-?}; joined DC=${DC_IP}; pool=2.debian.pool.ntp.org"
+    {
+        echo "# Managed by smbproxy-sconfig. Source priority: PDC -> joined DC -> public pool."
+        echo "# Adjust /etc/chrony/sources.d/*.sources to add per-deployment sources."
+        if [[ -n "$pdc_ip" ]]; then
+            echo "# Primary: AD PDC emulator (${pdc_host} resolved via _ldap._tcp.pdc._msdcs SRV)"
+            echo "server ${pdc_ip} iburst prefer"
+        else
+            echo "# (PDC SRV record not resolvable at join time; relying on joined DC + pool)"
+        fi
+        echo "# Secondary: the DC the proxy joined"
+        echo "server ${DC_IP} iburst"
+        echo "# Tertiary: public NTP pool — used when the AD time sources do not serve NTP"
+        echo "pool 2.debian.pool.ntp.org iburst"
+        echo
+        echo "driftfile /var/lib/chrony/drift"
+        echo
+        echo "# Step (not just slew) the clock on first sync. Without this"
+        echo "# chrony refuses corrections > 1s, breaking fresh deploys with"
+        echo "# a wrong-time VM."
+        echo "makestep 1.0 3"
+        echo
+        echo "# Keep RTC in sync so reboots come up close to correct."
+        echo "rtcsync"
+    } > /etc/chrony/chrony.conf
     systemctl restart chrony 2>/dev/null || systemctl restart chronyd 2>/dev/null || true
     chronyc -a 'burst 4/4' >/dev/null 2>&1 || true
     chronyc -a makestep   >/dev/null 2>&1 || true
-    sleep 2
+    sleep 4
+
+    # Post-sync verification — warn (don't fail the join) if no source
+    # became selectable within the burst window. Operator gets a clear
+    # log line they can grep for; symptom is otherwise mystery-Kerberos.
+    local ref_id
+    ref_id=$(chronyc tracking 2>/dev/null | awk '/^Reference ID/ {print $4; exit}')
+    if [[ -z "$ref_id" || "$ref_id" == "(00000000)" || "$ref_id" == "()" ]]; then
+        log_join "WARN: chrony has not selected a source — clock will drift; Kerberos auth will fail at >5min skew"
+        log_join "WARN: check /var/log/syslog for chronyd; also check UDP/123 reachability to PDC ${pdc_ip:-?} and DC ${DC_IP}"
+    else
+        log_join "chrony reference: ${ref_id}"
+    fi
 
     # 5. smb.conf — write a minimal [global] only. Per-share sections
     #    are added later by configure_share() (one per proxied share).
