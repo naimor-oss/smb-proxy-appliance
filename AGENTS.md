@@ -77,13 +77,15 @@ posix locking   = yes
 Backend (cifs mount options for the WS2008 share):
 
 ```
-vers=1.0,nobrl,cache=none,serverino
+vers=1.0,nobrl,cache=none,serverino,nosharesock
 ```
 
 `nobrl` deliberately silences kernel-level byte-range lock propagation so
 the backend never sees lock requests; `cache=none` removes the read cache
 that could mask conflicts; `serverino` keeps inode numbers stable across
-remounts.
+remounts; `nosharesock` forces a separate TCP/SMB session per cifs mount
+so multi-share configs against the same backend don't multiplex onto a
+single session and silently reuse the first share's credentials.
 
 ## Persistent Infrastructure
 
@@ -185,13 +187,43 @@ kept there.
   WS2025 DC after join (set by `smbproxy-sconfig`), not a public pool.
 - Backend cifs creds live at `/etc/samba/.creds-<safe>`, mode 0600,
   owned by root, **one file per proxied share**. Each frontend
-  share section enforces an AD security group via
-  `valid users = @"DOMAIN\\Group"` and maps all incoming AD
-  identities to a single local backend user via `force user` —
-  that user is the one whose credentials sit in this share's
-  `.creds-<safe>` file. Different shares can use different backend
-  users with different passwords against the same WS2008 server;
-  that's the multi-share model.
+  share section enforces an AD security group via `valid users =
+  <SID>` (the AD group's SID, resolved by `wbinfo --name-to-sid`
+  at config time) and maps all incoming AD identities to a single
+  local backend user via `force user = <numeric UID>` — that local
+  user's credentials sit in this share's `.creds-<safe>` file.
+  Different shares can use different backend users with different
+  passwords against the same WS2008 server; that's the multi-share
+  model.
+- **Why SIDs and numeric UIDs, not symbolic names.** The proxy runs
+  with `winbind use default domain = yes`, which publishes every AD
+  account to NSS under its bare lowercased name. Symbolic forms
+  (`force user = NAME`, `valid users = @"DOMAIN\Group"`) re-introduce
+  ambiguity:
+  - `force user = NAME` resolves to the AD account if one exists by
+    that name, even when a local `/etc/passwd` entry of the same
+    name is also present — production hit this 2026-05-05 with a
+    local account colliding with an AD account, and tree-connect
+    silently corrupted under the resulting double-mapping.
+  - `valid users = @"DOMAIN\Group"` fails to match in Samba 4.22 on
+    this appliance under default-domain mode; the SID form is
+    NSS-independent and unambiguous.
+  `configure_share` resolves both at config time and writes only the
+  numeric/SID form into `smb.conf` and the cifs `uid=`/`gid=` mount
+  options. It also WARNs when the operator picks a local-force-user
+  name that collides with an AD account.
+- **`nosharesock` is non-optional in cifs fstab options.** Without
+  it, two cifs mounts to the same backend with different per-share
+  creds get multiplexed onto a single TCP/SMB session and the second
+  mount silently reuses the first's credentials, defeating the
+  multi-share model. Same prod incident, 2026-05-05.
+- **Operator mental model: the force-user is a backend identity,
+  not a login.** Treat `force user` as "the local Linux account that
+  owns the cifs mount and presents to the WS2008 backend" — it is
+  not the AD user that Windows clients authenticate as, and it
+  should not share a name with any AD account in use. AD identity
+  is enforced upstream of `force user` by the SID-based `valid
+  users` ACL.
 
 ## Private Agent State
 

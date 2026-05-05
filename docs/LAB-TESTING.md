@@ -221,10 +221,16 @@ Verification:
   0600 root:root with the right username and domain (the password
   is never echoed).
 - The per-share fstab line carries `vers=1.0`, `nobrl`,
-  `cache=none`, `serverino`, `x-systemd.automount`, and points at
-  the share's own creds file.
+  `cache=none`, `serverino`, `nosharesock`, `x-systemd.automount`,
+  numeric `uid=`/`gid=`, and points at the share's own creds file.
+  (`nosharesock` is non-optional — without it two cifs mounts to
+  the same backend silently multiplex on one TCP/SMB session and
+  the second mount reuses the first's creds; numeric `uid=`/`gid=`
+  locks in the LOCAL `/etc/passwd` account so an AD account by the
+  same name can't silently capture the mount.)
 - Force-user account exists with `/usr/sbin/nologin`.
-- The live cifs mount has the same options.
+- The live cifs mount carries the same options including
+  `nosharesock`.
 - The mount is readable and contains at least one entry (an empty
   share is warned about, not a failure — fresh labs may legitimately
   be empty).
@@ -259,8 +265,15 @@ Verification:
 
 - The `[$SC_SHARE_NAME]` block exists in `smb.conf` with
   `oplocks=no`, `level2 oplocks=no`, `strict locking=yes`,
-  `kernel oplocks=no`, `posix locking=yes`, `force user=pfuser`, the
-  configured `path`, and the `valid users = @"LAB\Domain Users"` ACL.
+  `kernel oplocks=no`, `posix locking=yes`, the configured `path`,
+  and the identity stanza in its strict numeric-/SID-only form:
+  `force user = <numeric UID>`, `force group = <numeric GID>`, and
+  `valid users = <SID>`. Symbolic forms (`force user = NAME`,
+  `valid users = @"DOMAIN\Group"`) are NOT accepted by the verify
+  step — they re-introduce the default-domain ambiguity bug
+  diagnosed in production 2026-05-05. The verify also cross-checks
+  that the UID matches `/etc/passwd` for `SC_FORCE_USER` and that
+  the SID resolves back to `SC_GROUP` via `wbinfo --sid-to-name`.
 - `testparm -s` reports no warnings/errors.
 - `smbd` is listening on 445/tcp; nmbd-style 137/138 sockets are
   not open.
@@ -301,7 +314,10 @@ Verification:
   mode 0600 root:root, each with its own username.
 - Two distinct fstab cifs lines with distinct `credentials=` paths.
 - Two distinct `[SHARE]` sections in `smb.conf`, each with its own
-  `valid users` and `force user`.
+  numeric `force user` / `force group` and SID-form `valid users`.
+  Cross-check: the two sections must have DISTINCT UIDs and
+  DISTINCT SIDs — sharing either would defeat the multi-share
+  independence guarantee.
 - `testparm -s` clean for the combined config.
 - `smbproxy-sconfig --list-shares` enumerates both.
 - `smbproxy-sconfig --status` shows both as active with
