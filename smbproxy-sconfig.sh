@@ -42,6 +42,14 @@ readonly KRB5_CONF="/etc/krb5.conf"
 readonly NFT_TEMPLATE="/etc/nftables-smbproxy.conf"
 readonly NFT_LIVE="/etc/nftables.conf"
 
+# Per-share profile names. The profile picks the cifs mount option
+# preset, the smb.conf locking-stanza preset, the default mount path,
+# and whether the legacy (backend-isolation) NIC role is required.
+# Adding a profile means adding cases to backend_mount_opts,
+# resolve_locking_kind, share_default_mount, and any_legacy_profile_shares.
+readonly PROFILE_LEGACY="legacy"
+readonly PROFILE_MODERN="modern"
+
 #===============================================================================
 # UTILITIES
 #===============================================================================
@@ -112,8 +120,114 @@ share_creds_file() {
     echo "${CREDS_DIR}/${CREDS_PREFIX}$(share_safe_name "$1")"
 }
 
+# Profile-aware default mount path. The legacy profile keeps the
+# historical /mnt/legacy/<safe> path so prior installs don't move
+# around; the modern profile lives under /mnt/backend/<safe> to
+# reflect that the backend may be on the domain LAN, not in a
+# dedicated legacy zone. Caller passes profile as the second arg;
+# absent = legacy.
 share_default_mount() {
-    echo "/mnt/legacy/$(share_safe_name "$1")"
+    local name="$1" profile="${2:-$PROFILE_LEGACY}"
+    case "$profile" in
+        modern) echo "/mnt/backend/$(share_safe_name "$name")" ;;
+        *)      echo "/mnt/legacy/$(share_safe_name "$name")" ;;
+    esac
+}
+
+# Map (profile, --locking override) -> effective locking kind. The
+# effective kind is what frontend_locking_stanza branches on. Two
+# kinds today: tps-strict (the WS2008 / Clarion .TPS profile) and
+# relaxed (suitable for routine file-copy backends like CNCs and NAS).
+# Override "profile-default" (or empty) defers to the profile's
+# default. Returns 2 on an unrecognized override.
+resolve_locking_kind() {
+    local profile="$1" override="${2:-profile-default}"
+    case "$override" in
+        tps-strict|relaxed) echo "$override" ;;
+        profile-default|"")
+            case "$profile" in
+                modern) echo "relaxed" ;;
+                *)      echo "tps-strict" ;;
+            esac ;;
+        *) return 2 ;;
+    esac
+}
+
+# Emits the comma-separated cifs option list for the given profile,
+# using the per-share globals CREDS / FU_UID / FU_GID / BACKEND_SEAL.
+# The mode/automount/uid/gid/credentials options are common; the
+# version, caching, locking, and encryption options diverge.
+backend_mount_opts() {
+    local profile="$1"
+    local common="credentials=${CREDS},nosharesock,serverino,uid=${FU_UID},gid=${FU_GID},file_mode=0660,dir_mode=0770,_netdev,x-systemd.automount,x-systemd.requires=network-online.target"
+    case "$profile" in
+        modern)
+            # cache=strict is the kernel default for cifs and is correct
+            # when the proxy is one of several clients hitting a modern
+            # backend (the device may have its own writers). seal=
+            # SMB3 wire encryption; ~10-30% CPU but cheap enough for
+            # the slow IO patterns these devices generate.
+            local sealopt=""
+            [[ "${BACKEND_SEAL:-yes}" == "yes" ]] && sealopt=",seal"
+            echo "${common},vers=3${sealopt}"
+            ;;
+        *)
+            # Legacy (WS2008/.TPS) profile. vers=1.0 + cache=none +
+            # nobrl is the locking-correct combination — see AGENTS.md
+            # for the full rationale.
+            echo "${common},vers=1.0,cache=none,nobrl"
+            ;;
+    esac
+}
+
+# Emits the smb.conf locking-stanza lines (already indented for the
+# share section) for the given effective locking kind.
+frontend_locking_stanza() {
+    local kind="$1"
+    case "$kind" in
+        relaxed)
+            cat <<'STANZA'
+    # Relaxed locking for routine file-copy backends (CNC, NAS,
+    # archive). The proxy is not assumed to be the sole writer;
+    # oplocks let modern Windows clients cache locally for speed.
+    oplocks = yes
+    level2 oplocks = yes
+    strict locking = no
+    kernel oplocks = no
+    posix locking = auto
+STANZA
+            ;;
+        *)
+            cat <<'STANZA'
+    # Strict locking for ISAM/.TPS multi-user databases; do NOT relax
+    # without reading AGENTS.md first.
+    oplocks = no
+    level2 oplocks = no
+    strict locking = yes
+    kernel oplocks = no
+    posix locking = yes
+STANZA
+            ;;
+    esac
+}
+
+# Returns 0 if any configured share uses the legacy profile. Used by
+# the firewall step: legacy NIC role assignment is required only when
+# at least one legacy-profile share is configured.
+any_legacy_profile_shares() {
+    [[ -d "$SHARES_DIR" ]] || return 1
+    shopt -s nullglob
+    local f p
+    for f in "$SHARES_DIR"/*.env; do
+        # shellcheck disable=SC1090
+        p=$( PROFILE=""; source "$f" 2>/dev/null; printf '%s' "${PROFILE:-$PROFILE_LEGACY}" )
+        if [[ "$p" == "$PROFILE_LEGACY" ]]; then
+            shopt -u nullglob
+            return 0
+        fi
+    done
+    shopt -u nullglob
+    return 1
 }
 
 # list_shares emits one SHARE_NAME per line. Empty output = no shares.
@@ -132,15 +246,20 @@ list_shares() {
 
 # load_share clears all per-share globals first, then sources the env
 # file for the named share. Returns 1 if the share doesn't exist.
+# Pre-profile env files (no PROFILE field) load as the legacy profile
+# with no seal/locking overrides — clean migration for existing installs.
 load_share() {
     local name="$1"
     SHARE_NAME="" BACKEND_IP="" BACKEND_USER="" BACKEND_DOMAIN=""
     BACKEND_MOUNT="" FRONT_GROUP="" FRONT_FORCE_USER=""
+    PROFILE="" BACKEND_SEAL="" LOCKING_OVERRIDE=""
     local f
     f=$(share_state_file "$name")
     [[ -f "$f" ]] || return 1
     # shellcheck disable=SC1090
     source "$f"
+    # Migration default: missing PROFILE = legacy.
+    PROFILE="${PROFILE:-$PROFILE_LEGACY}"
 }
 
 # save_share persists a share's non-credential fields. Caller must have
@@ -155,12 +274,15 @@ save_share() {
 # Generated by $SCRIPT_NAME. Safe to edit by hand if you know why.
 # Credentials live in $(share_creds_file "$SHARE_NAME") (mode 0600), not here.
 SHARE_NAME="${SHARE_NAME}"
+PROFILE="${PROFILE:-$PROFILE_LEGACY}"
 BACKEND_IP="${BACKEND_IP:-}"
 BACKEND_USER="${BACKEND_USER:-}"
 BACKEND_DOMAIN="${BACKEND_DOMAIN:-}"
 BACKEND_MOUNT="${BACKEND_MOUNT:-}"
+BACKEND_SEAL="${BACKEND_SEAL:-}"
 FRONT_GROUP="${FRONT_GROUP:-}"
 FRONT_FORCE_USER="${FRONT_FORCE_USER:-}"
+LOCKING_OVERRIDE="${LOCKING_OVERRIDE:-}"
 EOF
     chmod 0644 "$f"
 }
@@ -1031,6 +1153,36 @@ configure_share() {
         && -n "$BACKEND_MOUNT" && -n "$FRONT_FORCE_USER" ]] \
         || return 2
 
+    # Profile guard. Default to legacy for backward compat; a missing
+    # profile field on a pre-existing share's env file already loaded
+    # as legacy via load_share().
+    PROFILE="${PROFILE:-$PROFILE_LEGACY}"
+    case "$PROFILE" in
+        "$PROFILE_LEGACY"|"$PROFILE_MODERN") : ;;
+        *) log_join "ERROR: unknown profile '${PROFILE}' (expected: $PROFILE_LEGACY|$PROFILE_MODERN)"; return 8 ;;
+    esac
+
+    # Legacy profile assumes a dedicated backend NIC (the air-gapped
+    # LegacyZone subnet). Refuse to configure a legacy share if that
+    # NIC role isn't assigned yet — the cifs mount would silently
+    # route through the domain NIC and the isolation guarantee is
+    # gone. Modern profile has no such requirement; the backend is
+    # reached via normal domain-LAN routing.
+    if [[ "$PROFILE" == "$PROFILE_LEGACY" ]]; then
+        load_roles
+        if [[ -z "$LEGACY_NIC_NAME" ]]; then
+            log_join "ERROR: legacy-profile share requires a legacy NIC role assignment."
+            log_join "ERROR: run 'smbproxy-sconfig' and assign the legacy NIC, or use --profile modern."
+            return 7
+        fi
+    fi
+
+    # Resolve the effective locking kind (profile default unless
+    # overridden via --locking). A bad override value comes back rc=2.
+    local locking_kind
+    locking_kind=$(resolve_locking_kind "$PROFILE" "${LOCKING_OVERRIDE:-}") \
+        || { log_join "ERROR: invalid --locking value '${LOCKING_OVERRIDE}'"; return 2; }
+
     # Local backend force-user must exist as a *local* /etc/passwd
     # entry before we set the cifs uid/gid mount options against it.
     #
@@ -1083,39 +1235,33 @@ EOF
     chown root:root "$creds"
     umask 022
 
-    # fstab entry. Mount-option rationale:
-    #   vers=1.0          honored by cifs.ko independent of Samba's
-    #                     `client min protocol = SMB3`; the kernel
-    #                     speaks SMB1 to WS2008 even though Samba
-    #                     speaks SMB3 frontwise.
-    #   nobrl             do not propagate byte-range locks to the
-    #                     backend. Locking is enforced at the Samba
-    #                     share — see AGENTS.md for the rationale.
-    #   cache=none        no read cache; conflicts can't be masked.
-    #   serverino         stable inode numbers across remounts.
-    #   nosharesock       force a separate TCP/SMB session per mount.
-    #                     Without this, two mounts to the same backend
-    #                     with different per-share creds end up
-    #                     multiplexed on one session and the second
-    #                     mount silently uses the first's credentials
-    #                     — defeating per-share creds entirely. The
-    #                     production multi-share test 2026-05-05 hit
-    #                     exactly this; nosharesock is non-optional.
-    #   x-systemd.automount  mount lazily on first access so a flaky
-    #                     backend doesn't block boot.
-    # Resolve to numeric UID/GID locally to lock in the LOCAL account
-    # (per the comment above on default-domain ambiguity).
-    local fu_uid fu_gid
-    fu_uid=$(awk -F: -v u="$FRONT_FORCE_USER" '$1==u {print $3; exit}' /etc/passwd)
-    fu_gid=$(awk -F: -v u="$FRONT_FORCE_USER" '$1==u {print $4; exit}' /etc/passwd)
-    if [[ -z "$fu_uid" || -z "$fu_gid" ]]; then
+    # fstab entry. The cifs option string is profile-driven (see
+    # backend_mount_opts):
+    #   legacy: vers=1.0 + cache=none + nobrl — the locking-correct
+    #           combo for WS2008 / Clarion .TPS where the proxy is the
+    #           sole writer and locks are arbitrated at the Samba layer.
+    #   modern: vers=3 (auto-negotiate 3.0/3.1.1) + kernel default
+    #           caching + optional SMB3 sealing. Suitable for routine
+    #           file-copy backends (CNC, NAS) on the domain LAN.
+    # Common to both: nosharesock (per-mount session — the multi-share
+    # creds-isolation defense from 2026-05-05), serverino, automount.
+    # Resolve to numeric UID/GID locally to lock in the LOCAL /etc/passwd
+    # account (the default-domain ambiguity defense — see AGENTS.md).
+    local FU_UID FU_GID CREDS
+    FU_UID=$(awk -F: -v u="$FRONT_FORCE_USER" '$1==u {print $3; exit}' /etc/passwd)
+    FU_GID=$(awk -F: -v u="$FRONT_FORCE_USER" '$1==u {print $4; exit}' /etc/passwd)
+    if [[ -z "$FU_UID" || -z "$FU_GID" ]]; then
         log_join "ERROR: failed to resolve LOCAL UID/GID for force-user '${FRONT_FORCE_USER}'"
         return 5
     fi
-    local fstab_line="//${BACKEND_IP}/${SHARE_NAME} ${BACKEND_MOUNT} cifs credentials=${creds},vers=1.0,cache=none,nosharesock,serverino,nobrl,uid=${fu_uid},gid=${fu_gid},file_mode=0660,dir_mode=0770,_netdev,x-systemd.automount,x-systemd.requires=network-online.target 0 0"
+    CREDS="$creds"
+    local mount_opts; mount_opts=$(backend_mount_opts "$PROFILE")
+    local fstab_line="//${BACKEND_IP}/${SHARE_NAME} ${BACKEND_MOUNT} cifs ${mount_opts} 0 0"
     sed -i "\| ${BACKEND_MOUNT} cifs |d" /etc/fstab
     echo "$fstab_line" >> /etc/fstab
     systemctl daemon-reload
+    # Aliases for downstream comments / smb.conf section.
+    local fu_uid="$FU_UID" fu_gid="$FU_GID"
 
     # Frontend smb.conf section — only if domain-joined and FRONT_GROUP
     # is set. Operator can add a share's backend before joining and
@@ -1152,6 +1298,7 @@ EOF
         cat >> "${SMB_CONF}.new" <<EOF
 
 [${SHARE_NAME}]
+    # profile=${PROFILE}; locking=${locking_kind}
     path = ${BACKEND_MOUNT}
     read only = no
     guest ok = no
@@ -1163,19 +1310,13 @@ EOF
     # All AD identities authenticated to this share are mapped to
     # the LOCAL Linux account uid=${fu_uid} (${FRONT_FORCE_USER}),
     # whose creds in ${creds} authenticate the cifs mount to the
-    # WS2008 backend. Numeric UID written here so this resolves to
-    # the local account regardless of any AD account by the same
-    # name (default-domain ambiguity defense).
+    # backend. Numeric UID written here so this resolves to the local
+    # account regardless of any AD account by the same name
+    # (default-domain ambiguity defense).
     force user = ${fu_uid}
     force group = ${fu_gid}
 
-    # Strict locking for ISAM/.TPS multi-user databases; do NOT relax
-    # without reading AGENTS.md first.
-    oplocks = no
-    level2 oplocks = no
-    strict locking = yes
-    kernel oplocks = no
-    posix locking = yes
+$(frontend_locking_stanza "$locking_kind")
 EOF
 
         if ! testparm -s "${SMB_CONF}.new" >/dev/null 2>/tmp/smbproxy-tp.$$; then
@@ -1533,15 +1674,22 @@ menu_firewall() {
 
 install_firewall() {
     load_roles
-    if [[ -z "$DOMAIN_NIC_NAME" || -z "$LEGACY_NIC_NAME" ]]; then
-        info "NIC roles not assigned — go to NIC Roles first."
+    if [[ -z "$DOMAIN_NIC_NAME" ]]; then
+        info "Domain NIC role not assigned — go to NIC Roles first."
+        return
+    fi
+    # Legacy NIC role is required only if at least one legacy-profile
+    # share is configured (the legacy egress isolation depends on that
+    # NIC). A modern-only proxy needs no legacy NIC.
+    if any_legacy_profile_shares && [[ -z "$LEGACY_NIC_NAME" ]]; then
+        info "A legacy-profile share is configured but no legacy NIC role assigned.\nAssign the legacy NIC first, or remove the legacy share."
         return
     fi
     if [[ ! -f "$NFT_TEMPLATE" ]]; then
         info "Template missing: $NFT_TEMPLATE"; return
     fi
     sed -e "s|%DOMAIN_IFACE%|$DOMAIN_NIC_NAME|g" \
-        -e "s|%LEGACY_IFACE%|$LEGACY_NIC_NAME|g" \
+        -e "s|%LEGACY_IFACE%|${LEGACY_NIC_NAME:-lo}|g" \
         "$NFT_TEMPLATE" > "$NFT_LIVE"
     chmod 0644 "$NFT_LIVE"
     if ! nft -c -f "$NFT_LIVE" 2>/tmp/smbproxy-nft.$$; then
@@ -1838,14 +1986,33 @@ Usage:
 
   sudo smbproxy-sconfig --configure-share \\
         --name SHARE_NAME \\
+        [--profile legacy|modern] \\
         --backend-ip IP --backend-user USER --backend-domain NETBIOS \\
-        [--mount /mnt/legacy/X] \\
+        [--mount /mnt/.../X] \\
         [--group "DOM\\Group"] [--force-user pfuser] \\
+        [--backend-seal | --no-backend-seal]   (modern only) \\
+        [--locking profile-default|tps-strict|relaxed] \\
         [--pass-stdin]
         Headless add or update of a single share. SHARE_NAME is used at
-        BOTH ends (WS2008 backend share name AND published SMB3 share
-        name). Reads the WS2008 user password from stdin. --mount
-        defaults to /mnt/legacy/<safe-name>; --force-user defaults to
+        BOTH ends (backend share name AND published SMB3 share name).
+        Reads the backend user password from stdin.
+
+        --profile picks the cifs / smb.conf preset:
+          legacy (default) — vers=1.0 + nobrl + cache=none, TPS-strict
+            locking. Requires the legacy NIC role to be assigned (the
+            backend is assumed to live on the air-gapped LegacyZone
+            subnet). Use this for the WS2008 / Clarion .TPS workload.
+          modern — vers=3 (auto-negotiate 3.0/3.1.1) + relaxed locking
+            + optional SMB3 sealing (--backend-seal / --no-backend-seal,
+            default on). No legacy NIC required; backend is reached via
+            the domain LAN. Use this for standalone modern devices
+            (CNC, NAS, IoT) consolidated under DFS-N.
+
+        --locking overrides the profile's locking stanza. profile-default
+        (the default) picks tps-strict for legacy and relaxed for modern.
+
+        --mount defaults to /mnt/legacy/<safe-name> for legacy and
+        /mnt/backend/<safe-name> for modern; --force-user defaults to
         --backend-user. --group is REQUIRED to publish the smb.conf
         section; without it (or if not yet domain-joined) only the
         backend cifs mount is configured.
@@ -1888,6 +2055,7 @@ EOF
             local has_section="no"
             grep -qE "^\[$n\]" "$SMB_CONF" 2>/dev/null && has_section="yes"
             printf '  - %s\n' "$n"
+            printf '      profile:        %s\n' "${PROFILE:-$PROFILE_LEGACY}"
             printf '      backend:        //%s/%s\n' "${BACKEND_IP:-?}" "$n"
             printf '      mount:          %s  (active=%s)\n' "${BACKEND_MOUNT:-?}" "$active"
             printf '      ad_group:       %s\n' "${FRONT_GROUP:-(unset)}"
@@ -1932,17 +2100,22 @@ cli_configure_share() {
     SHARE_NAME=""
     BACKEND_IP="" BACKEND_USER="" BACKEND_DOMAIN="" BACKEND_MOUNT=""
     FRONT_GROUP="" FRONT_FORCE_USER=""
+    PROFILE="" BACKEND_SEAL="" LOCKING_OVERRIDE=""
     local PASS_STDIN=0
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --name)            SHARE_NAME="$2"; shift 2 ;;
-            --backend-ip)      BACKEND_IP="$2"; shift 2 ;;
-            --backend-user)    BACKEND_USER="$2"; shift 2 ;;
-            --backend-domain)  BACKEND_DOMAIN="$2"; shift 2 ;;
-            --mount)           BACKEND_MOUNT="$2"; shift 2 ;;
-            --group)           FRONT_GROUP="$2"; shift 2 ;;
-            --force-user)      FRONT_FORCE_USER="$2"; shift 2 ;;
-            --pass-stdin)      PASS_STDIN=1; shift ;;
+            --name)             SHARE_NAME="$2"; shift 2 ;;
+            --profile)          PROFILE="$2"; shift 2 ;;
+            --backend-ip)       BACKEND_IP="$2"; shift 2 ;;
+            --backend-user)     BACKEND_USER="$2"; shift 2 ;;
+            --backend-domain)   BACKEND_DOMAIN="$2"; shift 2 ;;
+            --backend-seal)     BACKEND_SEAL="yes"; shift ;;
+            --no-backend-seal)  BACKEND_SEAL="no"; shift ;;
+            --mount)            BACKEND_MOUNT="$2"; shift 2 ;;
+            --group)            FRONT_GROUP="$2"; shift 2 ;;
+            --force-user)       FRONT_FORCE_USER="$2"; shift 2 ;;
+            --locking)          LOCKING_OVERRIDE="$2"; shift 2 ;;
+            --pass-stdin)       PASS_STDIN=1; shift ;;
             *) echo "unknown flag: $1" >&2; return 2 ;;
         esac
     done
@@ -1951,8 +2124,17 @@ cli_configure_share() {
         && -n "$BACKEND_DOMAIN" ]] \
         || { echo "missing required flag (--name --backend-ip --backend-user --backend-domain)" >&2; return 2; }
 
-    # Defaults.
-    [[ -n "$BACKEND_MOUNT"      ]] || BACKEND_MOUNT=$(share_default_mount "$SHARE_NAME")
+    # Defaults. PROFILE defaults to legacy for backward compat.
+    PROFILE="${PROFILE:-$PROFILE_LEGACY}"
+    case "$PROFILE" in
+        "$PROFILE_LEGACY"|"$PROFILE_MODERN") : ;;
+        *) echo "invalid --profile '$PROFILE' (expected: $PROFILE_LEGACY|$PROFILE_MODERN)" >&2; return 2 ;;
+    esac
+    if [[ -n "$BACKEND_SEAL" && "$PROFILE" != "$PROFILE_MODERN" ]]; then
+        echo "--backend-seal/--no-backend-seal only applies to --profile modern" >&2
+        return 2
+    fi
+    [[ -n "$BACKEND_MOUNT"      ]] || BACKEND_MOUNT=$(share_default_mount "$SHARE_NAME" "$PROFILE")
     [[ -n "$FRONT_FORCE_USER"   ]] || FRONT_FORCE_USER="$BACKEND_USER"
 
     if [[ "$PASS_STDIN" -eq 1 ]]; then
@@ -1983,10 +2165,14 @@ cli_remove_share() {
 
 cli_apply_firewall() {
     load_roles
-    [[ -n "$DOMAIN_NIC_NAME" && -n "$LEGACY_NIC_NAME" ]] \
-        || { echo "NIC roles not assigned" >&2; return 2; }
+    [[ -n "$DOMAIN_NIC_NAME" ]] \
+        || { echo "domain NIC role not assigned" >&2; return 2; }
+    if any_legacy_profile_shares && [[ -z "$LEGACY_NIC_NAME" ]]; then
+        echo "legacy-profile share configured but no legacy NIC role assigned" >&2
+        return 2
+    fi
     sed -e "s|%DOMAIN_IFACE%|$DOMAIN_NIC_NAME|g" \
-        -e "s|%LEGACY_IFACE%|$LEGACY_NIC_NAME|g" \
+        -e "s|%LEGACY_IFACE%|${LEGACY_NIC_NAME:-lo}|g" \
         "$NFT_TEMPLATE" > "$NFT_LIVE"
     chmod 0644 "$NFT_LIVE"
     nft -c -f "$NFT_LIVE" || return 3
