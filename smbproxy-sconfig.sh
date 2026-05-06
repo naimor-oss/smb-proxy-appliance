@@ -42,6 +42,9 @@ readonly KRB5_CONF="/etc/krb5.conf"
 readonly NFT_TEMPLATE="/etc/nftables-smbproxy.conf"
 readonly NFT_LIVE="/etc/nftables.conf"
 
+readonly JOIN_LOG="/var/log/smbproxy-join.log"
+readonly SHARE_LOG="/var/log/smbproxy-share.log"
+
 # Per-share profile names. The profile picks the cifs mount option
 # preset, the smb.conf locking-stanza preset, the default mount path,
 # and whether the legacy (backend-isolation) NIC role is required.
@@ -62,6 +65,22 @@ check_root() {
         echo "ERROR: Run as root (sudo smbproxy-sconfig)." >&2
         exit 1
     fi
+}
+
+# Append a timestamped line to the share-action log. Top-level (not
+# nested in a function) so it's defined for every entry point: TUI,
+# CLI, and tests. configure_share calls this for WARN/ERROR. Logfile
+# is created on first write at mode 0600 since it may carry operator-
+# facing diagnostics (never credentials).
+log_share() {
+    local f="$SHARE_LOG"
+    if [[ ! -f "$f" ]]; then
+        : > "$f" 2>/dev/null && chmod 0600 "$f" 2>/dev/null
+    fi
+    printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*" >> "$f"
+    # Also echo to stderr so the message reaches a CLI operator who
+    # is watching stdout/stderr and won't think to tail the log file.
+    printf '%s\n' "$*" >&2
 }
 
 # Idempotent loaders for the two persistent state files written by
@@ -1159,7 +1178,7 @@ configure_share() {
     PROFILE="${PROFILE:-$PROFILE_LEGACY}"
     case "$PROFILE" in
         "$PROFILE_LEGACY"|"$PROFILE_MODERN") : ;;
-        *) log_join "ERROR: unknown profile '${PROFILE}' (expected: $PROFILE_LEGACY|$PROFILE_MODERN)"; return 8 ;;
+        *) log_share "ERROR: unknown profile '${PROFILE}' (expected: $PROFILE_LEGACY|$PROFILE_MODERN)"; return 8 ;;
     esac
 
     # Legacy profile assumes a dedicated backend NIC (the air-gapped
@@ -1171,8 +1190,8 @@ configure_share() {
     if [[ "$PROFILE" == "$PROFILE_LEGACY" ]]; then
         load_roles
         if [[ -z "$LEGACY_NIC_NAME" ]]; then
-            log_join "ERROR: legacy-profile share requires a legacy NIC role assignment."
-            log_join "ERROR: run 'smbproxy-sconfig' and assign the legacy NIC, or use --profile modern."
+            log_share "ERROR: legacy-profile share requires a legacy NIC role assignment."
+            log_share "ERROR: run 'smbproxy-sconfig' and assign the legacy NIC, or use --profile modern."
             return 7
         fi
     fi
@@ -1181,7 +1200,7 @@ configure_share() {
     # overridden via --locking). A bad override value comes back rc=2.
     local locking_kind
     locking_kind=$(resolve_locking_kind "$PROFILE" "${LOCKING_OVERRIDE:-}") \
-        || { log_join "ERROR: invalid --locking value '${LOCKING_OVERRIDE}'"; return 2; }
+        || { log_share "ERROR: invalid --locking value '${LOCKING_OVERRIDE}'"; return 2; }
 
     # Local backend force-user must exist as a *local* /etc/passwd
     # entry before we set the cifs uid/gid mount options against it.
@@ -1207,9 +1226,9 @@ configure_share() {
         # for getpwnam in nsswitch order (files first), but the
         # operator should know they picked a colliding name.
         if id "$FRONT_FORCE_USER" &>/dev/null; then
-            log_join "WARN: requested force-user '${FRONT_FORCE_USER}' also exists as an AD account."
-            log_join "WARN: a local /etc/passwd entry will be created and used; the AD account will be shadowed for"
-            log_join "WARN: getpwnam lookups on this proxy. Consider picking a name that does not collide."
+            log_share "WARN: requested force-user '${FRONT_FORCE_USER}' also exists as an AD account."
+            log_share "WARN: a local /etc/passwd entry will be created and used; the AD account will be shadowed for"
+            log_share "WARN: getpwnam lookups on this proxy. Consider picking a name that does not collide."
         fi
         useradd -M -s /usr/sbin/nologin "$FRONT_FORCE_USER"
     fi
@@ -1251,7 +1270,7 @@ EOF
     FU_UID=$(awk -F: -v u="$FRONT_FORCE_USER" '$1==u {print $3; exit}' /etc/passwd)
     FU_GID=$(awk -F: -v u="$FRONT_FORCE_USER" '$1==u {print $4; exit}' /etc/passwd)
     if [[ -z "$FU_UID" || -z "$FU_GID" ]]; then
-        log_join "ERROR: failed to resolve LOCAL UID/GID for force-user '${FRONT_FORCE_USER}'"
+        log_share "ERROR: failed to resolve LOCAL UID/GID for force-user '${FRONT_FORCE_USER}'"
         return 5
     fi
     CREDS="$creds"
@@ -1276,8 +1295,8 @@ EOF
         local group_sid
         group_sid=$(wbinfo --name-to-sid="$FRONT_GROUP" 2>/dev/null | awk '{print $1}')
         if [[ -z "$group_sid" || ! "$group_sid" =~ ^S-1- ]]; then
-            log_join "ERROR: cannot resolve AD group '${FRONT_GROUP}' to a SID via winbind."
-            log_join "ERROR: is the group name correct? Is winbind reachable? (try 'wbinfo --name-to-sid=\"${FRONT_GROUP}\"')"
+            log_share "ERROR: cannot resolve AD group '${FRONT_GROUP}' to a SID via winbind."
+            log_share "ERROR: is the group name correct? Is winbind reachable? (try 'wbinfo --name-to-sid=\"${FRONT_GROUP}\"')"
             return 6
         fi
 
