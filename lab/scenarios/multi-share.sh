@@ -217,6 +217,63 @@ verify() {
     grep -qF "$SC_SHARE_A" <<< "$out" || { say "smbclient -L missing $SC_SHARE_A"; rc=1; }
     grep -qF "$SC_SHARE_B" <<< "$out" || { say "smbclient -L missing $SC_SHARE_B"; rc=1; }
 
+    # Adversarial-profile checks: if either force-user collides with an
+    # AD account, verify the d480a7c default-domain ambiguity defense
+    # held under multi-share. The check self-activates when collision
+    # is detected on the live system — no need to gate on $PROFILE_NAME.
+    # Run BEFORE the destructive --remove-share step so both shares are
+    # still in place to inspect.
+    _multi_share_collision_check() {
+        local share_name="$1" force_user="$2" smb_section="$3"
+        local smb_uid file_uid ad_uid
+
+        say "  ${share_name}: configure log recorded the collision WARN"
+        out=$(ssh_vm "sudo grep -E \"WARN: requested force-user '${force_user}'\" /var/log/smbproxy-share.log 2>/dev/null" || true)
+        echo "$out"
+        [[ -n "$out" ]] || { say "  WARN about colliding name '${force_user}' not in /var/log/smbproxy-share.log"; rc=1; }
+
+        say "  ${share_name}: local /etc/passwd entry exists for '${force_user}'"
+        ssh_vm "grep -q '^${force_user}:' /etc/passwd" || { say "  no /etc/passwd entry for ${force_user} — useradd was skipped"; rc=1; }
+
+        say "  ${share_name}: smb.conf force-user UID is the LOCAL one, not the AD one"
+        smb_uid=$(grep -oE 'force user[[:space:]]*=[[:space:]]*[0-9]+' <<< "$smb_section" | grep -oE '[0-9]+$' | head -1)
+        file_uid=$(ssh_vm "awk -F: -v u='${force_user}' '\$1==u {print \$3; exit}' /etc/passwd" 2>&1 || true)
+        ad_uid=$(ssh_vm "wbinfo --name-to-sid='${force_user}' 2>/dev/null | awk '{print \$1}' | xargs -I{} wbinfo --sid-to-uid={} 2>/dev/null" || true)
+        echo "  ${share_name}: local=${file_uid} AD=${ad_uid} smb.conf=${smb_uid}"
+        if [[ -n "$file_uid" && -n "$smb_uid" && "$file_uid" != "$smb_uid" ]]; then
+            say "  ${share_name}: smb.conf UID $smb_uid != local /etc/passwd UID $file_uid — defense breach"; rc=1
+        fi
+        if [[ -n "$ad_uid" && "$ad_uid" == "$smb_uid" ]]; then
+            say "  ${share_name}: smb.conf UID $smb_uid is the AD UID — defense breach"; rc=1
+        fi
+    }
+
+    if ssh_vm "id '${SC_FORCE_USER_A}' 2>/dev/null | grep -q 'gid=.*domain users'"; then
+        say "share A force-user '${SC_FORCE_USER_A}' collides with an AD account — adversarial checks active"
+        _multi_share_collision_check "[$SC_SHARE_A]" "$SC_FORCE_USER_A" "$sec_a"
+    fi
+    if ssh_vm "id '${SC_FORCE_USER_B}' 2>/dev/null | grep -q 'gid=.*domain users'"; then
+        say "share B force-user '${SC_FORCE_USER_B}' collides with an AD account — adversarial checks active"
+        _multi_share_collision_check "[$SC_SHARE_B]" "$SC_FORCE_USER_B" "$sec_b"
+    fi
+
+    # When BOTH force-users collide with AD accounts, additionally
+    # confirm the two LOCAL accounts ended up with distinct UIDs (i.e.
+    # we actually created two separate /etc/passwd entries — not
+    # silently reused one). This is the adversarial mirror of the
+    # standard multi-share independence cross-check above.
+    if ssh_vm "id '${SC_FORCE_USER_A}' 2>/dev/null | grep -q 'gid=.*domain users'" && \
+       ssh_vm "id '${SC_FORCE_USER_B}' 2>/dev/null | grep -q 'gid=.*domain users'"; then
+        say "both force-users collide with AD — checking the two LOCAL UIDs are distinct"
+        local local_uid_a local_uid_b
+        local_uid_a=$(ssh_vm "awk -F: -v u='${SC_FORCE_USER_A}' '\$1==u {print \$3; exit}' /etc/passwd" 2>&1 || true)
+        local_uid_b=$(ssh_vm "awk -F: -v u='${SC_FORCE_USER_B}' '\$1==u {print \$3; exit}' /etc/passwd" 2>&1 || true)
+        echo "  local UIDs: A=${local_uid_a} B=${local_uid_b}"
+        if [[ -n "$local_uid_a" && "$local_uid_a" == "$local_uid_b" ]]; then
+            say "  both local accounts share UID $local_uid_a — useradd was reused, not separate"; rc=1
+        fi
+    fi
+
     say "removing share B leaves share A intact"
     # The destructive part of this scenario — exercises remove_share
     # while another share is configured against the same backend, which
