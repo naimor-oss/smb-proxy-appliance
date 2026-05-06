@@ -2216,11 +2216,16 @@ main_cli() {
 #===============================================================================
 # ENTRY POINT
 #===============================================================================
-check_root
+# Library mode: when the file is sourced (not executed), skip the entry
+# point so unit tests can call individual helpers without triggering
+# check_root or main_menu. The standard bash sourced-vs-executed check.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    check_root
 
-if [[ $# -gt 0 ]]; then
-    main_cli "$@"
-    exit $?
+    if [[ $# -gt 0 ]]; then
+        main_cli "$@"
+        exit $?
+    fi
+
+    main_menu
 fi
-
-main_menu
