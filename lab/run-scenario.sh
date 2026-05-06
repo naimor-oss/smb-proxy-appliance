@@ -48,6 +48,12 @@ Proxy-specific flags (consumed by scenario pre_hooks):
                           SC_BACKEND_PASS for backend-mount / frontend
                           / end-to-end scenarios. Default if unset:
                           lab/backend-creds.env (gitignored).
+  --profile NAME          source lab/profiles/NAME.env after backend
+                          creds; lets a scenario run with a swapped
+                          set of trap inputs (force-user names that
+                          collide with AD accounts, single-word
+                          groups, names with special characters).
+                          Available profiles: see lab/profiles/.
 
 Scenarios in $SCRIPT_DIR/scenarios:
 USAGE
@@ -66,6 +72,7 @@ fi
 SCENARIO=""
 FORWARD=()
 BACKEND_CREDS_FILE="$SCRIPT_DIR/backend-creds.env"
+PROFILE_NAME=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -82,6 +89,8 @@ while [[ $# -gt 0 ]]; do
             export SC_DRY_CLEANUP=1 ;;
         --backend-creds)
             BACKEND_CREDS_FILE="$2"; shift ;;
+        --profile)
+            PROFILE_NAME="$2"; shift ;;
         -*)
             echo "Unknown flag: $1" >&2; usage >&2; exit 2 ;;
         *)
@@ -103,6 +112,25 @@ if [[ -f "$BACKEND_CREDS_FILE" ]]; then
     # shellcheck disable=SC1090
     source "$BACKEND_CREDS_FILE"
     [[ -n "${SC_BACKEND_PASS:-}" ]] && export SC_BACKEND_PASS
+    [[ -n "${SC_BACKEND_PASS_B:-}" ]] && export SC_BACKEND_PASS_B
+fi
+
+# Source the named profile if --profile was given. Profiles use
+# `export SC_X=...` so all overrides are visible to the lab-kit
+# runner and to the scenario. Sourced AFTER backend creds so a
+# profile may override SC_BACKEND_USER / SC_BACKEND_DOMAIN if it
+# wants a different identity layout, while keeping the password.
+if [[ -n "$PROFILE_NAME" ]]; then
+    PROFILE_FILE="$SCRIPT_DIR/profiles/$PROFILE_NAME.env"
+    if [[ ! -f "$PROFILE_FILE" ]]; then
+        echo "ERROR: no such profile: $PROFILE_FILE" >&2
+        echo "Available profiles:" >&2
+        find "$SCRIPT_DIR/profiles" -maxdepth 1 -name '*.env' -type f 2>/dev/null \
+            | sed 's|.*/||; s|\.env$||; s|^|  |' | sort >&2
+        exit 2
+    fi
+    # shellcheck disable=SC1090
+    source "$PROFILE_FILE"
 fi
 
 # cd to repo root so LAB_STAGE_SOURCES and LAB_PUSH_FILES globs in
