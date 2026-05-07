@@ -637,11 +637,18 @@ if [[ -z "$(ip route show default 2>/dev/null)" ]]; then
     APT_FRESHNESS="apt: offline (no default route) — freshness check skipped"
 elif apt-get update -qq >>"$LOGFILE" 2>&1; then
     upg=$(apt list --upgradable 2>/dev/null | grep -cv '^Listing')
-    sec=$(apt list --upgradable 2>/dev/null | grep -c -- '-security')
+    sec=$(apt list --upgradable 2>/dev/null | grep -c -- '-security' || true)
     if [[ "$upg" -eq 0 ]]; then
         APT_FRESHNESS="apt: image is current (0 upgrades pending)"
     else
-        APT_FRESHNESS="apt: ${upg} upgrades pending (${sec} security-marked); review with 'apt list --upgradable', apply with 'sudo apt-get upgrade'"
+        # Kernel and other held-back packages require dist-upgrade (installs new
+        # packages); plain upgrade refuses to do so and silently skips them.
+        if apt-get --simulate upgrade 2>/dev/null | grep -q "kept back"; then
+            apt_cmd="sudo apt-get dist-upgrade"
+        else
+            apt_cmd="sudo apt-get upgrade"
+        fi
+        APT_FRESHNESS="apt: ${upg} upgrades pending (${sec} security-marked); review with 'apt list --upgradable', apply with '${apt_cmd}'"
     fi
 else
     APT_FRESHNESS="apt: index refresh failed — see $LOGFILE"
