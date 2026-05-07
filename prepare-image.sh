@@ -797,7 +797,8 @@ cat > /etc/systemd/system/smbproxy-firstboot.service <<'UEOF'
 [Unit]
 Description=SMB1↔SMB3 Proxy Appliance first-boot host integration
 ConditionPathExists=!/var/lib/smbproxy-firstboot.done
-After=local-fs.target
+After=local-fs.target network-online.target
+Wants=network-online.target
 # Run before smbd so the guest agent is up before any service traffic.
 # smbd is masked at image-prep time and only enabled by smbproxy-sconfig
 # after a join, so this ordering is mostly defensive.
