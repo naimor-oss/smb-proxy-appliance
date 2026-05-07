@@ -1381,6 +1381,209 @@ EOF
     return 0
 }
 
+# check_share — read-only diagnostic for one configured share. Reports:
+#   - state file presence + key fields
+#   - creds file existence + permissions (does NOT print contents)
+#   - fstab line + the option list
+#   - live mount state + live option list (from /proc/mounts)
+#   - drift diff: which expected options are absent from the live mount
+#   - smb.conf section presence + identity resolution (force_user UID
+#     in /etc/passwd, valid_users SID via wbinfo)
+#   - backend reachability (TCP probe to BACKEND_IP:445)
+#
+# Read-only — no state mutation, no service restart. Safe to run
+# during production traffic.
+#
+# Exit codes:
+#   0 — all good (mounted, options match expected, identity resolves)
+#   1 — drift (live options diverge from profile expectation, or
+#       identity doesn't resolve cleanly, or smb.conf section missing
+#       when it should be present)
+#   2 — backend unreachable (TCP/445 probe fails) — informational
+#       overlay on top of whatever else is reported; rc=2 wins over
+#       rc=1 because reachability is the more actionable signal
+#   3 — no such share (state file absent)
+check_share() {
+    local name="$1"
+    [[ -n "$name" ]] || { echo "check_share: missing name" >&2; return 2; }
+
+    if ! load_share "$name"; then
+        echo "no such share: '$name'" >&2
+        echo "configured shares: $(list_shares 2>/dev/null | tr '\n' ' ')" >&2
+        return 3
+    fi
+
+    local profile="${PROFILE:-$PROFILE_LEGACY}"
+    local creds; creds=$(share_creds_file "$SHARE_NAME")
+    local rc=0
+    local backend_unreachable=0
+
+    printf '== share: %s\n' "$SHARE_NAME"
+    printf '   profile:        %s\n' "$profile"
+    printf '   backend:        //%s/%s  user=%s domain=%s\n' \
+        "${BACKEND_IP:-?}" "$SHARE_NAME" "${BACKEND_USER:-?}" "${BACKEND_DOMAIN:-?}"
+    printf '   mount path:     %s\n' "${BACKEND_MOUNT:-?}"
+    printf '   force user:     %s\n' "${FRONT_FORCE_USER:-(unset)}"
+    printf '   AD group:       %s\n' "${FRONT_GROUP:-(unset — backend-only share)}"
+
+    # --- creds file --------------------------------------------------
+    if [[ -f "$creds" ]]; then
+        local creds_perm
+        creds_perm=$(stat -c '%a %U:%G' "$creds" 2>/dev/null || echo '?')
+        if [[ "$creds_perm" == "600 root:root" ]]; then
+            printf '   creds file:     %s  (0600 root:root, OK)\n' "$creds"
+        else
+            printf '   creds file:     %s  (perms=%s — EXPECTED 600 root:root)\n' "$creds" "$creds_perm"
+            rc=1
+        fi
+    else
+        printf '   creds file:     %s  (MISSING)\n' "$creds"
+        rc=1
+    fi
+
+    # --- fstab + expected options ------------------------------------
+    local fstab_line
+    fstab_line=$(grep -F " ${BACKEND_MOUNT} cifs " /etc/fstab 2>/dev/null | head -1 || true)
+    if [[ -z "$fstab_line" ]]; then
+        printf '   fstab:          (NO LINE for %s)\n' "$BACKEND_MOUNT"
+        rc=1
+    else
+        # Extract the comma-separated options field. Format:
+        # //ip/share /mnt/x cifs <opts> 0 0
+        local fstab_opts
+        fstab_opts=$(awk '{print $4}' <<< "$fstab_line")
+        printf '   fstab options:  %s\n' "$fstab_opts"
+    fi
+
+    # Compute what the profile would emit today (for drift detection
+    # against the actual /etc/fstab line). Need FU_UID/FU_GID/CREDS in
+    # scope for backend_mount_opts to render. Resolve them here from
+    # the same /etc/passwd path configure_share uses.
+    local FU_UID FU_GID CREDS
+    FU_UID=$(awk -F: -v u="${FRONT_FORCE_USER:-}" '$1==u {print $3; exit}' /etc/passwd)
+    FU_GID=$(awk -F: -v u="${FRONT_FORCE_USER:-}" '$1==u {print $4; exit}' /etc/passwd)
+    CREDS="$creds"
+    local expected_opts=""
+    if [[ -n "$FU_UID" && -n "$FU_GID" ]]; then
+        expected_opts=$(backend_mount_opts "$profile")
+        printf '   profile would:  %s\n' "$expected_opts"
+    else
+        printf '   profile would:  (cannot render — local UID for "%s" not in /etc/passwd)\n' "${FRONT_FORCE_USER:-?}"
+        rc=1
+    fi
+
+    # --- live mount --------------------------------------------------
+    local live_line live_opts
+    # /proc/mounts is the kernel's source of truth, including the
+    # actual options the cifs driver accepted (which can differ from
+    # what fstab requested if the driver normalized them).
+    live_line=$(awk -v mp="$BACKEND_MOUNT" '$2==mp && $3=="cifs" {print; exit}' /proc/mounts 2>/dev/null || true)
+    if [[ -n "$live_line" ]]; then
+        live_opts=$(awk '{print $4}' <<< "$live_line")
+        printf '   live mount:     ACTIVE\n'
+        printf '   live options:   %s\n' "$live_opts"
+
+        # Drift detection: every option the profile emits MUST appear
+        # in the live mount. We don't flag extras (kernel may add
+        # default options like `actimeo=1` that we never specify).
+        local missing=""
+        local opt
+        IFS=',' read -ra _expected_arr <<< "$expected_opts"
+        for opt in "${_expected_arr[@]}"; do
+            # Skip x-systemd.* — those live in fstab, not /proc/mounts.
+            [[ "$opt" == x-systemd.* ]] && continue
+            [[ "$opt" == _netdev ]]      && continue
+            # Skip credentials= — kernel doesn't echo it back.
+            [[ "$opt" == credentials=* ]] && continue
+            if ! grep -qE "(^|,)${opt//./\\.}(,|$)" <<< "$live_opts"; then
+                missing+="${opt} "
+            fi
+        done
+        if [[ -n "$missing" ]]; then
+            printf '   DRIFT:          live mount missing: %s\n' "$missing"
+            printf '                   (likely needs: sudo umount %s; sudo mount %s)\n' \
+                "$BACKEND_MOUNT" "$BACKEND_MOUNT"
+            rc=1
+        fi
+    else
+        # Not currently mounted — could be x-systemd.automount waiting,
+        # or a real failure. Distinguish by probing the backend port.
+        printf '   live mount:     not currently mounted (automount on first access)\n'
+    fi
+
+    # --- backend reachability ----------------------------------------
+    # Quick TCP/445 probe with a short timeout. Distinguishes "device
+    # offline" from "config drift". Uses bash's /dev/tcp pseudo-device
+    # so we don't need nc / socat installed.
+    if [[ -n "${BACKEND_IP:-}" ]]; then
+        if timeout 3 bash -c ">/dev/tcp/${BACKEND_IP}/445" 2>/dev/null; then
+            printf '   backend tcp/445: REACHABLE\n'
+        else
+            printf '   backend tcp/445: UNREACHABLE  (device powered down, or routing/firewall)\n'
+            backend_unreachable=1
+        fi
+    fi
+
+    # --- smb.conf section --------------------------------------------
+    if grep -qE "^\[${SHARE_NAME}\]\s*$" "$SMB_CONF" 2>/dev/null; then
+        printf '   smb.conf:       [%s] section present\n' "$SHARE_NAME"
+
+        # Identity resolution checks — only meaningful if joined.
+        if is_joined && [[ -n "${FRONT_GROUP:-}" ]]; then
+            local sec
+            sec=$(awk -v s="[$SHARE_NAME]" 'BEGIN{p=0} $0==s{p=1; next} /^\[/{p=0} p' "$SMB_CONF" 2>/dev/null)
+
+            # force user must be a numeric UID matching FRONT_FORCE_USER's /etc/passwd entry.
+            local smb_uid
+            smb_uid=$(grep -oE 'force user[[:space:]]*=[[:space:]]*[0-9]+' <<< "$sec" | grep -oE '[0-9]+$' | head -1)
+            if [[ -z "$smb_uid" ]]; then
+                printf '   force_user:     smb.conf force user is NOT numeric (default-domain ambiguity defense violated)\n'
+                rc=1
+            elif [[ -n "$FU_UID" && "$smb_uid" != "$FU_UID" ]]; then
+                printf '   force_user:     smb.conf UID=%s but /etc/passwd UID for %s is %s — MISMATCH\n' \
+                    "$smb_uid" "$FRONT_FORCE_USER" "$FU_UID"
+                rc=1
+            else
+                printf '   force_user:     uid=%s (%s, local /etc/passwd) — OK\n' "$smb_uid" "$FRONT_FORCE_USER"
+            fi
+
+            # valid users must be a SID and resolvable via wbinfo to FRONT_GROUP.
+            local smb_sid
+            smb_sid=$(grep -oE 'valid users[[:space:]]*=[[:space:]]*S-1-[0-9-]+' <<< "$sec" | awk -F= '{gsub(/^[[:space:]]+|[[:space:]]+$/,"",$2); print $2}')
+            if [[ -z "$smb_sid" ]]; then
+                printf '   valid_users:    not a SID — default-domain ambiguity defense violated\n'
+                rc=1
+            else
+                local resolved
+                resolved=$(wbinfo --sid-to-name="$smb_sid" 2>/dev/null | awk '{print $1}' || true)
+                if [[ -z "$resolved" ]]; then
+                    printf '   valid_users:    SID=%s does NOT resolve via wbinfo (winbind down? group deleted?)\n' "$smb_sid"
+                    rc=1
+                else
+                    printf '   valid_users:    SID=%s -> %s — OK\n' "$smb_sid" "$resolved"
+                fi
+            fi
+        elif [[ -z "${FRONT_GROUP:-}" ]]; then
+            printf '   identity:       (no FRONT_GROUP — backend-only share, identity check skipped)\n'
+        else
+            printf '   identity:       (proxy not domain-joined — identity check skipped)\n'
+        fi
+    elif [[ -n "${FRONT_GROUP:-}" ]]; then
+        printf '   smb.conf:       [%s] section MISSING (FRONT_GROUP set — should be published)\n' "$SHARE_NAME"
+        rc=1
+    else
+        printf '   smb.conf:       (not published — no FRONT_GROUP set)\n'
+    fi
+
+    # Backend unreachable wins over drift in the exit code because
+    # it's the more actionable signal. A drift report is meaningless
+    # if the device is just powered down — fix the device first.
+    if [[ "$backend_unreachable" -eq 1 ]]; then
+        return 2
+    fi
+    return $rc
+}
+
 # shares_add_wizard — TUI flow to create a new share end-to-end.
 # Prompts for SHARE_NAME first; subsequent dialogs all carry
 # "Share: $SHARE_NAME" in the body so the operator never has to look
@@ -2067,6 +2270,20 @@ Usage:
         smb.conf section, delete state + creds files, reload smbd.
         Idempotent against partial state.
 
+  sudo smbproxy-sconfig --check-share --name SHARE_NAME
+        Read-only diagnostic for one share. Reports state file fields,
+        creds file perms, fstab options, the option list the current
+        profile would emit, the live /proc/mounts options, drift
+        between fstab and live (with the umount/mount fix-up command),
+        backend TCP/445 reachability, and identity resolution
+        (force_user UID matches /etc/passwd; valid_users SID resolves
+        via wbinfo). Safe to run during production traffic — no
+        mutation, no service restart. Exit codes:
+            0 — all good
+            1 — drift or identity-resolution problem
+            2 — backend unreachable (overlay over any other status)
+            3 — no such share
+
   sudo smbproxy-sconfig --apply-firewall
         Render the nftables template using current NIC roles and load
         it into the kernel.
@@ -2208,6 +2425,18 @@ cli_remove_share() {
     remove_share "$name"
 }
 
+cli_check_share() {
+    local name=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --name) name="$2"; shift 2 ;;
+            *) echo "unknown flag: $1" >&2; return 2 ;;
+        esac
+    done
+    [[ -n "$name" ]] || { echo "missing --name" >&2; return 2; }
+    check_share "$name"
+}
+
 cli_apply_firewall() {
     load_roles
     [[ -n "$DOMAIN_NIC_NAME" ]] \
@@ -2234,6 +2463,7 @@ main_cli() {
         --list-shares)         cli_list_shares ;;
         --configure-share)     shift; cli_configure_share "$@" ;;
         --remove-share)        shift; cli_remove_share "$@" ;;
+        --check-share)         shift; cli_check_share "$@" ;;
         --apply-firewall)      cli_apply_firewall ;;
         *) echo "unknown subcommand: ${1:-}" >&2; print_help; return 2 ;;
     esac

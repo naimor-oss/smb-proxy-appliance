@@ -156,6 +156,29 @@ verify() {
     grep -qF "FRONT_GROUP=\"${SC_GROUP}\""        <<< "$out" || { say "FRONT_GROUP wrong"; rc=1; }
     grep -qF "FRONT_FORCE_USER=\"${SC_FORCE_USER}\"" <<< "$out" || { say "FRONT_FORCE_USER wrong"; rc=1; }
 
+    # End-to-end coverage of the --check-share diagnostic. After a
+    # successful configure_share + apply_firewall, --check-share for
+    # this share MUST return rc=0 (everything aligned). Catches a
+    # whole class of "configure_share said OK but the live state
+    # diverged" bugs that no individual assertion above would notice.
+    say "smbproxy-sconfig --check-share reports clean for this share"
+    out=$(ssh_vm "sudo smbproxy-sconfig --check-share --name '${SC_SHARE_NAME}'" 2>&1)
+    check_rc=$?
+    echo "$out"
+    if [[ "$check_rc" -ne 0 ]]; then
+        say "  --check-share returned rc=${check_rc} on a freshly-configured share"
+        rc=1
+    fi
+    # Also assert --check-share for a non-existent share returns rc=3
+    # — the documented "no such share" code. Cheap regression test for
+    # the CLI exit-code contract.
+    ssh_vm "sudo smbproxy-sconfig --check-share --name '__definitely_not_a_share__'" >/dev/null 2>&1
+    check_missing_rc=$?
+    if [[ "$check_missing_rc" -ne 3 ]]; then
+        say "  --check-share for missing share returned rc=${check_missing_rc} (expected 3)"
+        rc=1
+    fi
+
     # If running under the adversarial profile (force-user known to
     # collide with an AD account), assert the WARN actually fired in
     # /var/log/smbproxy-share.log AND that the local /etc/passwd entry
