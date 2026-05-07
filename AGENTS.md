@@ -171,6 +171,12 @@ Domain-level state (`REALM`, `DOMAIN_SHORT`, `DC_HOST`, `DC_IP`)
 lives in `/var/lib/smbproxy/deploy.env`; nothing share-specific is
 kept there.
 
+## Checks
+
+```bash
+bash -n prepare-image.sh smbproxy-sconfig.sh lab/run-scenario.sh lab/scenarios/*.sh tests/unit-helpers.sh
+```
+
 ## Development Rules
 
 - Prefer small, reviewable changes.
