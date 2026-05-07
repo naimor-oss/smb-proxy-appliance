@@ -1,5 +1,5 @@
 # lab/scenarios/multi-share.sh — configure TWO proxied shares from
-# the SAME WS2008 backend with DIFFERENT credentials and DIFFERENT
+# the SAME legacy backend with DIFFERENT credentials and DIFFERENT
 # AD access groups + force-users. This is the use case the
 # multi-share refactor (B1-B3, 2026-05-04) was built for: in
 # practice the operator needs to publish more than one share from
@@ -22,7 +22,7 @@
 # smbclient -k from the proxy itself.
 #
 # Overridable via env (defaults form a realistic two-share
-# configuration on the existing WS2008 backend):
+# configuration on the existing legacy backend):
 #   SC_SHARE_A, SC_SHARE_B          two share names; both used at
 #                                   both ends per the convention
 #   SC_BACKEND_PASS_A,
@@ -39,7 +39,7 @@
 # This scenario INTENTIONALLY does NOT default the per-share creds.
 # In practice you'd set SC_BACKEND_PASS_A / SC_BACKEND_PASS_B in
 # lab/backend-creds.env (gitignored). For a quick smoke test against
-# the existing WS2008 backend you can set them both to the same
+# the existing legacy backend you can set them both to the same
 # value as SC_BACKEND_PASS — the scenario will warn but proceed.
 
 source "$(dirname "${BASH_SOURCE[0]}")/join-domain.sh"
@@ -49,9 +49,9 @@ source "$(dirname "${BASH_SOURCE[0]}")/backend-mount.sh"
 SC_BACKEND_IP="${SC_BACKEND_IP:-172.29.137.1}"
 SC_BACKEND_DOMAIN="${SC_BACKEND_DOMAIN:-LEGACY}"
 
-SC_SHARE_A="${SC_SHARE_A:-ProfitFab\$}"
-SC_BACKEND_USER_A="${SC_BACKEND_USER_A:-pfuser}"
-SC_FORCE_USER_A="${SC_FORCE_USER_A:-pfuser}"
+SC_SHARE_A="${SC_SHARE_A:-Engineering\$}"
+SC_BACKEND_USER_A="${SC_BACKEND_USER_A:-engineering_user}"
+SC_FORCE_USER_A="${SC_FORCE_USER_A:-engineering_user}"
 SC_GROUP_A="${SC_GROUP_A:-LAB\\Domain Users}"
 
 SC_SHARE_B="${SC_SHARE_B:-Drawings\$}"

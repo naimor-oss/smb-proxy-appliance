@@ -5,7 +5,7 @@ appliance and how to add them to the lab scenario runner.
 
 The goal is not only "does smbd start?" The goal is to prove the proxy
 faithfully bridges a hardened Windows Server 2025 forest to a legacy
-WS2008 SP2 file server: NIC role assignment, AD join, backend SMB1
+SMB1 file server: NIC role assignment, AD join, backend SMB1
 mount with the right `nobrl` / `cache=none` semantics, frontend SMB3
 share with strict locking and oplocks-off, identity mapping via
 winbind to a single local backend `force user`, and recovery from the
@@ -63,10 +63,10 @@ Source-time relationships:
   `do_configure_backend()` twice with different `SC_*_A` / `SC_*_B`
   per-share inputs.
 - `end-to-end` sources `frontend-share` and adds the per-share
-  `--status` check + the optional WS2008 read/write roundtrip
+  `--status` check + the optional legacy backend read/write roundtrip
   (`SC_WRITE_ROUNDTRIP=1`).
 
-Backend credentials handling: scenarios that need the WS2008 password
+Backend credentials handling: scenarios that need the legacy backend password
 read it from `SC_BACKEND_PASS`. `lab/run-scenario.sh` automatically
 sources `lab/backend-creds.env` (gitignored by `*creds*` in
 `.gitignore`) before invoking the scenario, so the local workflow is:
@@ -294,7 +294,7 @@ lab/run-scenario.sh frontend-share
 
 ### `multi-share`
 
-Purpose: configure TWO proxied shares from the SAME WS2008 backend
+Purpose: configure TWO proxied shares from the SAME legacy backend
 with DIFFERENT credentials and DIFFERENT AD access groups +
 force-users. This is the use case the multi-share refactor was
 built for and the regression test that catches future bugs in
@@ -351,11 +351,11 @@ via the standard `eval $(declare -f ... | sed)` pattern) and adds:
   `winbind` active, and the configured share present with
   `active=yes` and `smb_section: yes`.
 - `ls $SC_BACKEND_MOUNT` is readable.
-- Optional WS2008 read/write roundtrip when `SC_WRITE_ROUNDTRIP=1`:
+- Optional legacy backend read/write roundtrip when `SC_WRITE_ROUNDTRIP=1`:
   writes a uniquely-named test file
   (`.smb-proxy-roundtrip-<ts>-<pid>.tmp`) through the proxy, reads
   it back, deletes it. Off by default to keep the shared
-  production WS2008 backend strictly read-only during test runs.
+  production legacy backend strictly read-only during test runs.
 
 Run:
 
@@ -371,7 +371,7 @@ The following tests are the highest-value next additions.
 ### 1. `.TPS` lock concentration: `tps-lock-isolation`
 
 Purpose: prove the proxy is genuinely the single arbiter of byte-range
-locks against the WS2008 backend.
+locks against the legacy backend.
 
 Assertions:
 
@@ -380,8 +380,8 @@ Assertions:
   what the application expects.
 - `smbstatus -L` on the proxy lists the locks.
 - `mount | grep cifs` confirms `nobrl` is still in effect (so locks
-  never propagate to WS2008).
-- `Get-SmbOpenFile` on the WS2008 server (or a `psexec`
+  never propagate to legacy backend).
+- `Get-SmbOpenFile` on the legacy backend server (or a `psexec`
   shell + `openfiles /query`) shows only the proxy's session, with no
   byte-range lock churn.
 
@@ -407,10 +407,10 @@ already does. Beyond "ruleset is loaded", verify:
 - `nft list ruleset` matches the rendered template byte-for-byte.
 - `ss -tnlp` shows `smbd` listening on 445 of the domain NIC only.
 - An SSH from `samba-dc1` to `smbproxy-1:22` succeeds; an SSH from a
-  pretend-WS2008 (using a temp listener on the LegacyZone segment) is
+  pretend-backend (using a temp listener on the LegacyZone segment) is
   rejected.
 
-### 4. WS2008 unreachable resilience: `ws2008-down-recovery`
+### 4. legacy backend unreachable resilience: `legacy-backend-down-recovery`
 
 Purpose: prove the proxy degrades gracefully when the backend goes
 away and recovers when it returns.
@@ -504,7 +504,7 @@ Test-NetConnection -ComputerName 10.10.10.30 -Port 445
 Get-SmbConnection
 ```
 
-From the WS2008 backend (via a console session or the operator's
+From the legacy backend (via a console session or the operator's
 runbook — not from this repo's automation):
 
 ```text
@@ -539,11 +539,11 @@ Good candidates for new headless subcommands:
 - Treat logs in `test-results/` as evidence. Keep representative
   passing logs, but avoid committing every ad-hoc run; the
   `.gitignore` already drops raw `*.log` files.
-- Never commit the WS2008 backend password into a scenario file. Use
+- Never commit the legacy backend password into a scenario file. Use
   `SC_BACKEND_PASS` env or a gitignored `lab/backend-creds.env`.
 - Never rely on stale AD objects. Add a pre_hook that removes the
   proxy's computer account before scenarios that join.
 - Do not tear down `router1`, `WS2025-DC1`, the `LegacyZone` switch,
-  or the WS2008 SP2 backend casually. They are persistent fixtures.
+  or the legacy SMB1 backend casually. They are persistent fixtures.
 - The Samba sibling and the proxy share `lab.test` — if you re-provision
   the WS2025 forest, both labs need a fresh `golden-image` rebuild.

@@ -13,5 +13,5 @@ This file is a placeholder. The maintained docs are:
   `.TPS` lock isolation, hardening, firewall, recovery, end-to-end)
 - [`docs/sketch-smb1-smb3-proxy.sh`](docs/sketch-smb1-smb3-proxy.sh) —
   the original single-script sketch this appliance supersedes,
-  preserved for historical reference and as the source of the WS2008
+  preserved for historical reference and as the source of the legacy backend
   backend coordinates the lab uses

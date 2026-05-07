@@ -122,14 +122,14 @@ verify() {
     local leg_ip="${SC_LEGACY_CIDR%/*}"
     grep -qF " ${leg_ip}/" <<< "$out" || { say "legacy NIC missing $leg_ip"; rc=1; }
 
-    say "LegacyZone reachable: ping $SC_LEGACY_GW_IP (the WS2008 backend)"
-    # ICMP from the proxy out the legacy NIC. The WS2008 firewall may
+    say "LegacyZone reachable: ping $SC_LEGACY_GW_IP (the legacy backend)"
+    # ICMP from the proxy out the legacy NIC. The legacy SMB1 backend firewall may
     # or may not reply — treat unreachable as informational since the
     # real test is the cifs mount in the next scenario, not ping.
     if ssh_vm "ping -c 2 -W 2 -I '$leg_ip' '$SC_LEGACY_GW_IP' >/dev/null 2>&1"; then
         say "  ping succeeded"
     else
-        say "  ping failed (informational; WS2008 may drop ICMP — backend-mount scenario tests SMB1 directly)"
+        say "  ping failed (informational; backend may drop ICMP — backend-mount scenario tests SMB1 directly)"
     fi
 
     say "default route did NOT leak onto the legacy NIC"

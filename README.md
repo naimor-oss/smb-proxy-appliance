@@ -1,11 +1,17 @@
 # SMB1↔SMB3 Protocol-Version Proxy Appliance
 
 This repository builds a small **SMB1↔SMB3 proxy appliance** on Debian 13.
-The appliance fronts a hardened Windows Server 2008 SP2 file server (over
-a dedicated point-to-point link) and re-publishes its share to a modern
-WS2025 AD forest as an SMB3-only share, with byte-range locking and oplock
-behavior enforced at the proxy so multi-user Clarion `.TPS` databases work
-correctly under modern Windows clients.
+The appliance fronts a hardened legacy SMB1 file server (over a dedicated
+point-to-point link) and re-publishes its share to a modern Windows Server
+2025 AD forest as an SMB3-only share, with byte-range locking and oplock
+behavior enforced at the proxy. The motivating use case was multi-user
+ISAM-style databases (e.g. Clarion `.TPS`) where the locking semantics
+need to be enforced at the proxy rather than across the WAN to the legacy
+backend, but the appliance is useful for any aging SMB1/SMB2 file server
+that needs to be re-published into a modern AD forest. A second profile
+(`modern`) covers standalone SMB2/3 devices like CNC HMIs, NAS units, and
+other shop-floor appliances that need to be consolidated into DFS-N — see
+[`AGENTS.md`](AGENTS.md) for the profile choices.
 
 ## Where do I start?
 
@@ -49,7 +55,7 @@ other on disk:
 | `lab/scenarios/backend-mount.sh` | Configures one share's backend half via `--configure-share` (no `--group`). Reads `SC_BACKEND_PASS` from `lab/backend-creds.env` (gitignored). |
 | `lab/scenarios/frontend-share.sh` | Composes bootstrap + join + full `--configure-share` (with `--group`) + `--apply-firewall`. Verifies SMB3 + Kerberos access. |
 | `lab/scenarios/multi-share.sh` | Configures TWO shares from the same backend with different creds + AD groups; verifies independence; exercises `--remove-share` while another share is configured. |
-| `lab/scenarios/end-to-end.sh` | Single-shot release-gate test. Optional WS2008 read/write roundtrip via `SC_WRITE_ROUNDTRIP=1`. |
+| `lab/scenarios/end-to-end.sh` | Single-shot release-gate test. Optional backend read/write roundtrip via `SC_WRITE_ROUNDTRIP=1`. |
 | `lab/backend-creds.env.example` | Template for the gitignored `lab/backend-creds.env`. Single-share scenarios need `SC_BACKEND_PASS`; `multi-share` also needs `SC_BACKEND_PASS_B`. |
 | `lab/templates/cloud-init/` | NoCloud seed templates (meta-data, network-config matching by domain MAC, user-data with operator pubkeys). |
 | `lab/keys/` | Operator SSH pubkeys baked into the image at build time. See `lab/keys/README.md`. |
@@ -61,8 +67,8 @@ other on disk:
 
 ## Intended Workflow
 
-1. Build (or reuse) the persistent lab infrastructure: router, WS2025 DC,
-   and the WS2008 SP2 staging server on the LegacyZone subnet.
+1. Build (or reuse) the persistent lab infrastructure: router, modern
+   AD DC, and the legacy SMB1 staging server on the LegacyZone subnet.
 2. Create a Debian VM with **two NICs**: the first attached to the
    domain LAN with DHCP for install-time internet access; the second
    attached to the LegacyZone switch (no gateway, no DHCP).
@@ -78,8 +84,8 @@ other on disk:
    - confirming or pinning a static IP on the domain NIC;
    - hostname, password, SSH key paste, timezone.
 5. Log in over SSH and run `sudo smbproxy-sconfig` to:
-   - join the WS2025 forest;
-   - configure backend SMB1 mount credentials (WS2008 IP, share, user,
+   - join the AD forest;
+   - configure backend SMB1 mount credentials (backend IP, share, user,
      password, NetBIOS domain);
    - configure the frontend SMB3 share (share name, mount path, the AD
      group allowed to access it, the local backend force-user);
@@ -94,13 +100,12 @@ switch named `LegacyZone` carrying the dedicated SMB1 backend subnet.
 | --- | --- | --- | --- |
 | Gateway / DHCP / DNS forwarder | `router1` | `10.10.10.0/24` | From `lab-router`. |
 | First Windows DC | `WS2025-DC1` | `10.10.10.10` | Owns the test forest. |
-| WS2008 SP2 backend | (existing) | `172.29.137.1` (LegacyZone) | Static, gateway-less. Test data only. |
+| Legacy SMB1 backend | (existing) | `172.29.137.1` (LegacyZone) | Static, gateway-less. Test data only. |
 | SMB1↔SMB3 proxy | `smbproxy-1` | domain NIC: DHCP→static, legacy NIC: `172.29.137.x/24` | Debian 13 appliance candidate. |
 
-The actual production WS2008 SP2 server reachable on LegacyZone is the
-authoritative source. The lab does **not** stand up a synthetic WS2008
-backend; backend behavior is validated against the existing staging
-server only.
+The lab assumes an actual legacy SMB1 server reachable on LegacyZone is
+the authoritative source — the lab does **not** stand up a synthetic
+backend; backend behavior is validated against the real staging server.
 
 ## Status
 
@@ -115,7 +120,7 @@ Initial commit covers:
 - Setup and lab-testing docs in [`docs/`](docs/).
 
 The lab reuses the existing samba-addc-appliance lab environment
-(router1, WS2025-DC1, LegacyZone vSwitch with the WS2008 SP2 backend
+(router1, WS2025-DC1, LegacyZone vSwitch with the legacy SMB1 backend
 on it). The proxy joins `lab.test` as a member server. Only one
 once-per-lab operator step is new: a dnsmasq reservation for
 `smbproxy-1` (MAC `00:15:5D:0A:0A:1E` → `10.10.10.30`). See

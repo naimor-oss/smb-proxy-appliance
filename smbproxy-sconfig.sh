@@ -15,7 +15,7 @@
 #   - Shared helpers do the real work and are also used by the headless CLI
 #     at the bottom of this file.
 #   - Keep deployment-specific decisions out of prepare-image.sh. If a value
-#     depends on realm, DC, WS2008 host, share name, or backend creds, set
+#     depends on realm, DC, legacy backend, share name, or backend creds, set
 #     it here.
 #   - Read AGENTS.md before changing the locking semantics. The frontend
 #     share is deliberately strict-locking + oplocks-off and the backend
@@ -116,12 +116,12 @@ load_deploy() {
 #   - one cifs entry in /etc/fstab keyed by the per-share BACKEND_MOUNT.
 #   - one [SHARE_NAME] section in $SMB_CONF.
 #
-# By convention SHARE_NAME is used as both the WS2008 backend share name
+# By convention SHARE_NAME is used as both the legacy backend share name
 # AND the published SMB3 frontend share name (per the user's deployment
 # model — operator picks one name and it appears at both ends).
 # <safe> is the SHARE_NAME with non-alphanumeric characters replaced by
-# underscore, so a $-bearing share like "ProfitFab$" stores as
-# ProfitFab_.env / .creds-ProfitFab_ on the filesystem while the literal
+# underscore, so a $-bearing share like "Engineering$" stores as
+# Engineering_.env / .creds-Engineering_ on the filesystem while the literal
 # name lives in SHARE_NAME.
 #-------------------------------------------------------------------------------
 
@@ -155,7 +155,7 @@ share_default_mount() {
 
 # Map (profile, --locking override) -> effective locking kind. The
 # effective kind is what frontend_locking_stanza branches on. Two
-# kinds today: tps-strict (the WS2008 / Clarion .TPS profile) and
+# kinds today: tps-strict (the ISAM-style (e.g. Clarion .TPS) profile) and
 # relaxed (suitable for routine file-copy backends like CNCs and NAS).
 # Override "profile-default" (or empty) defers to the profile's
 # default. Returns 2 on an unrecognized override.
@@ -224,7 +224,7 @@ backend_mount_opts() {
             echo "${common},vers=${vers}${sealopt},soft,echo_interval=10"
             ;;
         *)
-            # Legacy (WS2008/.TPS) profile. vers=1.0 + cache=none +
+            # Legacy (legacy SMB1 (e.g. Clarion .TPS)) profile. vers=1.0 + cache=none +
             # nobrl is the locking-correct combination — see AGENTS.md
             # for the full rationale.
             #
@@ -233,7 +233,7 @@ backend_mount_opts() {
             # the database. The locking-correct path requires that
             # writes either complete or block until the backend is
             # back; failing-with-error is the worst of both worlds.
-            # The WS2008 backend is also expected to be always-on
+            # The legacy backend is also expected to be always-on
             # (the legacy zone is hard-wired and not turned off
             # alongside the workstations), so the offline-hang
             # problem doesn't apply.
@@ -454,7 +454,7 @@ backend_mount_active() {
 # True (rc=0) if smb.conf has a `[share_name]` section header. Uses
 # awk's literal string compare ($0 == target) so share names with
 # regex metacharacters — most importantly the trailing `$` that's
-# common on Windows hidden shares like ProfitFab$ — match correctly.
+# common on Windows hidden shares like Engineering$ — match correctly.
 # The previous `grep -qE "^\[$name\]"` form interpreted `$` as
 # end-of-line and silently reported every $-bearing share as
 # "smb_section: no" even when the section was present and serving
@@ -728,7 +728,7 @@ reassign_roles() {
         $WT_HEIGHT $WT_WIDTH $WT_MENU_HEIGHT \
         "${menu_args[@]}" 3>&1 1>&2 2>&3) || return
     pick_leg=$(whiptail --title "Assign role: Legacy NIC" --notags \
-        --menu "Assigning the LEGACY NIC (LegacyZone, gateway-less).\n\nPick the interface that connects to the WS2008 SP2 backend." \
+        --menu "Assigning the LEGACY NIC (LegacyZone, gateway-less).\n\nPick the interface that connects to the legacy SMB1 backend." \
         $WT_HEIGHT $WT_WIDTH $WT_MENU_HEIGHT \
         "${menu_args[@]}" 3>&1 1>&2 2>&3) || return
     if [[ "$pick_dom" == "$pick_leg" ]]; then
@@ -1278,9 +1278,10 @@ configure_share() {
     # share's force-user pointing at the AD account instead of a local
     # account. The cifs mount then ends up with an AD UID, smb.conf's
     # `force user` resolves to the AD account, and Samba's tree-connect
-    # path corrupts under the resulting double-mapping. Hit this on
-    # production 2026-05-05 with `force user = AMTOperator` colliding
-    # with NAIMOR\AMTOperator.
+    # path corrupts under the resulting double-mapping. Hit this in
+    # production 2026-05-05 — the operator chose a local force-user
+    # name that happened to match an existing AD account, and the
+    # silent capture went undetected until tree-connect failures.
     if grep -q "^${FRONT_FORCE_USER}:" /etc/passwd 2>/dev/null; then
         : # local account already exists, leave it alone
     else
@@ -1321,7 +1322,7 @@ EOF
     # fstab entry. The cifs option string is profile-driven (see
     # backend_mount_opts):
     #   legacy: vers=1.0 + cache=none + nobrl — the locking-correct
-    #           combo for WS2008 / Clarion .TPS where the proxy is the
+    #           combo for ISAM-style (e.g. Clarion .TPS) where the proxy is the
     #           sole writer and locks are arbitrated at the Samba layer.
     #   modern: vers=3 (auto-negotiate 3.0/3.1.1) + kernel default
     #           caching + optional SMB3 sealing. Suitable for routine
@@ -1635,7 +1636,7 @@ shares_add_wizard() {
     local SHARE_NAME=""
     while true; do
         SHARE_NAME=$(whiptail --title "Add proxied share" \
-            --inputbox "Choose the share's name.\n\nThis is BOTH the WS2008 backend share name AND the published\nSMB3 share name (operator picks one; it appears at both ends).\nTrailing \$ marks it hidden in network browsing.\n\nExample: ProfitFab\$" \
+            --inputbox "Choose the share's name.\n\nThis is BOTH the legacy backend share name AND the published\nSMB3 share name (operator picks one; it appears at both ends).\nTrailing \$ marks it hidden in network browsing.\n\nExample: Engineering\$" \
             16 70 "" 3>&1 1>&2 2>&3) || return
         [[ -n "$SHARE_NAME" ]] || { info "Share name cannot be empty."; continue; }
         # Reject characters that aren't share-name-safe on Windows or
@@ -1656,7 +1657,7 @@ shares_add_wizard() {
     local BACKEND_PASS="" FRONT_GROUP="" FRONT_FORCE_USER=""
 
     BACKEND_IP=$(whiptail --title "Add proxied share — backend IP" \
-        --inputbox "${body_ctx}\n\nWS2008 backend IPv4 (LegacyZone-side):" \
+        --inputbox "${body_ctx}\n\nlegacy backend IPv4 (LegacyZone-side):" \
         12 64 "" 3>&1 1>&2 2>&3) || return
 
     # Note: same BACKEND_IP with a different SHARE_NAME is the
@@ -1668,10 +1669,10 @@ shares_add_wizard() {
     # is collected below.
 
     BACKEND_USER=$(whiptail --title "Add proxied share — backend user" \
-        --inputbox "${body_ctx}\n\nLocal WS2008 user with read/write access on the share:" \
+        --inputbox "${body_ctx}\n\nLocal legacy SMB1 backend user with read/write access on the share:" \
         12 64 "" 3>&1 1>&2 2>&3) || return
     BACKEND_DOMAIN=$(whiptail --title "Add proxied share — backend domain" \
-        --inputbox "${body_ctx}\n\nWS2008 NetBIOS domain (or workgroup) name:" \
+        --inputbox "${body_ctx}\n\nlegacy SMB1 backend NetBIOS domain (or workgroup) name:" \
         12 64 "LEGACY" 3>&1 1>&2 2>&3) || return
 
     local p1 p2
@@ -1713,10 +1714,10 @@ shares_add_wizard() {
     fi
 
     FRONT_FORCE_USER=$(whiptail --title "Add proxied share — local force-user" \
-        --inputbox "${body_ctx}\n\nLocal Linux account that owns the cifs mount AND that AD\nidentities authenticated to this share are mapped to on the\nway out to WS2008. Created if absent (system user, nologin)." \
+        --inputbox "${body_ctx}\n\nLocal Linux account that owns the cifs mount AND that AD\nidentities authenticated to this share are mapped to on the\nway out to legacy SMB1 backend. Created if absent (system user, nologin)." \
         14 74 "${BACKEND_USER}" 3>&1 1>&2 2>&3) || { BACKEND_PASS=""; return; }
 
-    yesno "Apply share '${SHARE_NAME}'?\n\n  backend://${BACKEND_IP}/${SHARE_NAME} -> ${BACKEND_MOUNT}\n  WS2008 user: ${BACKEND_DOMAIN}\\${BACKEND_USER}\n  AD access:   ${FRONT_GROUP:-(skipped — not joined)}\n  force user:  ${FRONT_FORCE_USER}" \
+    yesno "Apply share '${SHARE_NAME}'?\n\n  backend://${BACKEND_IP}/${SHARE_NAME} -> ${BACKEND_MOUNT}\n  legacy SMB1 backend user: ${BACKEND_DOMAIN}\\${BACKEND_USER}\n  AD access:   ${FRONT_GROUP:-(skipped — not joined)}\n  force user:  ${FRONT_FORCE_USER}" \
         || { BACKEND_PASS=""; return; }
 
     if configure_share; then
@@ -1798,7 +1799,7 @@ shares_edit_picker() {
                 ;;
             4)
                 BACKEND_IP=$(whiptail --title "Edit share: $name — backend IP" \
-                    --inputbox "${body_ctx}\n\nWS2008 backend IPv4:" 12 64 \
+                    --inputbox "${body_ctx}\n\nlegacy backend IPv4:" 12 64 \
                     "$BACKEND_IP" 3>&1 1>&2 2>&3) || continue
                 local p
                 p=$(whiptail --title "Edit share: $name — confirm with password" \
@@ -1810,7 +1811,7 @@ shares_edit_picker() {
                 ;;
             5)
                 BACKEND_USER=$(whiptail --title "Edit share: $name — backend user" \
-                    --inputbox "${body_ctx}\n\nWS2008 user with r/w access:" 12 64 \
+                    --inputbox "${body_ctx}\n\nlegacy SMB1 backend user with r/w access:" 12 64 \
                     "$BACKEND_USER" 3>&1 1>&2 2>&3) || continue
                 local p
                 p=$(whiptail --title "Edit share: $name — new password" \
@@ -1822,7 +1823,7 @@ shares_edit_picker() {
                 ;;
             6)
                 BACKEND_DOMAIN=$(whiptail --title "Edit share: $name — backend domain" \
-                    --inputbox "${body_ctx}\n\nWS2008 NetBIOS domain or workgroup:" 12 64 \
+                    --inputbox "${body_ctx}\n\nlegacy SMB1 backend NetBIOS domain or workgroup:" 12 64 \
                     "$BACKEND_DOMAIN" 3>&1 1>&2 2>&3) || continue
                 local p
                 p=$(whiptail --title "Edit share: $name — confirm with password" \
@@ -1841,7 +1842,7 @@ shares_remove_picker() {
     local name
     name=$(pick_share "Pick a share to REMOVE:") || return
     [[ -n "$name" ]] || return
-    yesno "Remove share '${name}'?\n\nThis will:\n  - umount it (best-effort)\n  - strip its fstab line\n  - strip its [${name}] section from smb.conf\n  - delete its state file and creds file\n  - reload smbd\n\nThe operator-side data on the WS2008 backend is NOT touched." \
+    yesno "Remove share '${name}'?\n\nThis will:\n  - umount it (best-effort)\n  - strip its fstab line\n  - strip its [${name}] section from smb.conf\n  - delete its state file and creds file\n  - reload smbd\n\nThe operator-side data on the legacy backend is NOT touched." \
         || return
     if remove_share "$name"; then
         info "Share '${name}' removed."
@@ -2275,7 +2276,7 @@ Usage:
         [--profile legacy|modern] \\
         --backend-ip IP --backend-user USER --backend-domain NETBIOS \\
         [--mount /mnt/.../X] \\
-        [--group "DOM\\Group"] [--force-user pfuser] \\
+        [--group "DOM\\Group"] [--force-user engineering_user] \\
         [--backend-vers 1.0|2.0|2.1|3|3.0|3.0.2|3.1.1|default]  (modern only) \\
         [--backend-seal | --no-backend-seal]   (modern only) \\
         [--locking profile-default|tps-strict|relaxed] \\
@@ -2288,7 +2289,7 @@ Usage:
           legacy (default) — vers=1.0 + nobrl + cache=none, TPS-strict
             locking. Requires the legacy NIC role to be assigned (the
             backend is assumed to live on the air-gapped LegacyZone
-            subnet). Use this for the WS2008 / Clarion .TPS workload.
+            subnet). Use this for the ISAM-style (e.g. Clarion .TPS) workload.
           modern — vers=3 (auto-negotiate 3.0/3.1.1) + relaxed locking
             + optional SMB3 sealing (--backend-seal / --no-backend-seal,
             default on). No legacy NIC required; backend is reached via

@@ -69,15 +69,15 @@ check_rc() {
 #-------------------------------------------------------------------------------
 echo "== share_safe_name =="
 check_eq "ascii-clean unchanged" \
-    "ProfitFab" "$(share_safe_name "ProfitFab")"
-check_eq "trailing dollar → underscore (the ProfitFab\$ case)" \
-    "ProfitFab_" "$(share_safe_name 'ProfitFab$')"
+    "Engineering" "$(share_safe_name "Engineering")"
+check_eq "trailing dollar → underscore (the Engineering\$ case)" \
+    "Engineering_" "$(share_safe_name 'Engineering$')"
 check_eq "embedded space → underscore" \
     "Old_Files" "$(share_safe_name "Old Files")"
 check_eq "embedded dot → underscore" \
     "Backup_2024" "$(share_safe_name "Backup.2024")"
 check_eq "multiple specials run together → multiple underscores (NOT collapsed)" \
-    "ProfitFab__" "$(share_safe_name 'ProfitFab$.')"
+    "Engineering__" "$(share_safe_name 'Engineering$.')"
 check_eq "idempotent on already-safe name" \
     "Already_Safe" "$(share_safe_name "Already_Safe")"
 check_eq "empty input → empty output" \
@@ -90,7 +90,7 @@ check_eq "single special char → single underscore" \
 #-------------------------------------------------------------------------------
 echo "== share_default_mount =="
 check_eq "legacy profile → /mnt/legacy/<safe>" \
-    "/mnt/legacy/ProfitFab_" "$(share_default_mount 'ProfitFab$' legacy)"
+    "/mnt/legacy/Engineering_" "$(share_default_mount 'Engineering$' legacy)"
 check_eq "modern profile → /mnt/backend/<safe>" \
     "/mnt/backend/Drawings_" "$(share_default_mount 'Drawings$' modern)"
 check_eq "missing profile arg defaults to legacy (back-compat)" \
@@ -290,8 +290,8 @@ trap 'rm -f "$fixture_smb"' EXIT
 cat > "$fixture_smb" <<'EOF'
 [global]
     realm = LAB.TEST
-[ProfitFab$]
-    path = /mnt/legacy/ProfitFab
+[Engineering$]
+    path = /mnt/legacy/Engineering
 [Shop$]
     path = /mnt/legacy/Shop
 [Plain]
@@ -302,8 +302,8 @@ EOF
 # file path as $2 specifically to make this testable.
 
 # The $-bearing names: must report present.
-share_section_present 'ProfitFab$' "$fixture_smb"
-check_rc "share_section_present('ProfitFab\$') → 0 (present)"  0 $?
+share_section_present 'Engineering$' "$fixture_smb"
+check_rc "share_section_present('Engineering\$') → 0 (present)"  0 $?
 share_section_present 'Shop$' "$fixture_smb"
 check_rc "share_section_present('Shop\$') → 0 (present)"       0 $?
 # Plain ASCII control case.
@@ -312,8 +312,8 @@ check_rc "share_section_present('Plain') → 0 (present)"        0 $?
 # Negative cases: similar names that are NOT present.
 share_section_present 'NotThere' "$fixture_smb"
 check_rc "share_section_present('NotThere') → !0 (missing)"    1 $?
-share_section_present 'ProfitFab' "$fixture_smb"   # no $ — different section
-check_rc "share_section_present('ProfitFab') → !0 (the \$ matters)" 1 $?
+share_section_present 'Engineering' "$fixture_smb"   # no $ — different section
+check_rc "share_section_present('Engineering') → !0 (the \$ matters)" 1 $?
 # Defense check: empty name returns failure (don't accidentally
 # match e.g. an `[]` line).
 share_section_present '' "$fixture_smb"

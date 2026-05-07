@@ -14,16 +14,20 @@ work here. This file covers what's specific to `smb-proxy-appliance`.
 ## Project Purpose
 
 Build and test an **SMB1↔SMB3 protocol-version proxy appliance** on Debian
-13. The appliance fronts a hardened Windows Server 2008 SP2 file server
-(reachable only over a dedicated point-to-point link) and re-publishes
+13. The appliance fronts a hardened legacy SMB1 file server (typically
+reachable only over a dedicated point-to-point link) and re-publishes
 **one or more of its shares** to a modern Windows Server 2025 forest as
 AD-joined SMB3 shares — each share with independent backend credentials
 and AD access groups.
 
-Primary use case: serving multi-user Clarion `.TPS` (ISAM) database files
-to AD-joined Windows 11 clients while the byte-range locking and oplock
-semantics required by `.TPS` are enforced **at the proxy** rather than
-across the WAN to the legacy backend.
+Motivating use case: serving multi-user ISAM-style database files
+(e.g. Clarion `.TPS`) to AD-joined Windows clients while the byte-range
+locking and oplock semantics those databases require are enforced **at
+the proxy** rather than across the WAN to the legacy backend. The same
+machinery generalizes to any aging SMB1/SMB2 file server that needs to
+be re-published into a modern AD forest, plus a `modern` profile for
+standalone SMB2/3 devices (CNC HMIs, NAS units) being consolidated
+into DFS-N — see `Profiles` below.
 
 The appliance has two core scripts:
 
@@ -43,9 +47,9 @@ This repo is a sibling of:
 
 ## Dual-NIC Model
 
-The proxy is the only writer the WS2008 backend ever sees, so all locking
-is enforced locally by Samba and the backend mount uses `nobrl` to avoid
-pushing locks across SMB1.
+For the legacy profile, the proxy is the only writer the legacy backend
+ever sees, so all locking is enforced locally by Samba and the backend
+mount uses `nobrl` to avoid pushing locks across SMB1.
 
 | NIC role | Network | Initial state | Final state |
 | --- | --- | --- | --- |
@@ -58,11 +62,11 @@ shows MAC, link-up state, and any DHCP lease present, so the choice is
 unambiguous). The mapping is persisted as `/etc/smbproxy/nic-roles.env`
 and consumed by `smbproxy-sconfig` thereafter.
 
-## Locking Semantics for `.TPS` Files
+## Locking Semantics for ISAM-style Databases (legacy profile)
 
 The frontend share enforces strict locking; the backend mount delegates
-nothing. This is correct for `.TPS` because the proxy is the single
-arbiter of all writes the WS2008 server sees.
+nothing. This is correct for `.TPS`-style ISAM databases because the
+proxy is the single arbiter of all writes the legacy backend sees.
 
 Frontend (`/etc/samba/smb.conf` per share):
 
@@ -108,7 +112,7 @@ doesn't apply there.
 Do not tear these down casually:
 
 - The Hyper-V switch carrying the LegacyZone subnet (172.29.137.0/24).
-- The WS2008 SP2 staging server VM. It contains test data only, but its
+- The legacy SMB1 staging server VM. It contains test data only, but its
   existence is assumed by every diagnostic and lab scenario in this repo.
 - The WS2025 forest used by the AD DC sibling appliance.
 - The prepared `smbproxy-1` checkpoint `golden-image` (once it exists).
@@ -150,18 +154,18 @@ Each proxied share has independent state:
   `FRONT_FORCE_USER`).
 - `/etc/samba/.creds-<safe>` (mode 0600 root:root) — the cifs
   username / password / domain for THIS share's backend mount. Each
-  share authenticates to the WS2008 backend with its own account.
+  share authenticates to the backend with its own account.
 - One line in `/etc/fstab` per share, each pointing at its own
   creds file.
 - One `[SHARE_NAME]` section in `/etc/samba/smb.conf` per share.
 
-`SHARE_NAME` is used as **both** the WS2008 backend share name and
-the published SMB3 share name (operator picks one name; it appears
-at both ends). `<safe>` is `SHARE_NAME` with non-alphanumeric
+`SHARE_NAME` is used as **both** the backend share name and the
+published SMB3 share name (operator picks one name; it appears at
+both ends). `<safe>` is `SHARE_NAME` with non-alphanumeric
 characters replaced by underscore — a `$`-bearing share like
-`ProfitFab$` stores as `ProfitFab_.env` / `.creds-ProfitFab_` on the
-filesystem while the literal name lives in `SHARE_NAME` and in
-`smb.conf`.
+`Engineering$` stores as `Engineering_.env` /
+`.creds-Engineering_` on the filesystem while the literal name
+lives in `SHARE_NAME` and in `smb.conf`.
 
 Domain-level state (`REALM`, `DOMAIN_SHORT`, `DC_HOST`, `DC_IP`)
 lives in `/var/lib/smbproxy/deploy.env`; nothing share-specific is
@@ -170,7 +174,7 @@ kept there.
 ## Development Rules
 
 - Prefer small, reviewable changes.
-- Never bake realm, DC IP, WS2008 IP, share name, or credentials into
+- Never bake realm, DC IP, backend IP, share name, or credentials into
   `prepare-image.sh`. They belong in `smbproxy-sconfig`.
 - For any whiptail dialog that operates on **one specific share**
   (input prompt, password prompt, confirmation yesno), put the share
@@ -181,10 +185,10 @@ kept there.
   line and then the prompt. Same rule applies to per-NIC dialogs
   (the role being assigned goes in the body) and any future
   per-instance dialog.
-- Never commit `*creds*` files or anything containing the WS2008 backend
+- Never commit `*creds*` files or anything containing the backend
   password. The `.gitignore` covers the obvious paths; if you add a new
   one, extend the `.gitignore` rather than rely on memory.
-- Do not modify the WS2008 SP2 staging server from this repo. Backend
+- Do not modify the legacy backend server from this repo. Backend
   hardening changes live in the operator's runbook, not in agent
   automation.
 - Use the headless `smbproxy-sconfig` CLI for automation instead of
@@ -209,7 +213,7 @@ kept there.
   local backend user via `force user = <numeric UID>` — that local
   user's credentials sit in this share's `.creds-<safe>` file.
   Different shares can use different backend users with different
-  passwords against the same WS2008 server; that's the multi-share
+  passwords against the same backend server; that's the multi-share
   model.
 - **Why SIDs and numeric UIDs, not symbolic names.** The proxy runs
   with `winbind use default domain = yes`, which publishes every AD
@@ -235,7 +239,7 @@ kept there.
   multi-share model. Same prod incident, 2026-05-05.
 - **Operator mental model: the force-user is a backend identity,
   not a login.** Treat `force user` as "the local Linux account that
-  owns the cifs mount and presents to the WS2008 backend" — it is
+  owns the cifs mount and presents to the legacy backend" — it is
   not the AD user that Windows clients authenticate as, and it
   should not share a name with any AD account in use. AD identity
   is enforced upstream of `force user` by the SID-based `valid

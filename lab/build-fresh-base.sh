@@ -23,7 +23,7 @@
 #
 # The lab reuses the samba-addc-appliance lab environment: same router1,
 # same Lab-NAT, same WS2025-DC1 the proxy will join. The LegacyZone
-# private switch is persistent infrastructure carrying the WS2008 SP2
+# private switch is persistent infrastructure carrying the legacy SMB1
 # backend — this script does not stand it up.
 #===============================================================================
 set -euo pipefail

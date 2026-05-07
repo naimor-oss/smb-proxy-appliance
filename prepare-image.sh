@@ -13,12 +13,12 @@
 #   - Install smbproxy-init TTY1 console wizard (incl. NIC role assignment)
 #
 # After running, snapshot the VM. Use smbproxy-sconfig for per-deployment
-# configuration: realm, DC IP, backend WS2008 IP/share/credentials, frontend
+# configuration: realm, DC IP, backend IP/share/credentials, frontend
 # share name and AD access group, etc.
 #
 # Design rule: this script prepares an image, but it does not decide the
 # domain or the backend. Anything that depends on the eventual realm, DC,
-# WS2008 host, share, or credentials belongs in smbproxy-sconfig.sh. That
+# legacy backend, share, or credentials belongs in smbproxy-sconfig.sh. That
 # is why files such as krb5.conf and chrony.conf are skeletons here, why
 # /etc/samba/smb.conf is removed entirely, and why no /etc/samba/.*creds
 # file is ever created in this script.
@@ -389,7 +389,7 @@ MOTDEOF
 # 18. NFTABLES FIREWALL RULESET (inactive — sconfig activates after join)
 #===============================================================================
 # Member-server rules. The legacy NIC carries only outbound SMB1 to the
-# WS2008 host; nothing should listen on it. sconfig writes the live
+# legacy backend; nothing should listen on it. sconfig writes the live
 # /etc/nftables.conf with the actual interface names once NIC roles are
 # known; this template is for reference and headless tests.
 log "Writing proxy firewall ruleset template (inactive)..."
@@ -598,7 +598,7 @@ case "$VIRT" in
     amazon)
         RECS+=$'\n'"  Platform:   Amazon EC2 (Nitro)"
         RECS+=$'\n'"  Two interfaces typically requires VPC peering or a private link"
-        RECS+=$'\n'"  to reach the WS2008 backend. The proxy works fine on EC2 but is"
+        RECS+=$'\n'"  to reach the legacy backend. The proxy works fine on EC2 but is"
         RECS+=$'\n'"  only useful when there is genuinely a legacy SMB1 host to front."
         RECS+=$'\n'"  Agents:     qemu-guest-agent + cloud-init + cloud-guest-utils (installed)"
         ;;
@@ -1019,7 +1019,7 @@ assign_nic_roles() {
         3>&1 1>&2 2>&3) || return
 
     pick_leg=$(whiptail --title "Legacy NIC" --notags \
-        --menu "Pick the interface attached to LegacyZone (the dedicated point-to-point link to the WS2008 backend).\n\nThis NIC is always static, gateway-less, and serves no DNS." \
+        --menu "Pick the interface attached to LegacyZone (the dedicated point-to-point link to the legacy backend).\n\nThis NIC is always static, gateway-less, and serves no DNS." \
         "$WT_HEIGHT" "$WT_WIDTH" "$WT_MENU" \
         "${menu_args[@]}" \
         3>&1 1>&2 2>&3) || return
@@ -1568,7 +1568,7 @@ chmod +x /etc/update-motd.d/15-smbproxy-net-status
 #      drop /etc/modprobe.d/smbproxy-blacklist-ixgbevf.conf and
 #      `update-initramfs -u`.
 #   2. If the appliance ever genuinely needs SR-IOV passthrough for
-#      throughput (it shouldn't — the WS2008 backend is SMB1, capped
+#      throughput (it shouldn't — the legacy backend is SMB1, capped
 #      at single-digit Gb/s practically), narrow the blacklist to a
 #      modprobe.d match against the specific buggy device-id combo
 #      instead of the whole driver.

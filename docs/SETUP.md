@@ -32,7 +32,7 @@ Five VMs run on the Hyper-V host:
 | `WS2025-DC1` | Windows Server 2025 first DC for `lab.test` | 10.10.10.10 |
 | `samba-dc1` | Samba AD DC appliance under test (sibling repo) | 10.10.10.20 |
 | `smbproxy-1` | Proxy appliance under test (this repo) | 10.10.10.30 |
-| WS2008 SP2 backend | Persistent legacy file server | `172.29.137.1` (LegacyZone) |
+| legacy SMB1 backend | Persistent legacy file server | `172.29.137.1` (LegacyZone) |
 
 The Mac mounts an SMB share from the Hyper-V host (typically
 `/Volumes/ISO` on the Mac = `D:\ISO\` on the host). This share is where
@@ -44,13 +44,13 @@ runner jumps through the host via SSH to reach the VMs.
 If you already followed the `samba-addc-appliance` SETUP guide, the
 only proxy-specific items you still need are:
 
-1. **`LegacyZone` private virtual switch** with the WS2008 SP2 server
+1. **`LegacyZone` private virtual switch** with the legacy SMB1 server
    attached (172.29.137.0/24). This is persistent infrastructure — see
    [LegacyZone vSwitch](#legacyzone-vswitch) below.
 2. **dnsmasq reservation for the proxy's domain NIC**. Add
    `00:15:5D:0A:0A:1E,smbproxy-1,10.10.10.30` to your lab-router config
    (see [dnsmasq reservation](#dnsmasq-reservation)) and re-render.
-3. **WS2008 backend credentials**. See
+3. **legacy backend credentials**. See
    [Backend credentials](#backend-credentials).
 
 Everything else — the Mac toolchain, the SSH setup to the Hyper-V
@@ -96,20 +96,20 @@ Same expectations as `samba-addc-appliance/docs/SETUP.md`:
 
 Create the LegacyZone switch **once** as a Hyper-V *Private* vSwitch
 (no host adapter, no upstream — just a private bus the proxy and the
-WS2008 server share):
+legacy backend server share):
 
 ```powershell
 New-VMSwitch -Name 'LegacyZone' -SwitchType Private
 ```
 
-Attach the WS2008 SP2 staging server to it and pin the Windows side
+Attach the legacy SMB1 staging server to it and pin the Windows side
 to `172.29.137.1/24` with **no gateway, no DNS**. The proxy's legacy
 NIC is configured later from `smbproxy-init` to a static address on
 the same subnet (e.g. `172.29.137.10/24`, again no gateway, no DNS).
 
 This switch is persistent infrastructure. Do not delete or rename it
 casually; every diagnostic and lab scenario in this repo assumes it
-exists with a working WS2008 backend.
+exists with a working legacy backend.
 
 ### dnsmasq reservation
 
@@ -129,14 +129,14 @@ in `New-SmbProxyTestVM.ps1` and the IP in `lab/proxy.env`.
 
 ### Backend credentials
 
-The WS2008 SP2 backend is reachable on LegacyZone at `172.29.137.1`
-with share `ProfitFab$`, NetBIOS domain `LEGACY`, user `pfuser`. The
-credentials are documented in
-[`docs/sketch-smb1-smb3-proxy.sh`](sketch-smb1-smb3-proxy.sh) (the
-historical starter script). They are **not** repeated in any scenario
-file — scenarios that mount the backend read the password from the
-`SC_BACKEND_PASS` env var or a gitignored `lab/backend-creds.env`
-file. See [LAB-TESTING.md](LAB-TESTING.md) for the exact pattern.
+A legacy SMB1 backend on the LegacyZone subnet (e.g. at
+`172.29.137.1` with a share named `Engineering$`, NetBIOS domain
+`LEGACY`, user `engineering_user` — names are operator-chosen) is
+the assumed test fixture. Lab scenarios take the share/user/domain
+as inputs (`SC_SHARE_NAME`, `SC_BACKEND_USER`, `SC_BACKEND_DOMAIN`)
+and never embed the password — scenarios read it from
+`SC_BACKEND_PASS` or a gitignored `lab/backend-creds.env` file. See
+[LAB-TESTING.md](LAB-TESTING.md) for the exact pattern.
 
 ## External Artifacts
 
@@ -200,7 +200,7 @@ ssh nmadmin@server 'pwsh -Command "Get-VMSwitch | Where-Object Name -in @(\"Lab-
 # 5. ISO share is mounted and writable.
 touch /Volumes/ISO/.write-test && rm /Volumes/ISO/.write-test && echo "ISO share OK"
 
-# 6. WS2008 backend reachable from the Hyper-V host.
+# 6. legacy backend reachable from the Hyper-V host.
 ssh nmadmin@server 'Test-NetConnection -ComputerName 172.29.137.1 -Port 445 -InformationLevel Quiet'
 
 # 7. Syntax check the proxy scripts.

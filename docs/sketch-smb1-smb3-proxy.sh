@@ -14,7 +14,7 @@
 #
 # The intent and the locking-strict frontend stanza in this sketch carried
 # directly into smbproxy-sconfig. The deployment-specific pieces here
-# (WS2008/WS2025 IPs, share names, credentials) became sconfig prompts.
+# (legacy SMB1 / modern AD IPs, share names, credentials) became sconfig prompts.
 #
 # ------------------------------------------------------------------------------
 set -euo pipefail
@@ -22,24 +22,24 @@ set -euo pipefail
 # ==============================================================================
 # CONFIGURATION VARIABLES - Edit these before running
 # ==============================================================================
-# WS2008 Backend (SMB1 Target)
-WS2008_IP="172.29.137.1"    # Dedicated Link IP
-WS2008_SHARE="ProfitFab$"
-WS2008_DOMAIN="LEGACY"
-WS2008_USER="pfuser"
-WS2008_PASS="<ROTATED-2026-05-01-see-internal-vault>"  # original literal removed; cred rotated in production. See dev-commons/PUBLISH-CHECKLIST.md.
+# Legacy SMB1 backend
+BACKEND_IP="172.29.137.1"    # Dedicated Link IP
+BACKEND_SHARE="Engineering$"
+BACKEND_DOMAIN="LEGACY"
+BACKEND_USER="engineering_user"
+BACKEND_PASS="<ROTATED-2026-05-01-see-internal-vault>"  # original literal removed; cred rotated in production. See dev-commons/PUBLISH-CHECKLIST.md.
 
-# WS2025 Active Directory Domain (Frontend)
-DOMAIN_FQDN="naimor.naimorinc.com"
-DOMAIN_SHORT="NAIMOR"      # NetBIOS name (pre-Windows 2000 domain name)
+# Modern AD Forest (Frontend)
+DOMAIN_FQDN="example.lan"
+DOMAIN_SHORT="EXAMPLE"     # NetBIOS name (pre-Windows 2000 domain name)
 DC_IP="192.168.0.18"       # Domain Network IP
-AD_ADMIN_USER="NMAdmin"
+AD_ADMIN_USER="Administrator"
 
 # Proxy Configuration
-PROXY_MOUNT="/mnt/profitfab$"
-PROXY_SHARE_NAME="ProfitFab$"
-PROXY_ACCESS_GROUP="NAIMOR\ProfitFab Users"  # Domain security group controlling who can access legacy share
-PROXY_FRONTEND_USER="pfuser"
+PROXY_MOUNT="/mnt/engineering$"
+PROXY_SHARE_NAME="Engineering$"
+PROXY_ACCESS_GROUP="EXAMPLE\Engineering Users"  # Domain security group controlling who can access legacy share
+PROXY_FRONTEND_USER="engineering_user"
 
 # ==============================================================================
 # INITIALIZATION & CREDENTIAL GATHERING
@@ -194,16 +194,16 @@ chown "${PROXY_FRONTEND_USER}:${PROXY_FRONTEND_USER}" "${PROXY_MOUNT}"
 # Secure backend credentials
 CREDS_FILE="/etc/samba/.ws2008_creds"
 cat <<EOF > "${CREDS_FILE}"
-username=${WS2008_USER}
-password=${WS2008_PASS}
-domain=${WS2008_DOMAIN}
+username=${BACKEND_USER}
+password=${BACKEND_PASS}
+domain=${BACKEND_DOMAIN}
 EOF
 chmod 600 "${CREDS_FILE}"
 
 # Add to fstab
 # Note: SMB1 is explicitly handled here by the cifs kernel module, which ignores 
 # the 'client min protocol = SMB3' setting in smb.conf.
-FSTAB_ENTRY="//${WS2008_IP}/${WS2008_SHARE} ${PROXY_MOUNT} cifs credentials=${CREDS_FILE},vers=1.0,cache=none,serverino,nobrl,uid=${PROXY_FRONTEND_USER},gid=${PROXY_FRONTEND_USER},_netdev,x-systemd.automount,x-systemd.requires=network-online.target 0 0"
+FSTAB_ENTRY="//${BACKEND_IP}/${BACKEND_SHARE} ${PROXY_MOUNT} cifs credentials=${CREDS_FILE},vers=1.0,cache=none,serverino,nobrl,uid=${PROXY_FRONTEND_USER},gid=${PROXY_FRONTEND_USER},_netdev,x-systemd.automount,x-systemd.requires=network-online.target 0 0"
 
 if ! grep -q "${PROXY_MOUNT}" /etc/fstab; then
   echo "${FSTAB_ENTRY}" >> /etc/fstab

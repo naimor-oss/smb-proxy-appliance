@@ -30,12 +30,12 @@
 
 source "$(dirname "${BASH_SOURCE[0]}")/bootstrap-network.sh"
 
-SC_SHARE_NAME="${SC_SHARE_NAME:-ProfitFab\$}"
+SC_SHARE_NAME="${SC_SHARE_NAME:-Engineering\$}"
 SC_BACKEND_IP="${SC_BACKEND_IP:-172.29.137.1}"
-SC_BACKEND_USER="${SC_BACKEND_USER:-pfuser}"
+SC_BACKEND_USER="${SC_BACKEND_USER:-engineering_user}"
 SC_BACKEND_DOMAIN="${SC_BACKEND_DOMAIN:-LEGACY}"
-SC_BACKEND_MOUNT="${SC_BACKEND_MOUNT:-/mnt/legacy/ProfitFab_}"
-SC_FORCE_USER="${SC_FORCE_USER:-pfuser}"
+SC_BACKEND_MOUNT="${SC_BACKEND_MOUNT:-/mnt/legacy/Engineering_}"
+SC_FORCE_USER="${SC_FORCE_USER:-engineering_user}"
 
 # Safe-name derivation matching share_safe_name() in smbproxy-sconfig.
 # Used to predict the on-disk creds file path for the verify checks.
@@ -46,7 +46,7 @@ require_backend_pass() {
         say "ERROR: SC_BACKEND_PASS is unset"
         say "  Drop  SC_BACKEND_PASS='...'  into lab/backend-creds.env (gitignored),"
         say "  or pass --backend-creds /some/other/file to lab/run-scenario.sh."
-        say "  See docs/sketch-smb1-smb3-proxy.sh for the original WS2008 credential."
+        say "  See docs/sketch-smb1-smb3-proxy.sh for the original legacy SMB1 backend credential."
         return 1
     fi
 }
@@ -63,7 +63,7 @@ do_configure_backend() {
         # than just the cifs mount.
         extra="--group '$SC_GROUP'"
     fi
-    # SC_SHARE_NAME may contain a literal '$' (e.g. ProfitFab$). Quote
+    # SC_SHARE_NAME may contain a literal '$' (e.g. Engineering$). Quote
     # everything single so the local shell doesn't expand it before ssh;
     # ssh_vm wraps the whole thing in another layer of quoting.
     # shellcheck disable=SC2086

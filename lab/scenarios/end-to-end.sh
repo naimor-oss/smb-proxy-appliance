@@ -15,7 +15,7 @@
 #
 # Verification: the full frontend-share verify() (renamed before
 # redefining, so we can reuse it) plus a per-share status check via
-# the new --status output, plus an opt-in WS2008 read/write roundtrip
+# the new --status output, plus an opt-in legacy SMB1 backend read/write roundtrip
 # through the proxy.
 #
 # Overridable via env (see upstream scenarios for the full list):
@@ -25,7 +25,7 @@
 #   SC_BACKEND_IP/USER/DOMAIN/MOUNT, SC_FORCE_USER, SC_GROUP
 #   SC_WRITE_ROUNDTRIP=1     opt-in: write a uniquely-named test file
 #                            through the proxy, read it back, delete.
-#                            Off by default to keep the shared WS2008
+#                            Off by default to keep the shared legacy SMB1 backend
 #                            backend strictly read-only during tests.
 
 source "$(dirname "${BASH_SOURCE[0]}")/frontend-share.sh"
@@ -80,7 +80,7 @@ verify() {
     fi
 
     if [[ "${SC_WRITE_ROUNDTRIP:-0}" == "1" ]]; then
-        say "WS2008 write roundtrip (opt-in via SC_WRITE_ROUNDTRIP=1)"
+        say "legacy SMB1 backend write roundtrip (opt-in via SC_WRITE_ROUNDTRIP=1)"
         # Unique filename so concurrent runs don't collide and so it's
         # obviously a test artifact if cleanup is interrupted. The proxy
         # mount uses uid=$SC_FORCE_USER so writes go out as that user.
@@ -96,7 +96,7 @@ verify() {
         echo "$out"
         grep -qE '^OK$' <<< "$out" || { say "write roundtrip did not complete"; rc=1; }
     else
-        say "WS2008 write roundtrip skipped (set SC_WRITE_ROUNDTRIP=1 to enable)"
+        say "legacy SMB1 backend write roundtrip skipped (set SC_WRITE_ROUNDTRIP=1 to enable)"
     fi
 
     return "$rc"
