@@ -192,7 +192,7 @@ mkdir -p "${PROXY_MOUNT}"
 chown "${PROXY_FRONTEND_USER}:${PROXY_FRONTEND_USER}" "${PROXY_MOUNT}"
 
 # Secure backend credentials
-CREDS_FILE="/etc/samba/.ws2008_creds"
+CREDS_FILE="/etc/samba/.legacy_creds"
 cat <<EOF > "${CREDS_FILE}"
 username=${BACKEND_USER}
 password=${BACKEND_PASS}

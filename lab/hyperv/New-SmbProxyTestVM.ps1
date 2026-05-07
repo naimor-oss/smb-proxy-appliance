@@ -23,7 +23,7 @@
       smbproxy-2   00:15:5D:0A:0A:1F   10.10.10.31
       smbproxy-3   00:15:5D:0A:0A:20   10.10.10.32
 
-    The LegacyZone vSwitch is persistent infrastructure — the WS2008 SP2
+    The LegacyZone vSwitch is persistent infrastructure — the legacy SMB1
     backend lives on it. This script refuses to run if LegacyZone is
     missing rather than create a wrong-topology switch.
 
@@ -45,7 +45,7 @@
 
 .PARAMETER LegacySwitchName
     Backend point-to-point switch (default 'LegacyZone'). Must already
-    exist with the WS2008 SP2 server attached.
+    exist with the legacy SMB1 server attached.
 
 .PARAMETER DomainStaticMacAddress
     Pinned MAC for the domain NIC, no separators. Default '00155D0A0A1E'
@@ -102,7 +102,7 @@ if (-not (Get-VMSwitch -Name $DomainSwitchName -ErrorAction SilentlyContinue)) {
     throw "Switch '$DomainSwitchName' not found. Build the lab router first (New-LabRouter.ps1)."
 }
 if (-not (Get-VMSwitch -Name $LegacySwitchName -ErrorAction SilentlyContinue)) {
-    throw "Switch '$LegacySwitchName' not found. The LegacyZone private switch (with the WS2008 backend on it) is persistent infrastructure — create it once by hand and leave it."
+    throw "Switch '$LegacySwitchName' not found. The LegacyZone private switch (with the legacy backend on it) is persistent infrastructure — create it once by hand and leave it."
 }
 
 Write-Step "Creating proxy test VM: $VMName"
