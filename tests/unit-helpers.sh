@@ -157,6 +157,38 @@ check_eq "modern + BACKEND_SEAL=yes (explicit) → vers=3,seal,soft,echo_interva
     "${COMMON},vers=3,seal,soft,echo_interval=10" \
     "$(BACKEND_SEAL=yes; backend_mount_opts modern)"
 
+# --backend-vers override (added 2026-05-07 for the HMI device that
+# only speaks SMB1/SMB2). Modern profile semantics (relaxed locking,
+# soft mount) are preserved; only the version changes.
+check_eq "modern + BACKEND_VERS=2.1 → vers=2.1, seal auto-dropped (SMB3-only)" \
+    "${COMMON},vers=2.1,soft,echo_interval=10" \
+    "$(BACKEND_VERS=2.1; backend_mount_opts modern)"
+check_eq "modern + BACKEND_VERS=1.0 → vers=1.0, seal auto-dropped" \
+    "${COMMON},vers=1.0,soft,echo_interval=10" \
+    "$(BACKEND_VERS=1.0; backend_mount_opts modern)"
+check_eq "modern + BACKEND_VERS=3.1.1 (explicit SMB3.1.1) → seal kept" \
+    "${COMMON},vers=3.1.1,seal,soft,echo_interval=10" \
+    "$(BACKEND_VERS=3.1.1; backend_mount_opts modern)"
+check_eq "modern + BACKEND_VERS=3.0 → seal kept" \
+    "${COMMON},vers=3.0,seal,soft,echo_interval=10" \
+    "$(BACKEND_VERS=3.0; backend_mount_opts modern)"
+# Critical invariant: seal must be SUPPRESSED for non-SMB3 versions
+# even if BACKEND_SEAL=yes is explicit. The cifs driver would reject
+# seal on a vers=2.1 negotiation with NT_STATUS_NOT_SUPPORTED. The
+# silent suppress is the right default — emitting `seal` for SMB1/2
+# would just break the mount with a confusing error.
+check_eq "modern + BACKEND_VERS=2.1 + BACKEND_SEAL=yes → seal STILL suppressed" \
+    "${COMMON},vers=2.1,soft,echo_interval=10" \
+    "$(BACKEND_VERS=2.1; BACKEND_SEAL=yes; backend_mount_opts modern)"
+
+# Legacy is fixed at vers=1.0 regardless of BACKEND_VERS — the override
+# is a CLI-level rejection, but defense-in-depth at the helper level
+# would also be cheap. Today the helper just ignores BACKEND_VERS for
+# legacy. Pin that.
+check_eq "legacy ignores BACKEND_VERS (still vers=1.0)" \
+    "${COMMON},vers=1.0,cache=none,nobrl" \
+    "$(BACKEND_VERS=2.1; backend_mount_opts legacy)"
+
 check_eq "modern MUST contain nosharesock" \
     "yes" \
     "$(backend_mount_opts modern | grep -qF nosharesock && echo yes || echo no)"
@@ -224,8 +256,16 @@ check_eq "relaxed: level2 oplocks = yes" "yes" \
     "$(grep -qxF '    level2 oplocks = yes' <<< "$REL" && echo yes || echo no)"
 check_eq "relaxed: strict locking = no" "yes" \
     "$(grep -qxF '    strict locking = no'  <<< "$REL" && echo yes || echo no)"
-check_eq "relaxed: posix locking = auto" "yes" \
-    "$(grep -qxF '    posix locking = auto' <<< "$REL" && echo yes || echo no)"
+check_eq "relaxed: posix locking = yes" "yes" \
+    "$(grep -qxF '    posix locking = yes' <<< "$REL" && echo yes || echo no)"
+
+# Regression: 'posix locking = auto' is not a valid Samba boolean
+# (caught by testparm in production 2026-05-07: "set_variable_helper
+# (auto): value is not boolean!"). Pin that the relaxed stanza never
+# regresses to it.
+check_eq "relaxed MUST NOT use 'auto' (not a Samba boolean)" \
+    "no" \
+    "$(grep -qF 'auto' <<< "$REL" && echo yes || echo no)"
 
 # Cross-check: tps-strict MUST NOT have oplocks=yes; relaxed MUST NOT
 # have strict locking=yes. Catches a "fix" that copy-pastes the wrong
@@ -234,6 +274,59 @@ check_eq "tps-strict MUST NOT enable oplocks" "yes" \
     "$(grep -q 'oplocks = yes' <<< "$TPS" && echo no || echo yes)"
 check_eq "relaxed MUST NOT set strict locking = yes" "yes" \
     "$(grep -q 'strict locking = yes' <<< "$REL" && echo no || echo yes)"
+
+#-------------------------------------------------------------------------------
+# share_section_present — regression for the $-in-share-name bug
+# caught on the production proxy 2026-05-07. Section presence was
+# being detected with `grep -qE "^\[$name\]"`; for a share named
+# `Shop$` the regex `^\[Shop$\]` interpreted `$` as end-of-line and
+# silently reported every $-bearing share as section-MISSING even
+# when the section was present and serving traffic.
+#-------------------------------------------------------------------------------
+echo "== share_section_present =="
+
+fixture_smb=$(mktemp /tmp/smbproxy-smbconf-XXXX.conf)
+trap 'rm -f "$fixture_smb"' EXIT
+cat > "$fixture_smb" <<'EOF'
+[global]
+    realm = LAB.TEST
+[ProfitFab$]
+    path = /mnt/legacy/ProfitFab
+[Shop$]
+    path = /mnt/legacy/Shop
+[Plain]
+    path = /mnt/plain
+EOF
+# Pass the fixture as the optional second arg — SMB_CONF is readonly
+# in the script so we can't override it, and the helper takes the
+# file path as $2 specifically to make this testable.
+
+# The $-bearing names: must report present.
+share_section_present 'ProfitFab$' "$fixture_smb"
+check_rc "share_section_present('ProfitFab\$') → 0 (present)"  0 $?
+share_section_present 'Shop$' "$fixture_smb"
+check_rc "share_section_present('Shop\$') → 0 (present)"       0 $?
+# Plain ASCII control case.
+share_section_present 'Plain' "$fixture_smb"
+check_rc "share_section_present('Plain') → 0 (present)"        0 $?
+# Negative cases: similar names that are NOT present.
+share_section_present 'NotThere' "$fixture_smb"
+check_rc "share_section_present('NotThere') → !0 (missing)"    1 $?
+share_section_present 'ProfitFab' "$fixture_smb"   # no $ — different section
+check_rc "share_section_present('ProfitFab') → !0 (the \$ matters)" 1 $?
+# Defense check: empty name returns failure (don't accidentally
+# match e.g. an `[]` line).
+share_section_present '' "$fixture_smb"
+check_rc "share_section_present('') → !0"                      1 $?
+
+# Lint: no caller in smbproxy-sconfig.sh should use the old buggy
+# `grep -qE "^\[$name\]"` pattern for section detection. Catches a
+# future revert where someone "simplifies" share_section_present
+# back to an inline grep. Excludes comment lines so the docstring
+# in share_section_present (which quotes the old pattern as the
+# bug it fixed) doesn't self-match.
+buggy_callers=$(grep -cE '^[^#]*grep -qE "\^\\\[\$' "$SCONFIG" 2>/dev/null || true)
+check_eq "no caller uses raw grep -qE for section detection" "0" "$buggy_callers"
 
 #-------------------------------------------------------------------------------
 echo

@@ -185,7 +185,9 @@ backend_mount_opts() {
             # when the proxy is one of several clients hitting a modern
             # backend (the device may have its own writers). seal=
             # SMB3 wire encryption; ~10-30% CPU but cheap enough for
-            # the slow IO patterns these devices generate.
+            # the slow IO patterns these devices generate. seal is
+            # SMB3-only and is auto-suppressed when the negotiated
+            # version is below SMB3 (see vers handling below).
             #
             # soft + echo_interval=10: when the backend device is off
             # (CNC powered down, NAS rebooted), the kernel cifs default
@@ -202,9 +204,24 @@ backend_mount_opts() {
             # the access pattern is file-copy (CNC programs, NAS
             # archive); a mid-copy retry is preferable to a 60s freeze.
             # NOT applicable to the legacy profile — see below.
+            #
+            # vers: defaults to 3 (the modern-profile assumption) but
+            # is overridable via BACKEND_VERS. Real-world need surfaced
+            # 2026-05-07 with an HMI device that only speaks SMB1/SMB2;
+            # forcing vers=3 made the cifs negotiation fail. The
+            # override keeps the modern profile's other semantics
+            # (relaxed locking, soft mount, automount) intact while
+            # letting the version match the device's capability.
+            local vers="${BACKEND_VERS:-3}"
             local sealopt=""
-            [[ "${BACKEND_SEAL:-yes}" == "yes" ]] && sealopt=",seal"
-            echo "${common},vers=3${sealopt},soft,echo_interval=10"
+            # seal is SMB3-only. Drop it silently for older versions
+            # — the encryption simply isn't part of the SMB1/2 wire
+            # format, so emitting `seal` would make the cifs mount
+            # fail to negotiate.
+            if [[ "${BACKEND_SEAL:-yes}" == "yes" ]] && [[ "$vers" =~ ^3 ]]; then
+                sealopt=",seal"
+            fi
+            echo "${common},vers=${vers}${sealopt},soft,echo_interval=10"
             ;;
         *)
             # Legacy (WS2008/.TPS) profile. vers=1.0 + cache=none +
@@ -239,7 +256,7 @@ frontend_locking_stanza() {
     level2 oplocks = yes
     strict locking = no
     kernel oplocks = no
-    posix locking = auto
+    posix locking = yes
 STANZA
             ;;
         *)
@@ -297,7 +314,7 @@ load_share() {
     local name="$1"
     SHARE_NAME="" BACKEND_IP="" BACKEND_USER="" BACKEND_DOMAIN=""
     BACKEND_MOUNT="" FRONT_GROUP="" FRONT_FORCE_USER=""
-    PROFILE="" BACKEND_SEAL="" LOCKING_OVERRIDE=""
+    PROFILE="" BACKEND_SEAL="" LOCKING_OVERRIDE="" BACKEND_VERS=""
     local f
     f=$(share_state_file "$name")
     [[ -f "$f" ]] || return 1
@@ -324,6 +341,7 @@ BACKEND_IP="${BACKEND_IP:-}"
 BACKEND_USER="${BACKEND_USER:-}"
 BACKEND_DOMAIN="${BACKEND_DOMAIN:-}"
 BACKEND_MOUNT="${BACKEND_MOUNT:-}"
+BACKEND_VERS="${BACKEND_VERS:-}"
 BACKEND_SEAL="${BACKEND_SEAL:-}"
 FRONT_GROUP="${FRONT_GROUP:-}"
 FRONT_FORCE_USER="${FRONT_FORCE_USER:-}"
@@ -431,6 +449,26 @@ backend_mount_active() {
     local mp="$1"
     [[ -n "$mp" ]] || return 1
     mountpoint -q "$mp"
+}
+
+# True (rc=0) if smb.conf has a `[share_name]` section header. Uses
+# awk's literal string compare ($0 == target) so share names with
+# regex metacharacters — most importantly the trailing `$` that's
+# common on Windows hidden shares like ProfitFab$ — match correctly.
+# The previous `grep -qE "^\[$name\]"` form interpreted `$` as
+# end-of-line and silently reported every $-bearing share as
+# "smb_section: no" even when the section was present and serving
+# traffic. Caught 2026-05-07 on the production proxy.
+share_section_present() {
+    local name="$1"
+    # Second arg lets tests point at a fixture file; production calls
+    # default to $SMB_CONF.
+    local conf="${2:-$SMB_CONF}"
+    [[ -n "$name" && -f "$conf" ]] || return 1
+    awk -v target="[$name]" '
+        $0 == target { found=1; exit }
+        END { exit !found }
+    ' "$conf"
 }
 
 read_smbconf_param() {
@@ -1166,7 +1204,7 @@ shares_list_status() {
                 fi
                 printf '  AD access:      %s\n' "${FRONT_GROUP:-?}"
                 printf '  force user:     %s\n' "${FRONT_FORCE_USER:-?}"
-                if grep -qE "^\[$n\]" "$SMB_CONF" 2>/dev/null; then
+                if share_section_present "$n"; then
                     printf '  smb.conf:       [%s] section present\n' "$n"
                 else
                     printf '  smb.conf:       [%s] section MISSING\n' "$n"
@@ -1525,7 +1563,7 @@ check_share() {
     fi
 
     # --- smb.conf section --------------------------------------------
-    if grep -qE "^\[${SHARE_NAME}\]\s*$" "$SMB_CONF" 2>/dev/null; then
+    if share_section_present "$SHARE_NAME"; then
         printf '   smb.conf:       [%s] section present\n' "$SHARE_NAME"
 
         # Identity resolution checks — only meaningful if joined.
@@ -2238,6 +2276,7 @@ Usage:
         --backend-ip IP --backend-user USER --backend-domain NETBIOS \\
         [--mount /mnt/.../X] \\
         [--group "DOM\\Group"] [--force-user pfuser] \\
+        [--backend-vers 1.0|2.0|2.1|3|3.0|3.0.2|3.1.1|default]  (modern only) \\
         [--backend-seal | --no-backend-seal]   (modern only) \\
         [--locking profile-default|tps-strict|relaxed] \\
         [--pass-stdin]
@@ -2258,6 +2297,12 @@ Usage:
 
         --locking overrides the profile's locking stanza. profile-default
         (the default) picks tps-strict for legacy and relaxed for modern.
+
+        --backend-vers overrides the modern profile's default vers=3.
+        Use when the device only speaks SMB1/SMB2 (HMI panels, older
+        NAS, embedded SMB stacks). seal is auto-suppressed for
+        non-SMB3 versions since it's part of the SMB3 wire format.
+        Legacy profile is fixed at vers=1.0 — override is rejected.
 
         --mount defaults to /mnt/legacy/<safe-name> for legacy and
         /mnt/backend/<safe-name> for modern; --force-user defaults to
@@ -2315,9 +2360,10 @@ EOF
             local active="no"
             backend_mount_active "${BACKEND_MOUNT:-/dev/null}" 2>/dev/null && active="yes"
             local has_section="no"
-            grep -qE "^\[$n\]" "$SMB_CONF" 2>/dev/null && has_section="yes"
+            share_section_present "$n" && has_section="yes"
             printf '  - %s\n' "$n"
-            printf '      profile:        %s\n' "${PROFILE:-$PROFILE_LEGACY}"
+            printf '      profile:        %s%s\n' "${PROFILE:-$PROFILE_LEGACY}" \
+                "$([[ -n "${BACKEND_VERS:-}" ]] && printf ' (vers=%s)' "$BACKEND_VERS")"
             printf '      backend:        //%s/%s\n' "${BACKEND_IP:-?}" "$n"
             printf '      mount:          %s  (active=%s)\n' "${BACKEND_MOUNT:-?}" "$active"
             printf '      ad_group:       %s\n' "${FRONT_GROUP:-(unset)}"
@@ -2362,7 +2408,7 @@ cli_configure_share() {
     SHARE_NAME=""
     BACKEND_IP="" BACKEND_USER="" BACKEND_DOMAIN="" BACKEND_MOUNT=""
     FRONT_GROUP="" FRONT_FORCE_USER=""
-    PROFILE="" BACKEND_SEAL="" LOCKING_OVERRIDE=""
+    PROFILE="" BACKEND_SEAL="" LOCKING_OVERRIDE="" BACKEND_VERS=""
     local PASS_STDIN=0
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -2371,6 +2417,7 @@ cli_configure_share() {
             --backend-ip)       BACKEND_IP="$2"; shift 2 ;;
             --backend-user)     BACKEND_USER="$2"; shift 2 ;;
             --backend-domain)   BACKEND_DOMAIN="$2"; shift 2 ;;
+            --backend-vers)     BACKEND_VERS="$2"; shift 2 ;;
             --backend-seal)     BACKEND_SEAL="yes"; shift ;;
             --no-backend-seal)  BACKEND_SEAL="no"; shift ;;
             --mount)            BACKEND_MOUNT="$2"; shift 2 ;;
@@ -2395,6 +2442,16 @@ cli_configure_share() {
     if [[ -n "$BACKEND_SEAL" && "$PROFILE" != "$PROFILE_MODERN" ]]; then
         echo "--backend-seal/--no-backend-seal only applies to --profile modern" >&2
         return 2
+    fi
+    if [[ -n "$BACKEND_VERS" ]]; then
+        if [[ "$PROFILE" != "$PROFILE_MODERN" ]]; then
+            echo "--backend-vers only applies to --profile modern (legacy is fixed at vers=1.0)" >&2
+            return 2
+        fi
+        case "$BACKEND_VERS" in
+            1.0|2.0|2.1|3|3.0|3.0.2|3.1.1|default) : ;;
+            *) echo "invalid --backend-vers '$BACKEND_VERS' (expected: 1.0|2.0|2.1|3|3.0|3.0.2|3.1.1|default)" >&2; return 2 ;;
+        esac
     fi
     [[ -n "$BACKEND_MOUNT"      ]] || BACKEND_MOUNT=$(share_default_mount "$SHARE_NAME" "$PROFILE")
     [[ -n "$FRONT_FORCE_USER"   ]] || FRONT_FORCE_USER="$BACKEND_USER"
