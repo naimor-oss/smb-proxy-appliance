@@ -74,18 +74,34 @@ kernel oplocks  = no
 posix locking   = yes
 ```
 
-Backend (cifs mount options for the WS2008 share):
+Backend (cifs mount options) — diverges per profile:
 
 ```
-vers=1.0,nobrl,cache=none,serverino,nosharesock
+legacy:  vers=1.0,nobrl,cache=none,serverino,nosharesock
+modern:  vers=3,seal,serverino,nosharesock,soft,echo_interval=10
 ```
 
-`nobrl` deliberately silences kernel-level byte-range lock propagation so
-the backend never sees lock requests; `cache=none` removes the read cache
-that could mask conflicts; `serverino` keeps inode numbers stable across
-remounts; `nosharesock` forces a separate TCP/SMB session per cifs mount
-so multi-share configs against the same backend don't multiplex onto a
-single session and silently reuse the first share's credentials.
+`nobrl` (legacy only) deliberately silences kernel-level byte-range
+lock propagation so the backend never sees lock requests; `cache=none`
+(legacy only) removes the read cache that could mask conflicts;
+`serverino` keeps inode numbers stable across remounts; `nosharesock`
+forces a separate TCP/SMB session per cifs mount so multi-share
+configs against the same backend don't multiplex onto a single
+session and silently reuse the first share's credentials.
+
+**`soft,echo_interval=10` (modern only)** is the offline-device
+fail-fast defense. The kernel cifs default of `hard` makes I/O block
+indefinitely waiting for an unreachable backend's TCP socket — a
+Windows client with a drive letter to the proxied share then sees
+Open Dialog and Explorer hang for ~60-75s on every directory listing
+when the backend device is off (CNC powered down, NAS rebooted).
+With `soft` + a 10-second heartbeat, the kernel returns I/O errors
+~10s after the backend disappears, Samba forwards a clean SMB error,
+and Open Dialog grays out the share immediately. The legacy profile
+deliberately stays HARD — under .TPS multi-writer workloads, a
+soft-mount mid-write error would corrupt the database. The legacy
+zone is also expected to be always-on, so the offline annoyance
+doesn't apply there.
 
 ## Persistent Infrastructure
 

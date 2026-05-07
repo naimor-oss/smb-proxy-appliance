@@ -186,14 +186,40 @@ backend_mount_opts() {
             # backend (the device may have its own writers). seal=
             # SMB3 wire encryption; ~10-30% CPU but cheap enough for
             # the slow IO patterns these devices generate.
+            #
+            # soft + echo_interval=10: when the backend device is off
+            # (CNC powered down, NAS rebooted), the kernel cifs default
+            # of `hard` blocks indefinitely waiting for the TCP
+            # connection to come back. Windows clients that have a
+            # drive letter to the proxied share then see Open Dialog /
+            # Explorer hang for ~60-75s on every directory listing —
+            # the dominant offline-device annoyance reported on the
+            # shop floor 2026-05. With `soft`, the kernel returns I/O
+            # errors after `echo_interval=10`s of failed heartbeats,
+            # Samba forwards a clean SMB error to Windows, and Open
+            # Dialog grays out the share immediately instead of
+            # freezing. This is safe for the modern profile because
+            # the access pattern is file-copy (CNC programs, NAS
+            # archive); a mid-copy retry is preferable to a 60s freeze.
+            # NOT applicable to the legacy profile — see below.
             local sealopt=""
             [[ "${BACKEND_SEAL:-yes}" == "yes" ]] && sealopt=",seal"
-            echo "${common},vers=3${sealopt}"
+            echo "${common},vers=3${sealopt},soft,echo_interval=10"
             ;;
         *)
             # Legacy (WS2008/.TPS) profile. vers=1.0 + cache=none +
             # nobrl is the locking-correct combination — see AGENTS.md
             # for the full rationale.
+            #
+            # Stays HARD-mounted (no `soft`): under .TPS multi-writer
+            # workloads, a soft-mount I/O error mid-write would corrupt
+            # the database. The locking-correct path requires that
+            # writes either complete or block until the backend is
+            # back; failing-with-error is the worst of both worlds.
+            # The WS2008 backend is also expected to be always-on
+            # (the legacy zone is hard-wired and not turned off
+            # alongside the workstations), so the offline-hang
+            # problem doesn't apply.
             echo "${common},vers=1.0,cache=none,nobrl"
             ;;
     esac

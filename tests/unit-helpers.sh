@@ -145,21 +145,43 @@ check_eq "legacy MUST contain nosharesock" \
     "yes" \
     "$(backend_mount_opts legacy | grep -qF nosharesock && echo yes || echo no)"
 
-check_eq "modern + default seal=on → vers=3,seal" \
-    "${COMMON},vers=3,seal" \
+check_eq "modern + default seal=on → vers=3,seal,soft,echo_interval=10" \
+    "${COMMON},vers=3,seal,soft,echo_interval=10" \
     "$(backend_mount_opts modern)"
 
-check_eq "modern + BACKEND_SEAL=no → vers=3 (no seal)" \
-    "${COMMON},vers=3" \
+check_eq "modern + BACKEND_SEAL=no → vers=3,soft,echo_interval=10 (no seal)" \
+    "${COMMON},vers=3,soft,echo_interval=10" \
     "$(BACKEND_SEAL=no; backend_mount_opts modern)"
 
-check_eq "modern + BACKEND_SEAL=yes (explicit) → vers=3,seal" \
-    "${COMMON},vers=3,seal" \
+check_eq "modern + BACKEND_SEAL=yes (explicit) → vers=3,seal,soft,echo_interval=10" \
+    "${COMMON},vers=3,seal,soft,echo_interval=10" \
     "$(BACKEND_SEAL=yes; backend_mount_opts modern)"
 
 check_eq "modern MUST contain nosharesock" \
     "yes" \
     "$(backend_mount_opts modern | grep -qF nosharesock && echo yes || echo no)"
+
+# soft + echo_interval=10 invariants — the offline-device fail-fast
+# fix (Layer 1, 2026-05-06). Modern profile MUST have both so Open
+# Dialog grays out instead of hanging when a CNC/NAS is powered off.
+check_eq "modern MUST have soft (Layer 1 offline-device fail-fast)" \
+    "yes" \
+    "$(backend_mount_opts modern | grep -qE '(^|,)soft(,|$)' && echo yes || echo no)"
+check_eq "modern MUST have echo_interval=10" \
+    "yes" \
+    "$(backend_mount_opts modern | grep -qF 'echo_interval=10' && echo yes || echo no)"
+
+# Legacy profile MUST NOT have soft — under .TPS multi-writer the
+# soft-mount mid-write error would corrupt the database. The legacy
+# zone is also expected to be always-on, so the offline annoyance
+# doesn't apply. Pin the absence so a future "let me unify the
+# profiles' mount options" refactor can't sneak it in.
+check_eq "legacy MUST NOT have soft (TPS write-corruption defense)" \
+    "no" \
+    "$(backend_mount_opts legacy | grep -qE '(^|,)soft(,|$)' && echo yes || echo no)"
+check_eq "legacy MUST NOT have echo_interval (no fail-fast on .TPS)" \
+    "no" \
+    "$(backend_mount_opts legacy | grep -qF 'echo_interval' && echo yes || echo no)"
 
 # Invariant: numeric uid=/gid= must appear in BOTH profiles. The
 # default-domain ambiguity defense from configure_share writes them
