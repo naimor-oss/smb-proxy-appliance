@@ -152,14 +152,39 @@ done
 ssh_vm 'hostname; ip -4 addr show | grep -E "inet " | head -3; \
         test -f /var/log/smbproxy-base-ready.marker && cat /var/log/smbproxy-base-ready.marker'
 
-step "5. push appliance scripts"
+step "5. push appliance scripts and appliance-core lib/ to the VM"
 scp -J "${HV_USER}@${HV_HOST}" \
     -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
     "$REPO_DIR/prepare-image.sh" "$REPO_DIR/smbproxy-sconfig.sh" \
     "${VM_USER}@${VM_IP}:/tmp/"
 
+# Cross-repo: vendor the shared libs from the sibling appliance-core
+# repo. prepare-image.sh §16b looks for them at /tmp/lib/. The
+# appliance-core checkout lives at $REPO_DIR/../appliance-core per
+# REPO-SPLIT.md.
+APPCORE_REPO="${APPCORE_REPO:-$REPO_DIR/../appliance-core}"
+if [[ ! -d "$APPCORE_REPO/lib" ]]; then
+    say "appliance-core lib/ not found at $APPCORE_REPO/lib"
+    say "set \$APPCORE_REPO if the sibling lives elsewhere"
+    exit 1
+fi
+scp -J "${HV_USER}@${HV_HOST}" -r \
+    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    "$APPCORE_REPO/lib" \
+    "${VM_USER}@${VM_IP}:/tmp/"
+
 step "6. run prepare-image.sh on $VM_NAME"
-ssh_vm 'sudo bash /tmp/prepare-image.sh'
+# Compute the appliance-core source-tree commit on the Mac and pass
+# through; the appliance image has no git, so this is the only correct
+# way to record provenance. See appliance-core/prepare-image.sh §12 and
+# decisions/0002-appliance-core.md §"Versioning + identity".
+APPCORE_BUILD_COMMIT="$(git -C "$APPCORE_REPO" rev-parse HEAD 2>/dev/null || echo unknown)"
+say "  appliance-core source commit: $APPCORE_BUILD_COMMIT"
+if ! ssh_vm "sudo APPCORE_BUILD_COMMIT='$APPCORE_BUILD_COMMIT' bash /tmp/prepare-image.sh"; then
+    say "prepare-image.sh failed"
+    ssh_vm 'sudo tail -30 /var/log/smbproxy-prepare.log 2>/dev/null || journalctl -n 30 --no-pager'
+    exit 1
+fi
 ssh_vm 'sudo install -m 0755 /tmp/smbproxy-sconfig.sh /usr/local/sbin/smbproxy-sconfig'
 
 step "7. shutdown for deploy-master snapshot"

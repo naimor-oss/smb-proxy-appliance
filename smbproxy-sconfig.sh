@@ -56,6 +56,18 @@ readonly PROFILE_MODERN="modern"
 #===============================================================================
 # UTILITIES
 #===============================================================================
+# Source the shared appliance-core libs that prepare-image.sh §16b
+# vendored to /usr/local/lib/appliance-core/. Sentinel-guarded, so
+# sourcing every time smbproxy-sconfig starts is cheap. Older images
+# without the libs work fine for paths that don't depend on them.
+APPCORE_LIBS=/usr/local/lib/appliance-core
+if [[ -d "$APPCORE_LIBS" ]]; then
+    [[ -f "$APPCORE_LIBS/identity.sh"   ]] && source "$APPCORE_LIBS/identity.sh"
+    [[ -f "$APPCORE_LIBS/tui.sh"        ]] && source "$APPCORE_LIBS/tui.sh"
+    [[ -f "$APPCORE_LIBS/hostname.sh"   ]] && source "$APPCORE_LIBS/hostname.sh"
+    [[ -f "$APPCORE_LIBS/detect-net.sh" ]] && source "$APPCORE_LIBS/detect-net.sh"
+fi
+
 die()  { whiptail --msgbox "FATAL: $*" 10 60; exit 1; }
 info() { whiptail --msgbox "$*" 12 64; }
 yesno(){ whiptail --yesno "$*" 10 60; }
@@ -606,26 +618,28 @@ menu_system_config() {
 }
 
 config_hostname() {
-    local cur new
-    cur=$(get_fqdn)
-    new=$(whiptail --inputbox \
-        "Enter the FQDN for this server.\n\nRules:\n- Short name max 15 characters (NetBIOS limit)\n- Use a real domain you control or .lan\n- NEVER use .local (mDNS conflict)\n\nCurrent: $cur" \
-        14 64 "$cur" 3>&1 1>&2 2>&3) || return
-    [[ -z "$new" ]] && return
-    if [[ "$new" != *.* ]]; then
-        info "ERROR: Must be a FQDN (e.g., smbproxy-1.example.lan)."; return
+    # Hostname changes after a domain join break Kerberos keytabs,
+    # the machine account, and SPNs. Block them post-join and send
+    # the operator to leave the domain first.
+    if is_joined; then
+        info "This proxy is already joined to a domain.\n\nChanging the hostname here would break Kerberos and the machine account. Leave the domain first via Domain Operations, set the new hostname, then re-join."
+        return
     fi
-    if [[ "$new" == *.local ]]; then
-        info "ERROR: .local conflicts with mDNS/Bonjour."; return
+
+    # The actual rename flow lives in the appliance-core hostname.sh
+    # lib (live DHCP/PTR/dnsdomainname domain detection,
+    # NetBIOS-rules short-name validation, safe /etc/hosts rewrite,
+    # .local rejection). The is_joined guard above is the only
+    # product-specific bit; everything else is shared with samba-addc
+    # and any future appliance.
+    if ! command -v appcore_hostname_change_tui >/dev/null 2>&1; then
+        info "appliance-core libs not vendored on this image.\nRebuild via lab/build-fresh-base.sh, or copy ../appliance-core/lib/*.sh to /usr/local/lib/appliance-core/ by hand."
+        return
     fi
-    local short="${new%%.*}"
-    if [[ ${#short} -gt 15 ]]; then
-        info "ERROR: Short name '$short' exceeds 15 chars."; return
+
+    if appcore_hostname_change_tui; then
+        info "Hostname set to: ${APPCORE_HOSTNAME_NEW_FQDN}\n\nReboot recommended after the join is complete."
     fi
-    hostnamectl set-hostname "$new"
-    echo "$new" > /etc/hostname
-    sed -i "/\s${cur}\b/d" /etc/hosts 2>/dev/null || true
-    info "Hostname set to: $new\nShort: $short\n\nReboot recommended after the join is complete."
 }
 
 config_timezone() {

@@ -384,6 +384,64 @@ grep -q 'smbproxy-sconfig' /root/.bashrc 2>/dev/null || \
     echo 'alias sconfig="sudo smbproxy-sconfig"' >> /root/.bashrc
 
 #===============================================================================
+# 16b. VENDOR APPLIANCE-CORE LIBS
+#===============================================================================
+# smbproxy-sconfig sources shared bash helpers from
+# /usr/local/lib/appliance-core/. The libs come from the sibling
+# appliance-core repo and are scp'd to /tmp/lib by the build pipeline
+# (see lab/build-fresh-base.sh §5). Vendoring them into the image at
+# prep time means a deployed appliance has no runtime cross-repo
+# dependency.
+#
+# Provenance file at /etc/appliance-core.provenance carries the SemVer
+# (lib/VERSION, informational) and the git commit hash of the
+# appliance-core checkout that built this image (load-bearing
+# identity). Hash is computed Mac-side and passed via
+# $APPCORE_BUILD_COMMIT.
+LIB_TARGET=/usr/local/lib/appliance-core
+LIB_SRC=""
+for cand in /tmp/lib /root/appliance-core-lib; do
+    if [[ -d "$cand" && -f "$cand/detect-net.sh" ]]; then
+        LIB_SRC="$cand"; break
+    fi
+done
+
+if [[ -n "$LIB_SRC" ]]; then
+    log "Vendoring appliance-core libs from $LIB_SRC -> $LIB_TARGET ..."
+    install -d -m 0755 "$LIB_TARGET"
+    install -m 0644 "$LIB_SRC"/*.sh "$LIB_TARGET/"
+    [[ -f "$LIB_SRC/VERSION"   ]] && install -m 0644 "$LIB_SRC/VERSION"   "$LIB_TARGET/VERSION"
+    [[ -f "$LIB_SRC/README.md" ]] && install -m 0644 "$LIB_SRC/README.md" "$LIB_TARGET/README.md"
+
+    src_count=$(ls -1 "$LIB_SRC"/*.sh 2>/dev/null | wc -l)
+    dst_count=$(ls -1 "$LIB_TARGET"/*.sh 2>/dev/null | wc -l)
+    if (( src_count == 0 || src_count != dst_count )); then
+        err "appliance-core vendoring count mismatch: source $src_count, target $dst_count"
+        exit 1
+    fi
+    for libfile in "$LIB_TARGET"/*.sh; do
+        bash -n "$libfile" || { err "vendored lib failed bash -n: $libfile"; exit 1; }
+    done
+    log "  vendored $dst_count appliance-core lib(s) into $LIB_TARGET"
+
+    PROV_FILE=/etc/appliance-core.provenance
+    PROV_COMMIT="${APPCORE_BUILD_COMMIT:-unknown}"
+    {
+        printf 'appliance-core-version=%s\n' "$(<"$LIB_TARGET/VERSION")"
+        printf 'appliance-core-commit=%s\n'  "$PROV_COMMIT"
+        printf 'image-built-at=%s\n'         "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        printf 'image-built-on=%s\n'         "$(uname -srm)"
+        printf 'consumer=smb-proxy-appliance\n'
+    } > "$PROV_FILE"
+    chmod 0644 "$PROV_FILE"
+    log "  provenance: $(tr '\n' ' ' < "$PROV_FILE")"
+else
+    warn "no appliance-core lib/ source at /tmp/lib or /root/appliance-core-lib"
+    warn "smbproxy-sconfig features that depend on the shared libs will fail at runtime"
+    warn "fix: ensure lab/build-fresh-base.sh pushes ../appliance-core/lib to /tmp/lib"
+fi
+
+#===============================================================================
 # 17. MOTD BANNER
 #===============================================================================
 log "Setting login banner..."
