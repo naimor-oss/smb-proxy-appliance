@@ -367,6 +367,19 @@ for src in /root/smbproxy-sconfig.sh /root/smbproxy-sconfig; do
 done
 [[ -x /usr/local/sbin/smbproxy-sconfig ]] || warn "smbproxy-sconfig not found — copy it manually to /usr/local/sbin/"
 
+# Pre-connect probe used by modern-profile shares' `root preexec` to
+# fail-fast when the backend is offline (see smbproxy-probe-backend
+# header for the rationale).
+for src in /root/smbproxy-probe-backend /root/smbproxy-probe-backend.sh; do
+    if [[ -f "$src" ]]; then
+        cp "$src" /usr/local/sbin/smbproxy-probe-backend
+        chmod +x /usr/local/sbin/smbproxy-probe-backend
+        log "  Installed from $src to /usr/local/sbin/smbproxy-probe-backend"
+        break
+    fi
+done
+[[ -x /usr/local/sbin/smbproxy-probe-backend ]] || warn "smbproxy-probe-backend not found — copy it manually to /usr/local/sbin/"
+
 grep -q 'smbproxy-sconfig' /root/.bashrc 2>/dev/null || \
     echo 'alias sconfig="sudo smbproxy-sconfig"' >> /root/.bashrc
 

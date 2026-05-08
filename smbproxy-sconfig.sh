@@ -221,7 +221,11 @@ backend_mount_opts() {
             if [[ "${BACKEND_SEAL:-yes}" == "yes" ]] && [[ "$vers" =~ ^3 ]]; then
                 sealopt=",seal"
             fi
-            echo "${common},vers=${vers}${sealopt},soft,echo_interval=10"
+            # x-systemd.mount-timeout=4: caps each automount attempt at
+            # 4 seconds so an offline device (ARP probe cycle on the same
+            # /24 takes ~6s by default) fails fast. 4s is enough for a
+            # responsive device on the LAN to complete mount+auth in <1s.
+            echo "${common},vers=${vers}${sealopt},soft,echo_interval=10,x-systemd.mount-timeout=4"
             ;;
         *)
             # Legacy (legacy SMB1 (e.g. Clarion .TPS)) profile. vers=1.0 + cache=none +
@@ -268,6 +272,35 @@ STANZA
     strict locking = yes
     kernel oplocks = no
     posix locking = yes
+STANZA
+            ;;
+    esac
+}
+
+# Emits the share's `root preexec` probe stanza, or empty for profiles
+# that should not probe.
+#
+# Modern profile only: a 1s TCP probe of the backend at tree-connect
+# time, with `close = yes` so an offline device aborts the tree connect
+# immediately. Without this, an offline backend produces ~60s of
+# Windows retries — Samba returns NT_STATUS_ACCESS_DENIED on every
+# chdir (because the automount fails after our 4s mount-timeout cap),
+# Windows interprets that as "transient, retry," and loops ~12 times.
+# The probe short-circuits to ~1s.
+#
+# Legacy profile: the legacy backend is assumed always-on, so the
+# probe is unnecessary overhead and is omitted.
+frontend_offline_probe_stanza() {
+    local profile="$1"
+    case "$profile" in
+        modern)
+            cat <<'STANZA'
+    # Pre-connect backend probe (see smbproxy-probe-backend). Aborts
+    # the tree connect in ~1s if the backend device is powered off,
+    # so the client sees one fast error instead of cycling ~12 times
+    # through automount-fails-then-ACCESS_DENIED for ~60s.
+    root preexec = /usr/local/sbin/smbproxy-probe-backend %S
+    root preexec close = yes
 STANZA
             ;;
     esac
@@ -448,7 +481,11 @@ is_joined() {
 backend_mount_active() {
     local mp="$1"
     [[ -n "$mp" ]] || return 1
-    mountpoint -q "$mp"
+    # mountpoint -q returns true for the automount filesystem itself
+    # (which is always present as long as the unit is active), even
+    # when the underlying cifs mount has not been established. Check
+    # /proc/mounts for an actual cifs entry at this path instead.
+    grep -q " ${mp} cifs " /proc/mounts 2>/dev/null
 }
 
 # True (rc=0) if smb.conf has a `[share_name]` section header. Uses
@@ -1282,19 +1319,32 @@ configure_share() {
     # production 2026-05-05 — the operator chose a local force-user
     # name that happened to match an existing AD account, and the
     # silent capture went undetected until tree-connect failures.
-    if grep -q "^${FRONT_FORCE_USER}:" /etc/passwd 2>/dev/null; then
-        : # local account already exists, leave it alone
-    else
-        # Warn loudly if the requested name is published by NSS via
-        # winbind (i.e. an AD account by the same name exists). The
-        # local account we are about to create will shadow the AD one
-        # for getpwnam in nsswitch order (files first), but the
-        # operator should know they picked a colliding name.
-        if id "$FRONT_FORCE_USER" &>/dev/null; then
-            log_share "WARN: requested force-user '${FRONT_FORCE_USER}' also exists as an AD account."
-            log_share "WARN: a local /etc/passwd entry will be created and used; the AD account will be shadowed for"
-            log_share "WARN: getpwnam lookups on this proxy. Consider picking a name that does not collide."
-        fi
+    # Refuse — not just warn — if the chosen force-user name also
+    # exists as an AD account. With `winbind use default domain =
+    # yes`, every AD account is published via NSS under its bare
+    # lowercased name, and Samba's `getpwnam`-based force-user
+    # resolution has been observed in production to bind to the AD
+    # account even when /etc/passwd carries a local entry of the
+    # same name (incident 2026-05-05). The numeric-UID workaround
+    # was itself broken — `force user = 1003` fails `getpwnam` at
+    # tree-connect with NT_STATUS_NO_SUCH_USER (confirmed
+    # 2026-05-07). The only robust defense is to keep collisions
+    # out of the configuration in the first place.
+    #
+    # Use `wbinfo --name-to-sid` rather than `id` / `getent`. Those
+    # go through NSS and a local entry shadows the winbind one,
+    # masking the collision. wbinfo queries winbind directly and
+    # reports AD presence regardless of /etc/passwd state.
+    if wbinfo --name-to-sid "$FRONT_FORCE_USER" >/dev/null 2>&1; then
+        log_share "ERROR: force-user '${FRONT_FORCE_USER}' collides with an AD account of the same name."
+        log_share "ERROR: Samba's force-user resolution can bind to the AD account instead of the local"
+        log_share "ERROR: backend identity, corrupting the share's identity mapping (incident 2026-05-05)."
+        log_share "ERROR: pick a force-user name that does not exist in AD."
+        return 9
+    fi
+
+    # Safe to ensure the local /etc/passwd and /etc/group entries.
+    if ! grep -q "^${FRONT_FORCE_USER}:" /etc/passwd 2>/dev/null; then
         useradd -M -s /usr/sbin/nologin "$FRONT_FORCE_USER"
     fi
     if ! grep -q "^${FRONT_FORCE_USER}:" /etc/group 2>/dev/null; then
@@ -1365,11 +1415,16 @@ EOF
             return 6
         fi
 
-        # Resolve force_user to its LOCAL UID for the same reason as
-        # the cifs uid= option above — `force user = NAME` would be
-        # ambiguous under default-domain mode if the name collides
-        # with an AD account. Numeric UID is unambiguous.
-        # (We already resolved fu_uid above; reuse it.)
+        # force user uses the username string, not the numeric UID.
+        # Samba resolves `force user` via getpwnam(), which honours the
+        # NSS order (files first on this appliance), so the local
+        # /etc/passwd entry wins over any winbind result. Numeric UIDs
+        # do NOT work here — getpwnam("1003") fails even though
+        # getpwuid(1003) succeeds, causing NT_STATUS_NO_SUCH_USER at
+        # tree-connect time (confirmed 2026-05-07).
+        # The AD-collision guard above (wbinfo --name-to-sid) already
+        # catches dangerous names at config time; that is the safety net.
+        # (fu_uid/fu_gid are still used for the cifs uid=/gid= options.)
 
         # Strip any prior [SHARE_NAME] section, then append fresh.
         awk -v sname="[$SHARE_NAME]" '
@@ -1392,14 +1447,16 @@ EOF
     valid users = ${group_sid}
 
     # All AD identities authenticated to this share are mapped to
-    # the LOCAL Linux account uid=${fu_uid} (${FRONT_FORCE_USER}),
+    # the LOCAL Linux account '${FRONT_FORCE_USER}' (uid=${fu_uid}),
     # whose creds in ${creds} authenticate the cifs mount to the
-    # backend. Numeric UID written here so this resolves to the local
-    # account regardless of any AD account by the same name
-    # (default-domain ambiguity defense).
-    force user = ${fu_uid}
-    force group = ${fu_gid}
+    # backend. Username written here (not numeric UID) because Samba
+    # resolves force user via getpwnam(), which uses the NSS files-first
+    # order and finds the local account before winbind. AD-collision
+    # check was performed at config time above.
+    force user = ${FRONT_FORCE_USER}
+    force group = ${FRONT_FORCE_USER}
 
+$(frontend_offline_probe_stanza "$PROFILE")
 $(frontend_locking_stanza "$locking_kind")
 EOF
 

@@ -93,19 +93,37 @@ forces a separate TCP/SMB session per cifs mount so multi-share
 configs against the same backend don't multiplex onto a single
 session and silently reuse the first share's credentials.
 
-**`soft,echo_interval=10` (modern only)** is the offline-device
-fail-fast defense. The kernel cifs default of `hard` makes I/O block
-indefinitely waiting for an unreachable backend's TCP socket — a
-Windows client with a drive letter to the proxied share then sees
-Open Dialog and Explorer hang for ~60-75s on every directory listing
-when the backend device is off (CNC powered down, NAS rebooted).
-With `soft` + a 10-second heartbeat, the kernel returns I/O errors
-~10s after the backend disappears, Samba forwards a clean SMB error,
-and Open Dialog grays out the share immediately. The legacy profile
-deliberately stays HARD — under .TPS multi-writer workloads, a
-soft-mount mid-write error would corrupt the database. The legacy
-zone is also expected to be always-on, so the offline annoyance
-doesn't apply there.
+**`soft,echo_interval=10` (modern only)** is one of several layered
+defenses that target the offline-device hang. The kernel cifs default
+of `hard` makes I/O block indefinitely waiting for an unreachable
+backend's TCP socket — a Windows client with a drive letter to the
+proxied share then sees Open Dialog and Explorer hang for ~60-75s on
+every directory listing when the backend device is off (CNC powered
+down, NAS rebooted). With `soft` + a 10-second heartbeat, the kernel
+returns I/O errors ~10s after the backend disappears.
+
+Companion defenses ship alongside `soft`:
+
+- `x-systemd.mount-timeout=4` in fstab caps each automount attempt
+  at 4 s (down from a ~6 s same-/24 ARP probe cycle) for the
+  device-was-off-all-along case.
+- `root preexec = /usr/local/sbin/smbproxy-probe-backend %S` with
+  `root preexec close = yes` runs a 1 s TCP probe of the backend at
+  tree-connect time. An unreachable backend short-circuits the tree
+  connect at ~1 s instead of letting the client cycle through
+  chdir-on-automount.
+
+The legacy profile deliberately stays HARD with no probe — under
+.TPS multi-writer workloads, a soft-mount mid-write error would
+corrupt the database, and the legacy zone is expected to be
+always-on so the offline annoyance doesn't apply there.
+
+A residual ~30 s Windows-retry wait remains in the modern-profile
+offline case because Samba returns `NT_STATUS_ACCESS_DENIED` for
+preexec failures (hardcoded), which Windows treats as a transient
+condition and retries in bursts. The deferred design that closes it
+(periodic `available = no` toggling via a systemd timer) is
+documented in [`docs/OFFLINE-DEVICE-FAILFAST.md`](docs/OFFLINE-DEVICE-FAILFAST.md).
 
 ## Persistent Infrastructure
 
@@ -216,28 +234,36 @@ bash -n prepare-image.sh smbproxy-sconfig.sh lab/run-scenario.sh lab/scenarios/*
   share section enforces an AD security group via `valid users =
   <SID>` (the AD group's SID, resolved by `wbinfo --name-to-sid`
   at config time) and maps all incoming AD identities to a single
-  local backend user via `force user = <numeric UID>` — that local
+  local backend user via `force user = <username>` — that local
   user's credentials sit in this share's `.creds-<safe>` file.
   Different shares can use different backend users with different
   passwords against the same backend server; that's the multi-share
   model.
-- **Why SIDs and numeric UIDs, not symbolic names.** The proxy runs
-  with `winbind use default domain = yes`, which publishes every AD
-  account to NSS under its bare lowercased name. Symbolic forms
-  (`force user = NAME`, `valid users = @"DOMAIN\Group"`) re-introduce
-  ambiguity:
-  - `force user = NAME` resolves to the AD account if one exists by
-    that name, even when a local `/etc/passwd` entry of the same
-    name is also present — production hit this 2026-05-05 with a
-    local account colliding with an AD account, and tree-connect
-    silently corrupted under the resulting double-mapping.
+- **Why SIDs for `valid users` and usernames for `force user`.**
+  The proxy runs with `winbind use default domain = yes`, which
+  publishes every AD account to NSS under its bare lowercased name.
+  Two different forms are required for two different reasons:
   - `valid users = @"DOMAIN\Group"` fails to match in Samba 4.22 on
     this appliance under default-domain mode; the SID form is
-    NSS-independent and unambiguous.
-  `configure_share` resolves both at config time and writes only the
-  numeric/SID form into `smb.conf` and the cifs `uid=`/`gid=` mount
-  options. It also WARNs when the operator picks a local-force-user
-  name that collides with an AD account.
+    NSS-independent and unambiguous. `configure_share` resolves the
+    group to its SID via `wbinfo --name-to-sid` at config time.
+  - `force user = <numeric UID>` does **not** work — Samba resolves
+    `force user` via `getpwnam()`, and `getpwnam("1003")` fails even
+    though `getpwuid(1003)` succeeds. This causes `NT_STATUS_NO_SUCH_USER`
+    at tree-connect (confirmed 2026-05-07, broke the WorkData share).
+    `force user` must use the local username string. Because the NSS
+    order is `files systemd winbind`, the local `/etc/passwd` entry is
+    found before winbind is consulted, so `getpwnam("tubelaser")`
+    returns the local account even when winbind is active.
+  - The remaining collision risk — a force-user name that also exists
+    as an AD account — is caught at config time: `configure_share`
+    calls `wbinfo --name-to-sid` on the chosen name and **refuses**
+    the configuration (returns rc=9) if it resolves. The check uses
+    `wbinfo` rather than `id` / `getent` because those go through NSS
+    and a local entry shadows the winbind one, hiding the collision.
+    The cifs `uid=` and `gid=` mount options continue to use the
+    numeric UID (that is a kernel cifs option and is correctly
+    interpreted as a UID).
 - **`nosharesock` is non-optional in cifs fstab options.** Without
   it, two cifs mounts to the same backend with different per-share
   creds get multiplexed onto a single TCP/SMB session and the second

@@ -1,0 +1,50 @@
+#!/bin/bash
+# smbproxy-probe-backend: pre-connect reachability probe for a proxied
+# share's backend.
+#
+# Used as `root preexec` (with `root preexec close = yes`) on modern-
+# profile shares so a powered-off backend short-circuits the SMB tree
+# connect immediately, instead of letting the client cycle through the
+# automount-fails-after-4s loop on every directory operation. Without
+# this probe, an offline device produces ~60s of "permission denied"
+# in Windows because Samba returns NT_STATUS_ACCESS_DENIED on every
+# chdir failure and Windows retries ~12 times.
+#
+# Online backend:  TCP 445 answers in <100ms, exit 0, share opens.
+# Offline backend: timeout fires at 1s, exit non-zero, Samba returns
+#                  NT_STATUS_UNSUCCESSFUL on the tree connect and the
+#                  client sees a single fast error.
+#
+# Usage: smbproxy-probe-backend <SHARE_NAME>
+#
+# Exit:
+#   0   — reachable, allow connect
+#   !=0 — unreachable / config missing, abort connect
+
+set -u
+
+share_name="${1:-}"
+[[ -n "$share_name" ]] || exit 1
+
+# Same safe-name convention as smbproxy-sconfig: any non-alphanumeric
+# character becomes underscore. So `Engineering$` looks up
+# `Engineering_.env` on disk while the literal share name lives in
+# the env file's SHARE_NAME field.
+safe_name="${share_name//[^A-Za-z0-9]/_}"
+env_file="/var/lib/smbproxy/shares/${safe_name}.env"
+[[ -r "$env_file" ]] || exit 1
+
+# shellcheck source=/dev/null
+. "$env_file"
+[[ -n "${BACKEND_IP:-}" ]] || exit 1
+
+# Bash builtin /dev/tcp; no external dependency. timeout(1) bounds it
+# at 1s — long enough for an on-LAN device to answer, short enough
+# that an offline backend adds at most 1s to the tree connect.
+timeout 1 bash -c ">/dev/tcp/${BACKEND_IP}/445" 2>/dev/null
+rc=$?
+# Single-line trace to journald (size-bounded, picked up by `journalctl
+# -t smbproxy-probe`). Useful for confirming that Samba actually
+# invoked the probe and seeing per-attempt latency from a real client.
+logger -t smbproxy-probe "share=${share_name} backend=${BACKEND_IP} exit=${rc}"
+exit "$rc"
