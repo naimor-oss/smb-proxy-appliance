@@ -66,6 +66,7 @@ if [[ -d "$APPCORE_LIBS" ]]; then
     [[ -f "$APPCORE_LIBS/tui.sh"        ]] && source "$APPCORE_LIBS/tui.sh"
     [[ -f "$APPCORE_LIBS/hostname.sh"   ]] && source "$APPCORE_LIBS/hostname.sh"
     [[ -f "$APPCORE_LIBS/detect-net.sh" ]] && source "$APPCORE_LIBS/detect-net.sh"
+    [[ -f "$APPCORE_LIBS/netconfig.sh"  ]] && source "$APPCORE_LIBS/netconfig.sh"
 fi
 
 die()  { whiptail --msgbox "FATAL: $*" 10 60; exit 1; }

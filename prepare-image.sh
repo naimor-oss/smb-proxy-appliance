@@ -937,7 +937,7 @@ set -u
 # silently when absent (older images that predate the vendoring).
 APPCORE_LIBS=/usr/local/lib/appliance-core
 if [[ -d "$APPCORE_LIBS" ]]; then
-    for _lib in apt-helpers detect-net identity tui hostname; do
+    for _lib in apt-helpers detect-net identity tui hostname netconfig; do
         [[ -f "$APPCORE_LIBS/${_lib}.sh" ]] && source "$APPCORE_LIBS/${_lib}.sh"
     done
     unset _lib
@@ -1271,13 +1271,31 @@ config_network() {
 
     write_netplan_yaml "$dom_mode" "$dom_cidr" "$dom_gw" "$dom_dns" "$leg_cidr" || return
 
-    if sudo netplan apply 2>&1 | tee /tmp/netplan.$$; then
-        whiptail --title "Network applied" --scrolltext --msgbox \
-            "$(cat /tmp/netplan.$$)\n\nResult:\n$(ip -br addr show)" 18 "$WT_WIDTH"
+    # Apply via the appliance-core lib (consistent error capture +
+    # sized-textbox renderer that doesn't clip long output). The
+    # lib's renderer functions don't apply here because smb-proxy
+    # writes a dual-NIC netplan in one file via write_netplan_yaml
+    # above; we only adopt the apply + display step.
+    local log
+    if command -v appcore_netconfig_apply >/dev/null 2>&1; then
+        log=$(mktemp -t smbproxy-netplan.XXXXXX)
+        if sudo netplan apply 2>&1 | tee "$log"; then
+            printf '0' > "${log}.rc"
+            appcore_tui_show_capture "Network applied" "$log"
+        else
+            printf '1' > "${log}.rc"
+            appcore_tui_show_capture "netplan apply FAILED" "$log"
+        fi
     else
-        whiptail --msgbox "netplan apply reported errors. See /tmp/netplan.$$ — fix and retry." 10 "$WT_WIDTH"
+        # Fallback for older images.
+        if sudo netplan apply 2>&1 | tee /tmp/netplan.$$; then
+            whiptail --title "Network applied" --scrolltext --msgbox \
+                "$(cat /tmp/netplan.$$)\n\nResult:\n$(ip -br addr show)" 18 "$WT_WIDTH"
+        else
+            whiptail --msgbox "netplan apply reported errors. See /tmp/netplan.$$ — fix and retry." 10 "$WT_WIDTH"
+        fi
+        rm -f /tmp/netplan.$$
     fi
-    rm -f /tmp/netplan.$$
 }
 
 change_password() {
