@@ -30,9 +30,16 @@ verify() {
         rc=1
     fi
 
-    say "samba-ad-dc is NOT installed (proxy is a member server only)"
-    out=$(ssh_vm 'dpkg -l samba-ad-dc 2>&1' || true)
-    grep -qE '^(rc|ii)\s+samba-ad-dc' <<< "$out" && { say "samba-ad-dc unexpectedly present"; rc=1; }
+    say "samba-ad-dc is NOT active (proxy is a member server only)"
+    # Debian trixie now pulls samba-ad-dc as a transitive dependency
+    # of `samba`, so package-presence is no longer a meaningful check.
+    # The proxy's prepare-image.sh §10 masks/disables the service;
+    # what matters is that samba-ad-dc.service is not running and not
+    # enabled — that's what would actually break the member-server role.
+    out=$(ssh_vm 'sudo bash -c "systemctl is-active samba-ad-dc; systemctl is-enabled samba-ad-dc"' 2>&1 || true)
+    if grep -qE '^(active|enabled)$' <<< "$out"; then
+        say "samba-ad-dc unexpectedly active or enabled: $out"; rc=1
+    fi
 
     say "no /etc/samba/smb.conf yet (sconfig writes it at frontend-configure time)"
     ssh_vm 'test ! -f /etc/samba/smb.conf' || rc=1
@@ -58,7 +65,11 @@ verify() {
     # singleton path /etc/samba/.legacy_creds and the original
     # sketch's /etc/samba/.legacy_creds is also checked for
     # belt-and-suspenders.
-    ssh_vm 'sudo bash -c "shopt -s nullglob; f=(/etc/samba/.creds-* /etc/samba/.legacy_creds); [[ \${#f[@]} -eq 0 ]]"' || { say "credential file present in golden image"; rc=1; }
+    # `shopt -s nullglob` only affects pathname expansion; literal paths
+    # without glob characters land in the array even when the file is
+    # absent. Use `find` so non-existent paths actually count as absent.
+    out=$(ssh_vm 'sudo find /etc/samba -maxdepth 1 \( -name ".creds-*" -o -name ".legacy_creds" \) -print 2>/dev/null' 2>&1 || true)
+    [[ -z "$out" ]] || { say "credential file present in golden image: $out"; rc=1; }
 
     say "no backend cifs mount active"
     out=$(ssh_vm 'mount | grep -E "type cifs " || true' 2>&1 || true)
