@@ -932,6 +932,17 @@ cat > /usr/local/sbin/smbproxy-init <<'INITEOF'
 
 set -u
 
+# Source shared appliance-core libs vendored by prepare-image.sh §16b.
+# Sentinel-guarded so this is a no-op if already loaded; falls through
+# silently when absent (older images that predate the vendoring).
+APPCORE_LIBS=/usr/local/lib/appliance-core
+if [[ -d "$APPCORE_LIBS" ]]; then
+    for _lib in apt-helpers detect-net identity tui hostname; do
+        [[ -f "$APPCORE_LIBS/${_lib}.sh" ]] && source "$APPCORE_LIBS/${_lib}.sh"
+    done
+    unset _lib
+fi
+
 MARKER=/var/lib/smbproxy-init.done
 DEFAULT_PWD_MARKER=/var/lib/smbproxy-init-default-password
 GETTY_DROPIN=/etc/systemd/system/getty@tty1.service.d/smbproxy-init.conf
@@ -976,11 +987,11 @@ count_upgrades() {
         echo "0 0"; return
     fi
     # Refresh apt indexes if the cache is older than 1h. Without this,
-    # `apt list --upgradable` reports against whatever the cache held
-    # at last refresh — and on a fresh deployment a few days after
-    # image build, the cache is stale and reports 0 even when real
-    # security updates are pending. Throttle so menu re-renders stay
-    # cheap (cold first-boot pays ~30s once; warm re-renders are free).
+    # the count reflects whatever the cache held at last refresh —
+    # and on a fresh deployment a few days after image build, the
+    # cache is stale and reports 0 even when real security updates
+    # are pending. Throttle so menu re-renders stay cheap (cold
+    # first-boot pays ~30s once; warm re-renders are free).
     local now mtime cache_age
     if [[ -f /var/cache/apt/pkgcache.bin ]]; then
         now=$(date +%s)
@@ -992,10 +1003,20 @@ count_upgrades() {
     if (( cache_age > 3600 )); then
         sudo apt-get update -qq >/dev/null 2>&1 || true
     fi
-    local upg sec
-    upg=$(apt list --upgradable 2>/dev/null | grep -cv '^Listing')
-    sec=$(apt list --upgradable 2>/dev/null | grep -c -- '-security')
-    echo "${upg} ${sec}"
+    # Delegate the actual count to appliance-core. The lib's
+    # implementation uses `apt-get --simulate dist-upgrade` and
+    # ^Inst lines, which is phased-rollout-aware (the regression
+    # class that bit `apt list --upgradable`-based counters).
+    if command -v appcore_apt_count_upgrades >/dev/null 2>&1; then
+        appcore_apt_count_upgrades
+        return
+    fi
+    # Fallback for older images without the lib.
+    local sim upg sec
+    sim=$(apt-get --simulate -qq dist-upgrade 2>/dev/null) || sim=""
+    upg=$(grep -c '^Inst ' <<< "$sim" || true)
+    sec=$(grep -c '^Inst .*-security' <<< "$sim" || true)
+    echo "${upg:-0} ${sec:-0}"
 }
 
 # ----------------------------------------------------------------------------
@@ -1407,13 +1428,24 @@ action_update() {
     echo "Note: full-upgrade can install new dependencies (kernels, etc.)."
     echo "      Plain 'apt-get upgrade' would silently keep them back."
     echo
-    sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get -y full-upgrade
+    if command -v appcore_apt_run_full_upgrade >/dev/null 2>&1; then
+        sudo DEBIAN_FRONTEND=noninteractive bash -c \
+            'source /usr/local/lib/appliance-core/apt-helpers.sh; appcore_apt_run_full_upgrade'
+    else
+        sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get -y full-upgrade
+    fi
     echo
     echo "=============================================================="
-    if [[ -f /var/run/reboot-required ]]; then
-        echo "  REBOOT REQUIRED — a kernel or library that's currently"
-        echo "  loaded was upgraded. Pick [R] from the menu (or run"
-        echo "  'sudo reboot') to apply the new version."
+    local rb=""
+    if command -v appcore_apt_reboot_banner_line >/dev/null 2>&1; then
+        rb=$(appcore_apt_reboot_banner_line)
+    elif [[ -f /var/run/reboot-required ]]; then
+        rb="REBOOT REQUIRED"
+    fi
+    if [[ -n "$rb" ]]; then
+        echo "  $rb"
+        echo "  A kernel or library that's currently loaded was upgraded."
+        echo "  Pick [R] from the menu (or run 'sudo reboot') to apply."
     else
         echo "  Done. No reboot required."
     fi

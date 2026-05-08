@@ -659,19 +659,28 @@ config_timezone() {
 
 run_updates_now() {
     clear
-    echo "[sconfig] apt update..."
-    apt-get update
     echo "[sconfig] apt full-upgrade..."
     echo "[sconfig]   note: full-upgrade can install new dependencies"
     echo "[sconfig]   (e.g. new kernel packages). Plain 'apt-get upgrade'"
     echo "[sconfig]   would silently keep them back."
     echo
-    DEBIAN_FRONTEND=noninteractive apt-get full-upgrade -y
+    if command -v appcore_apt_run_full_upgrade >/dev/null 2>&1; then
+        DEBIAN_FRONTEND=noninteractive appcore_apt_run_full_upgrade
+    else
+        apt-get update && DEBIAN_FRONTEND=noninteractive apt-get full-upgrade -y
+    fi
     echo
     echo "=============================================================="
-    if [[ -f /var/run/reboot-required ]]; then
-        echo "  REBOOT REQUIRED — a kernel or library that's currently"
-        echo "  loaded was upgraded. Run 'sudo reboot' to apply."
+    local rb=""
+    if command -v appcore_apt_reboot_banner_line >/dev/null 2>&1; then
+        rb=$(appcore_apt_reboot_banner_line)
+    elif [[ -f /var/run/reboot-required ]]; then
+        rb="REBOOT REQUIRED"
+    fi
+    if [[ -n "$rb" ]]; then
+        echo "  $rb"
+        echo "  A kernel or library that's currently loaded was upgraded."
+        echo "  Run 'sudo reboot' to apply."
     else
         echo "  Done. No reboot required."
     fi
