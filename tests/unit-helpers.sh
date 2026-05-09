@@ -145,32 +145,40 @@ check_eq "legacy MUST contain nosharesock" \
     "yes" \
     "$(backend_mount_opts legacy | grep -qF nosharesock && echo yes || echo no)"
 
-check_eq "modern + default seal=on → vers=3,seal,soft,echo_interval=10" \
-    "${COMMON},vers=3,seal,soft,echo_interval=10" \
+# x-systemd.mount-timeout=4 invariant — the offline-device fail-fast
+# Layer 2 fix (added 2026-05-07): caps each automount attempt at 4s
+# so an unreachable device fails the mount instead of waiting through
+# the kernel's ARP/SYN backoff (~6s+ on the same /24). Layer 1 is
+# soft+echo_interval; this is the systemd half. Pinned per-test below
+# so a future refactor can't drop it from one branch silently.
+TAIL=",soft,echo_interval=10,x-systemd.mount-timeout=4"
+
+check_eq "modern + default seal=on → vers=3,seal + tail" \
+    "${COMMON},vers=3,seal${TAIL}" \
     "$(backend_mount_opts modern)"
 
-check_eq "modern + BACKEND_SEAL=no → vers=3,soft,echo_interval=10 (no seal)" \
-    "${COMMON},vers=3,soft,echo_interval=10" \
+check_eq "modern + BACKEND_SEAL=no → vers=3 + tail (no seal)" \
+    "${COMMON},vers=3${TAIL}" \
     "$(BACKEND_SEAL=no; backend_mount_opts modern)"
 
-check_eq "modern + BACKEND_SEAL=yes (explicit) → vers=3,seal,soft,echo_interval=10" \
-    "${COMMON},vers=3,seal,soft,echo_interval=10" \
+check_eq "modern + BACKEND_SEAL=yes (explicit) → vers=3,seal + tail" \
+    "${COMMON},vers=3,seal${TAIL}" \
     "$(BACKEND_SEAL=yes; backend_mount_opts modern)"
 
 # --backend-vers override (added 2026-05-07 for the HMI device that
 # only speaks SMB1/SMB2). Modern profile semantics (relaxed locking,
 # soft mount) are preserved; only the version changes.
 check_eq "modern + BACKEND_VERS=2.1 → vers=2.1, seal auto-dropped (SMB3-only)" \
-    "${COMMON},vers=2.1,soft,echo_interval=10" \
+    "${COMMON},vers=2.1${TAIL}" \
     "$(BACKEND_VERS=2.1; backend_mount_opts modern)"
 check_eq "modern + BACKEND_VERS=1.0 → vers=1.0, seal auto-dropped" \
-    "${COMMON},vers=1.0,soft,echo_interval=10" \
+    "${COMMON},vers=1.0${TAIL}" \
     "$(BACKEND_VERS=1.0; backend_mount_opts modern)"
 check_eq "modern + BACKEND_VERS=3.1.1 (explicit SMB3.1.1) → seal kept" \
-    "${COMMON},vers=3.1.1,seal,soft,echo_interval=10" \
+    "${COMMON},vers=3.1.1,seal${TAIL}" \
     "$(BACKEND_VERS=3.1.1; backend_mount_opts modern)"
 check_eq "modern + BACKEND_VERS=3.0 → seal kept" \
-    "${COMMON},vers=3.0,seal,soft,echo_interval=10" \
+    "${COMMON},vers=3.0,seal${TAIL}" \
     "$(BACKEND_VERS=3.0; backend_mount_opts modern)"
 # Critical invariant: seal must be SUPPRESSED for non-SMB3 versions
 # even if BACKEND_SEAL=yes is explicit. The cifs driver would reject
@@ -178,8 +186,30 @@ check_eq "modern + BACKEND_VERS=3.0 → seal kept" \
 # silent suppress is the right default — emitting `seal` for SMB1/2
 # would just break the mount with a confusing error.
 check_eq "modern + BACKEND_VERS=2.1 + BACKEND_SEAL=yes → seal STILL suppressed" \
-    "${COMMON},vers=2.1,soft,echo_interval=10" \
+    "${COMMON},vers=2.1${TAIL}" \
     "$(BACKEND_VERS=2.1; BACKEND_SEAL=yes; backend_mount_opts modern)"
+
+# `default` means "let cifs negotiate" — the rendered string MUST NOT
+# contain a vers= token at all (passing literal vers=default would
+# make cifs reject the mount). seal is dropped because we cannot
+# assume SMB3 was negotiated.
+check_eq "modern + BACKEND_VERS=default → no vers= token at all" \
+    "${COMMON}${TAIL}" \
+    "$(BACKEND_VERS=default; backend_mount_opts modern)"
+check_eq "modern + BACKEND_VERS=default MUST NOT contain vers=" \
+    "no" \
+    "$(BACKEND_VERS=default backend_mount_opts modern | grep -qE '(^|,)vers=' && echo yes || echo no)"
+
+# All modern variants MUST emit x-systemd.mount-timeout=4. This is
+# the Layer-2 offline-device fail-fast token — if any branch drops
+# it (e.g. a future refactor that conditionally tags only SMB3),
+# automount falls back to the systemd default of 90s and Open
+# Dialog freezes return.
+for v in 1.0 2.0 2.1 3 3.0 3.0.2 3.1.1 default; do
+    check_eq "modern + BACKEND_VERS=$v MUST have x-systemd.mount-timeout=4" \
+        "yes" \
+        "$(BACKEND_VERS=$v backend_mount_opts modern | grep -qF 'x-systemd.mount-timeout=4' && echo yes || echo no)"
+done
 
 # Legacy is fixed at vers=1.0 regardless of BACKEND_VERS — the override
 # is a CLI-level rejection, but defense-in-depth at the helper level

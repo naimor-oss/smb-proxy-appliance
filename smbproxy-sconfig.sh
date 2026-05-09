@@ -226,11 +226,20 @@ backend_mount_opts() {
             # (relaxed locking, soft mount, automount) intact while
             # letting the version match the device's capability.
             local vers="${BACKEND_VERS:-3}"
+            # `default` means "let cifs negotiate" — emit no vers= token
+            # at all (passing literal vers=default would make cifs reject
+            # the mount). Build the version fragment accordingly.
+            local versopt=""
+            if [[ "$vers" != "default" ]]; then
+                versopt=",vers=${vers}"
+            fi
             local sealopt=""
             # seal is SMB3-only. Drop it silently for older versions
             # — the encryption simply isn't part of the SMB1/2 wire
             # format, so emitting `seal` would make the cifs mount
-            # fail to negotiate.
+            # fail to negotiate. With `default`, cifs may negotiate
+            # any version including pre-SMB3, so be conservative and
+            # also drop seal when no explicit vers is asserted.
             if [[ "${BACKEND_SEAL:-yes}" == "yes" ]] && [[ "$vers" =~ ^3 ]]; then
                 sealopt=",seal"
             fi
@@ -238,7 +247,7 @@ backend_mount_opts() {
             # 4 seconds so an offline device (ARP probe cycle on the same
             # /24 takes ~6s by default) fails fast. 4s is enough for a
             # responsive device on the LAN to complete mount+auth in <1s.
-            echo "${common},vers=${vers}${sealopt},soft,echo_interval=10,x-systemd.mount-timeout=4"
+            echo "${common}${versopt}${sealopt},soft,echo_interval=10,x-systemd.mount-timeout=4"
             ;;
         *)
             # Legacy (legacy SMB1 (e.g. Clarion .TPS)) profile. vers=1.0 + cache=none +
