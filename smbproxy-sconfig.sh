@@ -1876,6 +1876,70 @@ shares_add_wizard() {
     local body_ctx="Share: ${SHARE_NAME}"
     local BACKEND_IP="" BACKEND_USER="" BACKEND_DOMAIN="" BACKEND_MOUNT=""
     local BACKEND_PASS="" FRONT_GROUP="" FRONT_FORCE_USER=""
+    local PROFILE="" BACKEND_VERS="" BACKEND_SEAL="" LOCKING_OVERRIDE=""
+
+    # Profile picker. The CLI supports both legacy and modern shares
+    # but the TUI used to silently default to legacy, blocking the
+    # CNC/NAS/HMI use case from console-only operators. Default selects
+    # legacy so existing installs see no behavior change unless the
+    # operator picks modern explicitly.
+    PROFILE=$(whiptail --title "Add proxied share — profile" \
+        --radiolist "${body_ctx}\n\nWhich backend profile?\n\n  legacy: SMB1 (e.g. Clarion .TPS) — vers=1.0, strict locking,\n          hard mount. Backend assumed always-on.\n  modern: SMB3 (CNC, NAS, HMI) — vers=3 default, optional sealing,\n          relaxed locking, soft+automount with offline-device fail-fast." \
+        18 76 2 \
+        legacy "Legacy SMB1 (Clarion .TPS, ISAM-style)" ON  \
+        modern "Modern SMB3 (CNC / NAS / HMI)"          OFF \
+        3>&1 1>&2 2>&3) || return
+
+    if [[ "$PROFILE" == "modern" ]]; then
+        # Backend SMB version. `default` lets cifs negotiate (no vers=
+        # token written). 3 is the appliance default.
+        BACKEND_VERS=$(whiptail --title "Add proxied share — backend SMB version" \
+            --radiolist "${body_ctx}\n\nProtocol version to negotiate with the backend.\nPick '3' if unsure (most modern devices); the device's spec\nsheet usually says SMB2/SMB3. 'default' lets cifs decide." \
+            20 76 8 \
+            3       "SMB3 — auto-negotiate 3.0/3.1.1 (recommended)"     ON  \
+            3.0     "SMB3.0 only"                                       OFF \
+            3.0.2   "SMB3.0.2 only"                                     OFF \
+            3.1.1   "SMB3.1.1 only"                                     OFF \
+            2.1     "SMB2.1 only (older HMIs)"                          OFF \
+            2.0     "SMB2.0 only"                                       OFF \
+            1.0     "SMB1 only (rare on modern profile; prefer legacy)" OFF \
+            default "Let cifs negotiate (no vers= token)"               OFF \
+            3>&1 1>&2 2>&3) || return
+
+        # Sealing — SMB3-only wire encryption. Auto-suppressed on
+        # non-SMB3 versions (see backend_mount_opts). Asking on every
+        # modern share keeps the choice visible but defaults to ON
+        # because that's the appliance's documented modern posture.
+        if [[ "$BACKEND_VERS" =~ ^3 ]]; then
+            local seal_pick
+            seal_pick=$(whiptail --title "Add proxied share — backend SMB3 sealing" \
+                --radiolist "${body_ctx}\n\nSMB3 wire encryption (cifs 'seal' option).\nRecommended ON for any backend on the domain LAN.\nAdds ~10-30% CPU on the slow IO patterns these devices generate." \
+                14 70 2 \
+                yes "Encrypt backend traffic (recommended)" ON  \
+                no  "No encryption (lower CPU)"             OFF \
+                3>&1 1>&2 2>&3) || return
+            BACKEND_SEAL="$seal_pick"
+        else
+            # vers=1.0/2.x can't carry seal; skip the dialog and leave
+            # BACKEND_SEAL empty (configure_share treats this as default-
+            # off via backend_mount_opts' SMB3 guard).
+            BACKEND_SEAL=""
+        fi
+
+        # Locking override — only relevant for modern (legacy is fixed
+        # at tps-strict). 'profile-default' = relaxed for modern.
+        LOCKING_OVERRIDE=$(whiptail --title "Add proxied share — locking" \
+            --radiolist "${body_ctx}\n\nLocking semantics on the published SMB3 frontend.\nPick 'profile-default' (= relaxed) unless this share carries\nan ISAM-style multi-writer database that needs strict locking." \
+            16 76 3 \
+            profile-default "Relaxed (modern default — file-copy backends)" ON  \
+            relaxed         "Relaxed (explicit)"                             OFF \
+            tps-strict      "Strict — ISAM/.TPS multi-writer DB"             OFF \
+            3>&1 1>&2 2>&3) || return
+
+        # Translate 'profile-default' to empty for configure_share
+        # (which interprets empty as "use the profile's default").
+        [[ "$LOCKING_OVERRIDE" == "profile-default" ]] && LOCKING_OVERRIDE=""
+    fi
 
     BACKEND_IP=$(whiptail --title "Add proxied share — backend IP" \
         --inputbox "${body_ctx}\n\nlegacy backend IPv4 (LegacyZone-side):" \
@@ -1906,9 +1970,12 @@ shares_add_wizard() {
     [[ "$p1" == "$p2" ]] || { info "Passwords don't match."; return; }
     BACKEND_PASS="$p1"
 
+    # Default mount path is profile-aware: modern shares default to
+    # /mnt/backend/<safe>, legacy to /mnt/legacy/<safe> (mirroring the
+    # CLI default). Operator can edit either way.
     BACKEND_MOUNT=$(whiptail --title "Add proxied share — local mount point" \
         --inputbox "${body_ctx}\n\nLocal mount point on the proxy:" \
-        12 64 "$(share_default_mount "$SHARE_NAME")" 3>&1 1>&2 2>&3) || { BACKEND_PASS=""; return; }
+        12 64 "$(share_default_mount "$SHARE_NAME" "$PROFILE")" 3>&1 1>&2 2>&3) || { BACKEND_PASS=""; return; }
 
     # Mount-path collision check. The default mount path is derived
     # from SHARE_NAME so a default-vs-default collision is impossible
@@ -1938,7 +2005,16 @@ shares_add_wizard() {
         --inputbox "${body_ctx}\n\nLocal Linux account that owns the cifs mount AND that AD\nidentities authenticated to this share are mapped to on the\nway out to legacy SMB1 backend. Created if absent (system user, nologin)." \
         14 74 "${BACKEND_USER}" 3>&1 1>&2 2>&3) || { BACKEND_PASS=""; return; }
 
-    yesno "Apply share '${SHARE_NAME}'?\n\n  backend://${BACKEND_IP}/${SHARE_NAME} -> ${BACKEND_MOUNT}\n  legacy SMB1 backend user: ${BACKEND_DOMAIN}\\${BACKEND_USER}\n  AD access:   ${FRONT_GROUP:-(skipped — not joined)}\n  force user:  ${FRONT_FORCE_USER}" \
+    # Compose a profile-aware confirmation summary so the operator
+    # can sanity-check the modern-only knobs before committing.
+    local _confirm_extra=""
+    if [[ "$PROFILE" == "modern" ]]; then
+        local _vers_disp="${BACKEND_VERS:-3}"
+        local _seal_disp="${BACKEND_SEAL:-(default)}"
+        local _lock_disp="${LOCKING_OVERRIDE:-relaxed (profile default)}"
+        _confirm_extra=$'\n'"  vers:        ${_vers_disp}"$'\n'"  sealing:     ${_seal_disp}"$'\n'"  locking:     ${_lock_disp}"
+    fi
+    yesno "Apply share '${SHARE_NAME}' (${PROFILE})?\n\n  backend://${BACKEND_IP}/${SHARE_NAME} -> ${BACKEND_MOUNT}\n  backend user: ${BACKEND_DOMAIN}\\${BACKEND_USER}\n  AD access:   ${FRONT_GROUP:-(skipped — not joined)}\n  force user:  ${FRONT_FORCE_USER}${_confirm_extra}" \
         || { BACKEND_PASS=""; return; }
 
     if configure_share; then
@@ -1960,16 +2036,25 @@ shares_edit_picker() {
     local body_ctx="Share: ${name}"
 
     while true; do
+        # Show modern-only fields in the summary header so the operator
+        # sees them at a glance for modern shares.
+        local _modern_summary=""
+        if [[ "${PROFILE:-}" == "modern" ]]; then
+            _modern_summary=$'\n  vers: '"${BACKEND_VERS:-3 (default)}"$'  seal: '"${BACKEND_SEAL:-default}"$'  locking: '"${LOCKING_OVERRIDE:-relaxed (default)}"
+        fi
         local choice
         choice=$(whiptail --title "Edit share: $name" \
-            --menu "${body_ctx}\n\n  backend://${BACKEND_IP:-?}/${name} -> ${BACKEND_MOUNT:-?}\n  AD group: ${FRONT_GROUP:-(unset)}\n  force user: ${FRONT_FORCE_USER:-?}\n\nPick a field to update:" \
-            "$WT_HEIGHT" "$WT_WIDTH" 8 \
+            --menu "${body_ctx} (${PROFILE:-legacy})\n\n  backend://${BACKEND_IP:-?}/${name} -> ${BACKEND_MOUNT:-?}\n  AD group: ${FRONT_GROUP:-(unset)}\n  force user: ${FRONT_FORCE_USER:-?}${_modern_summary}\n\nPick a field to update:" \
+            "$WT_HEIGHT" "$WT_WIDTH" 10 \
             "1" "Backend password (most common edit)" \
             "2" "AD access group (FRONT_GROUP)" \
             "3" "Local force-user (FRONT_FORCE_USER)" \
             "4" "Backend IP (BACKEND_IP)" \
             "5" "Backend user (BACKEND_USER)" \
             "6" "Backend domain (BACKEND_DOMAIN)" \
+            "7" "Backend SMB version (modern only)" \
+            "8" "Backend sealing (modern only)" \
+            "9" "Locking override (modern only)" \
             "B" "Back" \
             3>&1 1>&2 2>&3) || return
 
@@ -2052,6 +2137,80 @@ shares_edit_picker() {
                     3>&1 1>&2 2>&3) || continue
                 BACKEND_PASS="$p"
                 configure_share && info "Backend domain updated for '$name'." || info "configure_share failed (rc=$?)"
+                BACKEND_PASS=""
+                ;;
+            7)
+                if [[ "${PROFILE:-}" != "modern" ]]; then
+                    info "Backend SMB version is fixed at 1.0 for legacy profile.\nConvert this share to modern (remove + re-add) to choose a version."
+                    continue
+                fi
+                local newvers
+                newvers=$(whiptail --title "Edit share: $name — backend SMB version" \
+                    --radiolist "${body_ctx}\n\nProtocol version to negotiate with the backend:" \
+                    20 76 8 \
+                    3       "SMB3 — auto-negotiate 3.0/3.1.1"          $([[ "${BACKEND_VERS:-3}" == 3       ]] && echo ON || echo OFF) \
+                    3.0     "SMB3.0 only"                              $([[ "${BACKEND_VERS:-}"  == 3.0     ]] && echo ON || echo OFF) \
+                    3.0.2   "SMB3.0.2 only"                            $([[ "${BACKEND_VERS:-}"  == 3.0.2   ]] && echo ON || echo OFF) \
+                    3.1.1   "SMB3.1.1 only"                            $([[ "${BACKEND_VERS:-}"  == 3.1.1   ]] && echo ON || echo OFF) \
+                    2.1     "SMB2.1 only"                              $([[ "${BACKEND_VERS:-}"  == 2.1     ]] && echo ON || echo OFF) \
+                    2.0     "SMB2.0 only"                              $([[ "${BACKEND_VERS:-}"  == 2.0     ]] && echo ON || echo OFF) \
+                    1.0     "SMB1 only"                                $([[ "${BACKEND_VERS:-}"  == 1.0     ]] && echo ON || echo OFF) \
+                    default "Let cifs negotiate (no vers= token)"      $([[ "${BACKEND_VERS:-}"  == default ]] && echo ON || echo OFF) \
+                    3>&1 1>&2 2>&3) || continue
+                BACKEND_VERS="$newvers"
+                local p
+                p=$(whiptail --title "Edit share: $name — confirm with password" \
+                    --passwordbox "${body_ctx}\n\nRe-enter backend password to apply:" 12 64 \
+                    3>&1 1>&2 2>&3) || continue
+                BACKEND_PASS="$p"
+                configure_share && info "Backend version updated for '$name' (vers=${BACKEND_VERS})." \
+                    || info "configure_share failed (rc=$?)"
+                BACKEND_PASS=""
+                ;;
+            8)
+                if [[ "${PROFILE:-}" != "modern" ]]; then
+                    info "Sealing is SMB3-only and not applicable to the legacy profile."
+                    continue
+                fi
+                local newseal
+                newseal=$(whiptail --title "Edit share: $name — sealing" \
+                    --radiolist "${body_ctx}\n\nSMB3 wire encryption (cifs 'seal' option):" \
+                    14 70 2 \
+                    yes "Encrypt backend traffic (recommended)" $([[ "${BACKEND_SEAL:-yes}" == yes ]] && echo ON || echo OFF) \
+                    no  "No encryption"                         $([[ "${BACKEND_SEAL:-}"    == no  ]] && echo ON || echo OFF) \
+                    3>&1 1>&2 2>&3) || continue
+                BACKEND_SEAL="$newseal"
+                local p
+                p=$(whiptail --title "Edit share: $name — confirm with password" \
+                    --passwordbox "${body_ctx}\n\nRe-enter backend password to apply:" 12 64 \
+                    3>&1 1>&2 2>&3) || continue
+                BACKEND_PASS="$p"
+                configure_share && info "Sealing updated for '$name' (seal=${BACKEND_SEAL})." \
+                    || info "configure_share failed (rc=$?)"
+                BACKEND_PASS=""
+                ;;
+            9)
+                if [[ "${PROFILE:-}" != "modern" ]]; then
+                    info "Locking override is fixed at tps-strict for the legacy profile.\nConvert this share to modern to choose a different override."
+                    continue
+                fi
+                local newlock
+                newlock=$(whiptail --title "Edit share: $name — locking" \
+                    --radiolist "${body_ctx}\n\nLocking semantics on the published frontend:" \
+                    16 76 3 \
+                    profile-default "Relaxed (modern default)"           $([[ -z "${LOCKING_OVERRIDE:-}" ]] && echo ON || echo OFF) \
+                    relaxed         "Relaxed (explicit)"                 $([[ "${LOCKING_OVERRIDE:-}" == relaxed    ]] && echo ON || echo OFF) \
+                    tps-strict      "Strict — ISAM/.TPS multi-writer DB" $([[ "${LOCKING_OVERRIDE:-}" == tps-strict ]] && echo ON || echo OFF) \
+                    3>&1 1>&2 2>&3) || continue
+                LOCKING_OVERRIDE="$newlock"
+                [[ "$LOCKING_OVERRIDE" == "profile-default" ]] && LOCKING_OVERRIDE=""
+                local p
+                p=$(whiptail --title "Edit share: $name — confirm with password" \
+                    --passwordbox "${body_ctx}\n\nRe-enter backend password to apply:" 12 64 \
+                    3>&1 1>&2 2>&3) || continue
+                BACKEND_PASS="$p"
+                configure_share && info "Locking updated for '$name'." \
+                    || info "configure_share failed (rc=$?)"
                 BACKEND_PASS=""
                 ;;
             B|b) return ;;
