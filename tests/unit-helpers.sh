@@ -86,6 +86,89 @@ check_eq "single special char → single underscore" \
     "_" "$(share_safe_name '$')"
 
 #-------------------------------------------------------------------------------
+# share_name_validate — single point of truth for share-name acceptance.
+# Used by both the TUI add-wizard and cli_configure_share.
+#-------------------------------------------------------------------------------
+echo "== share_name_validate =="
+
+# Helper: capture stderr to /dev/null and report just the rc.
+_validate_rc() { share_name_validate "$1" 2>/dev/null; echo $?; }
+
+check_eq "ascii-clean name accepted"           "0" "$(_validate_rc 'Engineering')"
+check_eq "trailing \$ accepted (hidden share)" "0" "$(_validate_rc 'Engineering$')"
+check_eq "underscore accepted"                 "0" "$(_validate_rc 'Already_Safe')"
+check_eq "hyphen accepted"                     "0" "$(_validate_rc 'foo-bar')"
+check_eq "dot accepted"                        "0" "$(_validate_rc 'foo.bar')"
+check_eq "empty rejected"                      "1" "$(_validate_rc '')"
+check_eq "space rejected (would break fstab)"  "1" "$(_validate_rc 'Old Files')"
+check_eq "tab rejected"                        "1" "$(_validate_rc $'a\tb')"
+check_eq "slash rejected"                      "1" "$(_validate_rc 'a/b')"
+check_eq "backslash rejected"                  "1" "$(_validate_rc 'a\b')"
+check_eq "bracket [ rejected"                  "1" "$(_validate_rc 'a[b')"
+check_eq "bracket ] rejected"                  "1" "$(_validate_rc 'a]b')"
+check_eq "double-quote rejected"               "1" "$(_validate_rc 'a"b')"
+check_eq "single-quote rejected"               "1" "$(_validate_rc "a'b")"
+check_eq "lt rejected"                         "1" "$(_validate_rc 'a<b')"
+check_eq "gt rejected"                         "1" "$(_validate_rc 'a>b')"
+# Shell metas (other than trailing $).
+check_eq "non-trailing \$ rejected"            "1" "$(_validate_rc 'a$b')"
+check_eq "backtick rejected"                   "1" "$(_validate_rc 'a`b')"
+check_eq "semicolon rejected"                  "1" "$(_validate_rc 'a;b')"
+check_eq "pipe rejected"                       "1" "$(_validate_rc 'a|b')"
+check_eq "ampersand rejected"                  "1" "$(_validate_rc 'a&b')"
+check_eq "asterisk rejected"                   "1" "$(_validate_rc 'a*b')"
+check_eq "question rejected"                   "1" "$(_validate_rc 'a?b')"
+
+#-------------------------------------------------------------------------------
+# share_safe_name_collides_with_existing — depends on list_shares.
+# SHARES_DIR is readonly post-source, so we can't redirect it; mock
+# list_shares directly. Function definitions aren't readonly-protected.
+#-------------------------------------------------------------------------------
+echo "== share_safe_name_collides_with_existing =="
+
+# Save the real impl and replace with a fixture-returning one. We
+# restore it after this section so other tests that follow (or run
+# concurrently with shared state) see the real behavior.
+_orig_list_shares() { :; }
+eval "_orig_list_shares() $(declare -f list_shares | sed -e '1d')"
+list_shares() { printf '%s\n' "${_LAB_FIXTURE_SHARES[@]}"; }
+
+# Fixture: one share named "A_B" already on disk.
+_LAB_FIXTURE_SHARES=(A_B)
+
+# A different name that encodes to the SAME safe name must collide.
+collision=$(share_safe_name_collides_with_existing 'A-B')
+check_eq "A-B collides with existing A_B"  "A_B" "$collision"
+collision=$(share_safe_name_collides_with_existing 'A.B')
+check_eq "A.B collides with existing A_B"  "A_B" "$collision"
+
+# Adding the SAME exact name (idempotency) must NOT report a collision —
+# that's the duplicate-name case, handled separately by the wizard. The
+# function returns 1 (no collision) and prints nothing.
+share_safe_name_collides_with_existing 'A_B' >/tmp/coll.out 2>&1
+check_rc "exact-self-match is not a safe-name collision" 1 $?
+check_eq "exact-self-match prints nothing" "" "$(cat /tmp/coll.out)"
+rm -f /tmp/coll.out
+
+# A genuinely different name must not collide.
+share_safe_name_collides_with_existing 'C_D' >/dev/null
+check_rc "non-colliding name returns rc=1" 1 $?
+
+# Multi-share fixture: multiple existing shares, none colliding.
+_LAB_FIXTURE_SHARES=(Engineering Drawings_ Quotes)
+share_safe_name_collides_with_existing 'NewShare' >/dev/null
+check_rc "no collision against multi-share fixture" 1 $?
+
+# Multi-share fixture with a hidden offender deeper in the list.
+_LAB_FIXTURE_SHARES=(Engineering Drawings_ A_B Quotes)
+collision=$(share_safe_name_collides_with_existing 'A.B')
+check_eq "collision detected even when offender is mid-list" "A_B" "$collision"
+
+# Restore the real list_shares.
+list_shares() { _orig_list_shares "$@"; }
+unset _LAB_FIXTURE_SHARES
+
+#-------------------------------------------------------------------------------
 # share_default_mount — profile-aware default path.
 #-------------------------------------------------------------------------------
 echo "== share_default_mount =="

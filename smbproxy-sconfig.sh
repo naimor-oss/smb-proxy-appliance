@@ -144,6 +144,90 @@ share_safe_name() {
     echo "${1//[^A-Za-z0-9_]/_}"
 }
 
+# Validate a proposed share name. Single point of truth for both the
+# CLI (cli_configure_share) and TUI (shares_add_wizard). Rejects:
+#
+#   - empty
+#   - characters not legal in SMB share names (\ / [ ] < > " ')
+#   - whitespace (spaces would land unescaped in fstab and break the
+#     mount; tabs/newlines are even worse)
+#   - shell metacharacters that would re-interpret if the name leaked
+#     unquoted into a shell command line ($ ` ; | & * ? ( ) {} ! ~ #)
+#     We DO permit a single trailing `$` because that's the standard
+#     marker for a hidden SMB share and is common in real deployments
+#     (e.g. `Engineering$`).
+#
+# Prints an error to stderr on rejection and returns non-zero.
+share_name_validate() {
+    local name="$1"
+    if [[ -z "$name" ]]; then
+        echo "share name cannot be empty" >&2; return 1
+    fi
+    # Bash =~ with a literal char class can be brittle once you start
+    # backslash-escaping inside [...]. Storing the regex in a variable
+    # AND the char list in a plain glob check sidesteps the entire
+    # quoting problem. We just iterate the bad-chars string.
+    local bad_chars=$'/\\[]<>"\''
+    local i ch
+    for (( i=0; i<${#bad_chars}; i++ )); do
+        ch="${bad_chars:i:1}"
+        # Use globbing to test substring presence — neutral to ERE quirks.
+        case "$name" in
+            *"$ch"*)
+                echo "share name '$name' contains a character not allowed in SMB share names (one of: / \\ [ ] < > \" ')" >&2
+                return 1
+                ;;
+        esac
+    done
+    if [[ "$name" =~ [[:space:]] ]]; then
+        echo "share name '$name' contains whitespace; not supported (would break fstab parsing)" >&2
+        return 1
+    fi
+    # Shell metas. Special-case: a SINGLE trailing `$` is the SMB
+    # hidden-share marker and is allowed; a `$` anywhere else is
+    # rejected because it would expand if the name ever reached a
+    # double-quoted shell context.
+    local stripped="${name%\$}"
+    local meta_chars='$`;|&*?(){}!~#'
+    for (( i=0; i<${#meta_chars}; i++ )); do
+        ch="${meta_chars:i:1}"
+        case "$stripped" in
+            *"$ch"*)
+                echo "share name '$name' contains shell metacharacters" >&2
+                return 1
+                ;;
+        esac
+    done
+    return 0
+}
+
+# Reject a proposed share name if its safe form collides with another
+# already-registered share's safe form. Without this, both `A-B` and
+# `A_B` map to `A_B.env` and the second add would silently overwrite
+# the first's state file. Returns 0 on collision (caller must reject),
+# 1 on no collision (safe to add). On collision the offending peer name
+# is printed to stdout so the caller can include it in the error.
+#
+# Idempotency: the proposed name colliding with ITSELF (operator
+# re-uses an existing exact name) is NOT a safe-name collision — it's
+# a duplicate-name collision, and that's caught earlier by the
+# duplicate-name check in the add-wizard / cli_add_share. We exclude
+# self-match here so an Edit operation doesn't false-positive.
+share_safe_name_collides_with_existing() {
+    local proposed="$1"
+    local proposed_safe; proposed_safe=$(share_safe_name "$proposed")
+    local existing
+    while IFS= read -r existing; do
+        [[ -z "$existing" ]] && continue
+        [[ "$existing" == "$proposed" ]] && continue
+        if [[ "$(share_safe_name "$existing")" == "$proposed_safe" ]]; then
+            printf '%s' "$existing"
+            return 0
+        fi
+    done < <(list_shares 2>/dev/null)
+    return 1
+}
+
 share_state_file() {
     echo "${SHARES_DIR}/$(share_safe_name "$1").env"
 }
@@ -321,7 +405,10 @@ frontend_offline_probe_stanza() {
     # the tree connect in ~1s if the backend device is powered off,
     # so the client sees one fast error instead of cycling ~12 times
     # through automount-fails-then-ACCESS_DENIED for ~60s.
-    root preexec = /usr/local/sbin/smbproxy-probe-backend %S
+    # %S is quoted so a share name containing spaces (or other
+    # shell-metas; share-name validation should already reject those
+    # but quoting is defense in depth) reaches the probe as one argv.
+    root preexec = /usr/local/sbin/smbproxy-probe-backend "%S"
     root preexec close = yes
 STANZA
             ;;
@@ -1389,31 +1476,16 @@ configure_share() {
         "$BACKEND_MOUNT" 2>/dev/null \
         || install -d -m 0755 "$BACKEND_MOUNT"
 
-    # Per-share creds file. NEVER log this file's contents.
-    local creds; creds=$(share_creds_file "$SHARE_NAME")
-    install -d -o root -g root -m 0755 "$CREDS_DIR"
-    umask 077
-    cat > "$creds" <<EOF
-username=${BACKEND_USER}
-password=${BACKEND_PASS}
-domain=${BACKEND_DOMAIN}
-EOF
-    chmod 0600 "$creds"
-    chown root:root "$creds"
-    umask 022
+    # ---- PRE-FLIGHT VALIDATION (no persistent writes yet) ----
+    # The previous shape wrote creds + fstab line BEFORE running the
+    # AD-group SID resolve and the testparm validation. A failure on
+    # either of those left orphan creds + an orphan fstab line whose
+    # share state was never saved — operator had to clean up by hand.
+    # Compute everything we'll need first, run the high-risk
+    # validations, and only then commit any writes.
 
-    # fstab entry. The cifs option string is profile-driven (see
-    # backend_mount_opts):
-    #   legacy: vers=1.0 + cache=none + nobrl — the locking-correct
-    #           combo for ISAM-style (e.g. Clarion .TPS) where the proxy is the
-    #           sole writer and locks are arbitrated at the Samba layer.
-    #   modern: vers=3 (auto-negotiate 3.0/3.1.1) + kernel default
-    #           caching + optional SMB3 sealing. Suitable for routine
-    #           file-copy backends (CNC, NAS) on the domain LAN.
-    # Common to both: nosharesock (per-mount session — the multi-share
-    # creds-isolation defense from 2026-05-05), serverino, automount.
-    # Resolve to numeric UID/GID locally to lock in the LOCAL /etc/passwd
-    # account (the default-domain ambiguity defense — see AGENTS.md).
+    local creds; creds=$(share_creds_file "$SHARE_NAME")
+
     local FU_UID FU_GID CREDS
     FU_UID=$(awk -F: -v u="$FRONT_FORCE_USER" '$1==u {print $3; exit}' /etc/passwd)
     FU_GID=$(awk -F: -v u="$FRONT_FORCE_USER" '$1==u {print $4; exit}' /etc/passwd)
@@ -1422,25 +1494,32 @@ EOF
         return 5
     fi
     CREDS="$creds"
-    local mount_opts; mount_opts=$(backend_mount_opts "$PROFILE")
-    local fstab_line="//${BACKEND_IP}/${SHARE_NAME} ${BACKEND_MOUNT} cifs ${mount_opts} 0 0"
-    sed -i "\| ${BACKEND_MOUNT} cifs |d" /etc/fstab
-    echo "$fstab_line" >> /etc/fstab
-    systemctl daemon-reload
     # Aliases for downstream comments / smb.conf section.
     local fu_uid="$FU_UID" fu_gid="$FU_GID"
 
-    # Frontend smb.conf section — only if domain-joined and FRONT_GROUP
-    # is set. Operator can add a share's backend before joining and
-    # publish the frontend afterward.
+    # fstab line is built but NOT written yet. The cifs option string is
+    # profile-driven (see backend_mount_opts):
+    #   legacy: vers=1.0 + cache=none + nobrl — the locking-correct
+    #           combo for ISAM-style (e.g. Clarion .TPS) where the proxy is the
+    #           sole writer and locks are arbitrated at the Samba layer.
+    #   modern: vers=3 (auto-negotiate 3.0/3.1.1) + kernel default
+    #           caching + optional SMB3 sealing. Suitable for routine
+    #           file-copy backends (CNC, NAS) on the domain LAN.
+    # Common to both: nosharesock (per-mount session — the multi-share
+    # creds-isolation defense from 2026-05-05), serverino, automount.
+    local mount_opts; mount_opts=$(backend_mount_opts "$PROFILE")
+    local fstab_line="//${BACKEND_IP}/${SHARE_NAME} ${BACKEND_MOUNT} cifs ${mount_opts} 0 0"
+
+    # Frontend smb.conf section — only validated/built if domain-joined
+    # AND FRONT_GROUP is set. Operator can add a share's backend pre-join
+    # and publish the frontend later.
+    local group_sid="" smb_conf_pending=""
     if is_joined && [[ -n "$FRONT_GROUP" ]]; then
         # Resolve the AD group to its SID at config time. SID-based
         # `valid users` is unambiguous, NSS-independent, and immune
         # to the `winbind use default domain = yes` parsing quirk that
         # makes `valid users = @"DOMAIN\Group"` fail to match in
-        # Samba 4.22 on this appliance. wbinfo --name-to-sid output
-        # shape: `<SID> <type-name> (<type-id>)`.
-        local group_sid
+        # Samba 4.22 on this appliance.
         group_sid=$(wbinfo --name-to-sid="$FRONT_GROUP" 2>/dev/null | awk '{print $1}')
         if [[ -z "$group_sid" || ! "$group_sid" =~ ^S-1- ]]; then
             log_share "ERROR: cannot resolve AD group '${FRONT_GROUP}' to a SID via winbind."
@@ -1448,26 +1527,17 @@ EOF
             return 6
         fi
 
-        # force user uses the username string, not the numeric UID.
-        # Samba resolves `force user` via getpwnam(), which honours the
-        # NSS order (files first on this appliance), so the local
-        # /etc/passwd entry wins over any winbind result. Numeric UIDs
-        # do NOT work here — getpwnam("1003") fails even though
-        # getpwuid(1003) succeeds, causing NT_STATUS_NO_SUCH_USER at
-        # tree-connect time (confirmed 2026-05-07).
-        # The AD-collision guard above (wbinfo --name-to-sid) already
-        # catches dangerous names at config time; that is the safety net.
-        # (fu_uid/fu_gid are still used for the cifs uid=/gid= options.)
-
-        # Strip any prior [SHARE_NAME] section, then append fresh.
+        # Build the candidate smb.conf in a temp file. Strip any prior
+        # [SHARE_NAME] section, then append fresh.
+        smb_conf_pending="${SMB_CONF}.new.$$"
         awk -v sname="[$SHARE_NAME]" '
             BEGIN { in_share=0 }
             $0 == sname { in_share=1; next }
             /^\[/ && in_share { in_share=0 }
             !in_share { print }
-        ' "$SMB_CONF" > "${SMB_CONF}.new"
+        ' "$SMB_CONF" > "$smb_conf_pending"
 
-        cat >> "${SMB_CONF}.new" <<EOF
+        cat >> "$smb_conf_pending" <<EOF
 
 [${SHARE_NAME}]
     # profile=${PROFILE}; locking=${locking_kind}
@@ -1493,11 +1563,32 @@ $(frontend_offline_probe_stanza "$PROFILE")
 $(frontend_locking_stanza "$locking_kind")
 EOF
 
-        if ! testparm -s "${SMB_CONF}.new" >/dev/null 2>/tmp/smbproxy-tp.$$; then
-            rm -f "${SMB_CONF}.new"
+        if ! testparm -s "$smb_conf_pending" >/dev/null 2>/tmp/smbproxy-tp.$$; then
+            rm -f "$smb_conf_pending"
             return 4
         fi
-        mv "${SMB_CONF}.new" "$SMB_CONF"
+    fi
+
+    # ---- COMMIT (all validations passed; writes from here on) ----
+
+    # Per-share creds file. NEVER log this file's contents.
+    install -d -o root -g root -m 0755 "$CREDS_DIR"
+    umask 077
+    cat > "$creds" <<EOF
+username=${BACKEND_USER}
+password=${BACKEND_PASS}
+domain=${BACKEND_DOMAIN}
+EOF
+    chmod 0600 "$creds"
+    chown root:root "$creds"
+    umask 022
+
+    sed -i "\| ${BACKEND_MOUNT} cifs |d" /etc/fstab
+    echo "$fstab_line" >> /etc/fstab
+    systemctl daemon-reload
+
+    if [[ -n "$smb_conf_pending" ]]; then
+        mv "$smb_conf_pending" "$SMB_CONF"
         chmod 0644 "$SMB_CONF"
         systemctl reload smbd 2>/dev/null || systemctl restart smbd
     fi
@@ -1662,18 +1753,47 @@ check_share() {
             local sec
             sec=$(awk -v s="[$SHARE_NAME]" 'BEGIN{p=0} $0==s{p=1; next} /^\[/{p=0} p' "$SMB_CONF" 2>/dev/null)
 
-            # force user must be a numeric UID matching FRONT_FORCE_USER's /etc/passwd entry.
-            local smb_uid
-            smb_uid=$(grep -oE 'force user[[:space:]]*=[[:space:]]*[0-9]+' <<< "$sec" | grep -oE '[0-9]+$' | head -1)
-            if [[ -z "$smb_uid" ]]; then
-                printf '   force_user:     smb.conf force user is NOT numeric (default-domain ambiguity defense violated)\n'
+            # force user is now written as a username (not numeric UID)
+            # because Samba resolves it via getpwnam(); numeric strings
+            # don't resolve. The default-domain ambiguity defense lives
+            # at write time (AD-collision check + NSS files-first
+            # ordering) and is verified here:
+            #   1. value is a username string (not numeric)
+            #   2. it matches the saved FRONT_FORCE_USER state
+            #   3. /etc/passwd resolves the same UID winbind would NOT
+            #      override (we look at the LOCAL files entry directly,
+            #      bypassing NSS) — confirms the local account exists.
+            local smb_user
+            smb_user=$(grep -oE 'force user[[:space:]]*=[[:space:]]*[^[:space:]]+' <<< "$sec" \
+                | sed -E 's/^force user[[:space:]]*=[[:space:]]*//' | head -1)
+            if [[ -z "$smb_user" ]]; then
+                printf '   force_user:     smb.conf has no force user entry\n'
                 rc=1
-            elif [[ -n "$FU_UID" && "$smb_uid" != "$FU_UID" ]]; then
-                printf '   force_user:     smb.conf UID=%s but /etc/passwd UID for %s is %s — MISMATCH\n' \
-                    "$smb_uid" "$FRONT_FORCE_USER" "$FU_UID"
+            elif [[ "$smb_user" =~ ^[0-9]+$ ]]; then
+                # Numeric value would silently fail at tree-connect
+                # (NT_STATUS_NO_SUCH_USER) because getpwnam("1003")
+                # returns nothing even when getpwuid(1003) succeeds.
+                printf '   force_user:     smb.conf force user is numeric (%s) — Samba getpwnam() will fail\n' "$smb_user"
+                rc=1
+            elif [[ -n "${FRONT_FORCE_USER:-}" && "$smb_user" != "$FRONT_FORCE_USER" ]]; then
+                printf '   force_user:     smb.conf force user=%s but saved state has FRONT_FORCE_USER=%s — DRIFT\n' \
+                    "$smb_user" "$FRONT_FORCE_USER"
                 rc=1
             else
-                printf '   force_user:     uid=%s (%s, local /etc/passwd) — OK\n' "$smb_uid" "$FRONT_FORCE_USER"
+                # Resolve via /etc/passwd (files-only) so a winbind
+                # outage / AD-side rename doesn't muddy the answer.
+                local pw_uid
+                pw_uid=$(awk -F: -v u="$smb_user" '$1==u {print $3; exit}' /etc/passwd)
+                if [[ -z "$pw_uid" ]]; then
+                    printf '   force_user:     %s has no /etc/passwd entry — local account is missing\n' "$smb_user"
+                    rc=1
+                elif [[ -n "${FU_UID:-}" && "$pw_uid" != "$FU_UID" ]]; then
+                    printf '   force_user:     /etc/passwd UID=%s for %s, but loaded state has FU_UID=%s — MISMATCH\n' \
+                        "$pw_uid" "$smb_user" "$FU_UID"
+                    rc=1
+                else
+                    printf '   force_user:     %s (uid=%s, local /etc/passwd) — OK\n' "$smb_user" "$pw_uid"
+                fi
             fi
 
             # valid users must be a SID and resolvable via wbinfo to FRONT_GROUP.
@@ -1728,15 +1848,26 @@ shares_add_wizard() {
         SHARE_NAME=$(whiptail --title "Add proxied share" \
             --inputbox "Choose the share's name.\n\nThis is BOTH the legacy backend share name AND the published\nSMB3 share name (operator picks one; it appears at both ends).\nTrailing \$ marks it hidden in network browsing.\n\nExample: Engineering\$" \
             16 70 "" 3>&1 1>&2 2>&3) || return
-        [[ -n "$SHARE_NAME" ]] || { info "Share name cannot be empty."; continue; }
-        # Reject characters that aren't share-name-safe on Windows or
-        # that would break smb.conf section parsing.
-        if [[ "$SHARE_NAME" =~ [/\\\[\]\"\'\<\>] ]]; then
-            info "Share name contains characters not allowed in SMB share names\n(/, \\\\, [, ], <, >, quotes)."
+        # Single point of truth for share-name validity (also used by
+        # cli_configure_share). Captures empty, bad chars, whitespace,
+        # and shell metas — the latter is the trailing fix for the
+        # spaces-in-fstab bug + the trailing $-vs-other-$ distinction.
+        local validate_err
+        if ! validate_err=$(share_name_validate "$SHARE_NAME" 2>&1); then
+            info "Invalid share name:\n${validate_err#*: }"
             continue
         fi
         if echo "$existing_names" | grep -qFx "$SHARE_NAME"; then
             info "A share named '$SHARE_NAME' already exists.\nUse Edit to change it, Remove to delete it first."
+            continue
+        fi
+        # Safe-name collision check: `A-B` and `A_B` both encode to
+        # `A_B`, which would silently overwrite the first share's
+        # state file. share_safe_name_collides_with_existing prints
+        # the colliding peer to stdout.
+        local peer
+        if peer=$(share_safe_name_collides_with_existing "$SHARE_NAME"); then
+            info "Share name '$SHARE_NAME' would conflict with existing\nshare '$peer' on disk (both encode to the same state-file\nname). Pick a different name."
             continue
         fi
         break
@@ -2523,6 +2654,17 @@ cli_configure_share() {
     [[ -n "$SHARE_NAME" && -n "$BACKEND_IP" && -n "$BACKEND_USER" \
         && -n "$BACKEND_DOMAIN" ]] \
         || { echo "missing required flag (--name --backend-ip --backend-user --backend-domain)" >&2; return 2; }
+
+    # Same validation as the TUI add-wizard. share_name_validate
+    # rejects names with shell metas / whitespace; the collision
+    # check rejects names that would overwrite an existing share's
+    # on-disk state file via safe-name aliasing (e.g. `A-B` vs `A_B`).
+    share_name_validate "$SHARE_NAME" || return 2
+    local _peer
+    if _peer=$(share_safe_name_collides_with_existing "$SHARE_NAME"); then
+        echo "share name '$SHARE_NAME' would collide with existing share '$_peer' on disk (both encode to the same state-file name)" >&2
+        return 2
+    fi
 
     # Defaults. PROFILE defaults to legacy for backward compat.
     PROFILE="${PROFILE:-$PROFILE_LEGACY}"

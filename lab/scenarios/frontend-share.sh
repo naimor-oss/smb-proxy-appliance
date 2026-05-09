@@ -86,22 +86,41 @@ verify() {
     grep -qE 'kernel oplocks[[:space:]]*=[[:space:]]*no'  <<< "$out" || { say "kernel oplocks != no"; rc=1; }
     grep -qE 'posix locking[[:space:]]*=[[:space:]]*yes'  <<< "$out" || { say "posix locking != yes"; rc=1; }
     grep -qF "path = ${SC_BACKEND_MOUNT}"                  <<< "$out" || { say "path wrong";          rc=1; }
-    # force user / force group / valid users are written numerically (UIDs/GIDs)
-    # and as SIDs respectively, NOT as symbolic AD names. This is the
-    # default-domain ambiguity defense added in configure_share on
-    # 2026-05-05 — symbolic names re-introduce the prod bug where an
-    # AD account by the same name silently captures the mapping.
-    grep -qE '^[[:space:]]*force user[[:space:]]*=[[:space:]]*[0-9]+[[:space:]]*$'  <<< "$out" || { say "force user not a numeric UID";  rc=1; }
-    grep -qE '^[[:space:]]*force group[[:space:]]*=[[:space:]]*[0-9]+[[:space:]]*$' <<< "$out" || { say "force group not a numeric GID"; rc=1; }
-    grep -qE '^[[:space:]]*valid users[[:space:]]*=[[:space:]]*S-1-'                <<< "$out" || { say "valid users not a SID";        rc=1; }
-    # Cross-check that the LOCAL force-user account's UID matches what
-    # smb.conf is writing — catches a stale section pointing at a UID
-    # the local /etc/passwd no longer has.
-    local fu_uid_file fu_uid_smb
-    fu_uid_file=$(ssh_vm "awk -F: -v u='${SC_FORCE_USER}' '\$1==u {print \$3; exit}' /etc/passwd" 2>&1 || true)
-    fu_uid_smb=$(grep -oE 'force user[[:space:]]*=[[:space:]]*[0-9]+' <<< "$out" | grep -oE '[0-9]+$' | head -1)
-    if [[ -n "$fu_uid_file" && -n "$fu_uid_smb" && "$fu_uid_file" != "$fu_uid_smb" ]]; then
-        say "force user UID $fu_uid_smb in smb.conf does not match /etc/passwd UID $fu_uid_file for ${SC_FORCE_USER}"; rc=1
+    # force user / force group are written as the LOCAL username
+    # (NOT a numeric UID — Samba resolves these via getpwnam(), and
+    # numeric strings don't resolve there even though getpwuid()
+    # would). The default-domain ambiguity defense lives elsewhere:
+    #   1. NSS files-first ordering on the appliance (passwd: files winbind)
+    #      so the local account always wins over a same-named AD one.
+    #   2. AD-collision check at configure_share write time.
+    # valid users stays as a SID for an unrelated ambiguity defense
+    # (winbind use default domain = yes parsing quirk).
+    grep -qE '^[[:space:]]*force user[[:space:]]*=[[:space:]]*[A-Za-z_][A-Za-z0-9_-]*[[:space:]]*$'  <<< "$out" \
+        || { say "force user not a username";  rc=1; }
+    grep -qE '^[[:space:]]*force group[[:space:]]*=[[:space:]]*[A-Za-z_][A-Za-z0-9_-]*[[:space:]]*$' <<< "$out" \
+        || { say "force group not a username"; rc=1; }
+    # Belt-and-suspenders: assert numeric force user is REJECTED.
+    # The previous numeric form would silently break tree-connect.
+    grep -qE '^[[:space:]]*force user[[:space:]]*=[[:space:]]*[0-9]+[[:space:]]*$' <<< "$out" \
+        && { say "force user is numeric (Samba getpwnam() would fail)"; rc=1; }
+    grep -qE '^[[:space:]]*valid users[[:space:]]*=[[:space:]]*S-1-' <<< "$out" \
+        || { say "valid users not a SID"; rc=1; }
+
+    # Cross-check that the username smb.conf names matches the saved
+    # FRONT_FORCE_USER state and that /etc/passwd (files-only, the
+    # configured NSS source) resolves it to a real UID. Catches a
+    # stale section pointing at an account that's been removed.
+    local fu_user_smb fu_uid_file
+    fu_user_smb=$(grep -oE 'force user[[:space:]]*=[[:space:]]*[A-Za-z_][A-Za-z0-9_-]*' <<< "$out" \
+        | sed -E 's/^force user[[:space:]]*=[[:space:]]*//' | head -1)
+    if [[ -n "$fu_user_smb" && "$fu_user_smb" != "${SC_FORCE_USER}" ]]; then
+        say "force user '$fu_user_smb' in smb.conf does not match SC_FORCE_USER '${SC_FORCE_USER}'"; rc=1
+    fi
+    if [[ -n "$fu_user_smb" ]]; then
+        fu_uid_file=$(ssh_vm "awk -F: -v u='${fu_user_smb}' '\$1==u {print \$3; exit}' /etc/passwd" 2>&1 || true)
+        if [[ -z "$fu_uid_file" ]]; then
+            say "force user '$fu_user_smb' has no /etc/passwd entry on the proxy"; rc=1
+        fi
     fi
     # Cross-check that the SID in valid users resolves back to the
     # AD group the operator named.

@@ -23,14 +23,21 @@
 
 set -u
 
-share_name="${1:-}"
+# Defense in depth: a share name with whitespace would arrive split
+# across argv if smb.conf were ever to drop the quoting around %S.
+# Concatenate the full positional list so we still reconstruct the
+# correct name. Single-arg invocations (the normal path now that
+# smb.conf quotes %S) still work — "$*" reduces to "$1".
+share_name="$*"
 [[ -n "$share_name" ]] || exit 1
 
-# Same safe-name convention as smbproxy-sconfig: any non-alphanumeric
-# character becomes underscore. So `Engineering$` looks up
-# `Engineering_.env` on disk while the literal share name lives in
-# the env file's SHARE_NAME field.
-safe_name="${share_name//[^A-Za-z0-9]/_}"
+# Same safe-name convention as smbproxy-sconfig (share_safe_name):
+# any character outside [A-Za-z0-9_] becomes underscore. So
+# `Engineering$` looks up `Engineering_.env` on disk while the
+# literal share name lives in the env file's SHARE_NAME field.
+# (Underscore is preserved unchanged so the mapping is stable
+# across the writer and the reader.)
+safe_name="${share_name//[^A-Za-z0-9_]/_}"
 env_file="/var/lib/smbproxy/shares/${safe_name}.env"
 [[ -r "$env_file" ]] || exit 1
 
