@@ -42,7 +42,12 @@ STAGE_DIR_MAC="${LAB_STAGE_DIR:-/Volumes/ISO/lab-scripts}"
 STAGE_DIR_HOST="${LAB_HOST_STAGE_DIR:-D:\\ISO\\lab-scripts}"
 ISO_DIR_MAC="${ISO_DIR_MAC:-/Volumes/ISO}"
 DOMAIN="${DOMAIN:-lab.test}"
-SSH_PUBKEY="${SSH_PUBKEY:-$HOME/.ssh/id_ed25519.pub}"
+# Empty by default so the stager picks up lab/keys/*.pub (the
+# documented multi-key path). Operators can still pin a single key
+# with -k/--pubkey or by exporting SSH_PUBKEY=...; if neither is set
+# AND lab/keys/ has no .pub files, we fall back to the operator's
+# personal key after arg parsing — see below.
+SSH_PUBKEY="${SSH_PUBKEY:-}"
 GOLDEN_CHECKPOINT="${GOLDEN_CHECKPOINT:-golden-image}"
 DOMAIN_STATIC_MAC="${DOMAIN_STATIC_MAC:-00155D0A0A1E}"
 LEGACY_STATIC_MAC="${LEGACY_STATIC_MAC:-}"
@@ -63,7 +68,8 @@ Flags:
       --legacy-mac MAC   Optional pinned legacy-NIC MAC (default: auto)
   -d, --domain DOMAIN    DNS domain for the appliance hostname
                          (default: $DOMAIN)
-  -k, --pubkey FILE      SSH public key (default: $SSH_PUBKEY)
+  -k, --pubkey FILE      SSH public key (default: lab/keys/*.pub, then
+                         ~/.ssh/id_ed25519.pub if lab/keys/ is empty)
   -f, --force            Remove the VM and its diff VHDX first if present
       --deploy-only      Stop after the host-agnostic 'deploy-master'
                          snapshot. Skip the firstboot pass and the
@@ -117,9 +123,27 @@ if [[ $FORCE -eq 1 ]]; then
               Write-Host 'cleaned'"
 fi
 
+# Resolve key source: prefer lab/keys/ (multi-key path), fall back to
+# operator's personal key only if lab/keys/ is empty AND no -k was
+# given. Forwarding `-k` to the stager forces single-key mode and
+# bypasses lab/keys/, so we only forward when an explicit key was set.
+STAGER_KEY_ARGS=()
+if [[ -n "$SSH_PUBKEY" ]]; then
+    STAGER_KEY_ARGS=(-k "$SSH_PUBKEY")
+else
+    keys_dir="$SCRIPT_DIR/keys"
+    have_keys=0
+    for f in "$keys_dir"/*.pub; do
+        [[ -f "$f" ]] && { have_keys=1; break; }
+    done
+    if [[ $have_keys -eq 0 ]]; then
+        STAGER_KEY_ARGS=(-k "$HOME/.ssh/id_ed25519.pub")
+    fi
+fi
+
 step "1. stage base VHDX + seed ISO"
 "$SCRIPT_DIR/stage-proxy-base.sh" \
-    -n "$VM_NAME" -d "$DOMAIN" -u "$VM_USER" -k "$SSH_PUBKEY" \
+    -n "$VM_NAME" -d "$DOMAIN" -u "$VM_USER" "${STAGER_KEY_ARGS[@]}" \
     -m "$DOMAIN_STATIC_MAC" -i "$VM_IP" -s "$ISO_DIR_MAC"
 
 step "2. push host-side helper scripts to $STAGE_DIR_HOST"
