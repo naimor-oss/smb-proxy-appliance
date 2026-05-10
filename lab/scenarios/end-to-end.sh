@@ -85,6 +85,7 @@ verify() {
         # Unique filename so concurrent runs don't collide and so it's
         # obviously a test artifact if cleanup is interrupted. The proxy
         # mount uses uid=$SC_FORCE_USER so writes go out as that user.
+        # shellcheck disable=SC2155  # date(1) cannot fail in any way we'd act on
         local probe=".smb-proxy-roundtrip-$(date -u +%Y%m%dT%H%M%SZ)-$$.tmp"
         out=$(ssh_vm "sudo bash -c '
             set -e

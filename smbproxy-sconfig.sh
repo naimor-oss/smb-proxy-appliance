@@ -842,7 +842,10 @@ show_iface_table() {
     local f=/tmp/smbproxy-iface.$$
     {
         printf '%-12s %-19s %-7s %s\n' "NAME" "MAC" "STATE" "IPv4"
-        for n in $(ls -1 /sys/class/net | grep -v '^lo$'); do
+        local _net_path
+    for _net_path in /sys/class/net/*; do
+        local n="${_net_path##*/}"
+        [[ "$n" == "lo" ]] && continue
             local typ
             typ=$(cat "/sys/class/net/$n/type" 2>/dev/null || echo 0)
             [[ "$typ" == "1" ]] || continue
@@ -860,7 +863,10 @@ show_iface_table() {
 reassign_roles() {
     # Build a menu of NIC choices.
     local menu_args=()
-    for n in $(ls -1 /sys/class/net | grep -v '^lo$'); do
+    local _net_path
+    for _net_path in /sys/class/net/*; do
+        local n="${_net_path##*/}"
+        [[ "$n" == "lo" ]] && continue
         local typ
         typ=$(cat "/sys/class/net/$n/type" 2>/dev/null || echo 0)
         [[ "$typ" == "1" ]] || continue
@@ -2163,18 +2169,33 @@ shares_edit_picker() {
                     info "Backend SMB version is fixed at 1.0 for legacy profile.\nConvert this share to modern (remove + re-add) to choose a version."
                     continue
                 fi
+                # Pre-compute the per-version selection state. Inlining
+                # `$([[ ... ]] && echo ON || echo OFF)` between the
+                # whiptail args works but trips shellcheck SC2046 (word-
+                # split risk if the substitution ever yielded a multi-
+                # token string). The flat var pattern is unambiguous.
+                local cur_vers="${BACKEND_VERS:-3}"
+                local v_3 v_30 v_302 v_311 v_21 v_20 v_10 v_def
+                [[ "$cur_vers" == 3       ]] && v_3=ON   || v_3=OFF
+                [[ "$cur_vers" == 3.0     ]] && v_30=ON  || v_30=OFF
+                [[ "$cur_vers" == 3.0.2   ]] && v_302=ON || v_302=OFF
+                [[ "$cur_vers" == 3.1.1   ]] && v_311=ON || v_311=OFF
+                [[ "$cur_vers" == 2.1     ]] && v_21=ON  || v_21=OFF
+                [[ "$cur_vers" == 2.0     ]] && v_20=ON  || v_20=OFF
+                [[ "$cur_vers" == 1.0     ]] && v_10=ON  || v_10=OFF
+                [[ "$cur_vers" == default ]] && v_def=ON || v_def=OFF
                 local newvers
                 newvers=$(whiptail --title "Edit share: $name — backend SMB version" \
                     --radiolist "${body_ctx}\n\nProtocol version to negotiate with the backend:" \
                     20 76 8 \
-                    3       "SMB3 — auto-negotiate 3.0/3.1.1"          $([[ "${BACKEND_VERS:-3}" == 3       ]] && echo ON || echo OFF) \
-                    3.0     "SMB3.0 only"                              $([[ "${BACKEND_VERS:-}"  == 3.0     ]] && echo ON || echo OFF) \
-                    3.0.2   "SMB3.0.2 only"                            $([[ "${BACKEND_VERS:-}"  == 3.0.2   ]] && echo ON || echo OFF) \
-                    3.1.1   "SMB3.1.1 only"                            $([[ "${BACKEND_VERS:-}"  == 3.1.1   ]] && echo ON || echo OFF) \
-                    2.1     "SMB2.1 only"                              $([[ "${BACKEND_VERS:-}"  == 2.1     ]] && echo ON || echo OFF) \
-                    2.0     "SMB2.0 only"                              $([[ "${BACKEND_VERS:-}"  == 2.0     ]] && echo ON || echo OFF) \
-                    1.0     "SMB1 only"                                $([[ "${BACKEND_VERS:-}"  == 1.0     ]] && echo ON || echo OFF) \
-                    default "Let cifs negotiate (no vers= token)"      $([[ "${BACKEND_VERS:-}"  == default ]] && echo ON || echo OFF) \
+                    3       "SMB3 — auto-negotiate 3.0/3.1.1"          "$v_3"   \
+                    3.0     "SMB3.0 only"                              "$v_30"  \
+                    3.0.2   "SMB3.0.2 only"                            "$v_302" \
+                    3.1.1   "SMB3.1.1 only"                            "$v_311" \
+                    2.1     "SMB2.1 only"                              "$v_21"  \
+                    2.0     "SMB2.0 only"                              "$v_20"  \
+                    1.0     "SMB1 only"                                "$v_10"  \
+                    default "Let cifs negotiate (no vers= token)"      "$v_def" \
                     3>&1 1>&2 2>&3) || continue
                 BACKEND_VERS="$newvers"
                 local p
@@ -2191,12 +2212,16 @@ shares_edit_picker() {
                     info "Sealing is SMB3-only and not applicable to the legacy profile."
                     continue
                 fi
+                local cur_seal="${BACKEND_SEAL:-yes}"
+                local s_yes s_no
+                [[ "$cur_seal" == yes ]] && s_yes=ON || s_yes=OFF
+                [[ "$cur_seal" == no  ]] && s_no=ON  || s_no=OFF
                 local newseal
                 newseal=$(whiptail --title "Edit share: $name — sealing" \
                     --radiolist "${body_ctx}\n\nSMB3 wire encryption (cifs 'seal' option):" \
                     14 70 2 \
-                    yes "Encrypt backend traffic (recommended)" $([[ "${BACKEND_SEAL:-yes}" == yes ]] && echo ON || echo OFF) \
-                    no  "No encryption"                         $([[ "${BACKEND_SEAL:-}"    == no  ]] && echo ON || echo OFF) \
+                    yes "Encrypt backend traffic (recommended)" "$s_yes" \
+                    no  "No encryption"                         "$s_no"  \
                     3>&1 1>&2 2>&3) || continue
                 BACKEND_SEAL="$newseal"
                 local p
@@ -2213,13 +2238,18 @@ shares_edit_picker() {
                     info "Locking override is fixed at tps-strict for the legacy profile.\nConvert this share to modern to choose a different override."
                     continue
                 fi
+                local cur_lock="${LOCKING_OVERRIDE:-}"
+                local l_def l_relaxed l_strict
+                [[ -z "$cur_lock"           ]] && l_def=ON     || l_def=OFF
+                [[ "$cur_lock" == relaxed   ]] && l_relaxed=ON || l_relaxed=OFF
+                [[ "$cur_lock" == tps-strict ]] && l_strict=ON || l_strict=OFF
                 local newlock
                 newlock=$(whiptail --title "Edit share: $name — locking" \
                     --radiolist "${body_ctx}\n\nLocking semantics on the published frontend:" \
                     16 76 3 \
-                    profile-default "Relaxed (modern default)"           $([[ -z "${LOCKING_OVERRIDE:-}" ]] && echo ON || echo OFF) \
-                    relaxed         "Relaxed (explicit)"                 $([[ "${LOCKING_OVERRIDE:-}" == relaxed    ]] && echo ON || echo OFF) \
-                    tps-strict      "Strict — ISAM/.TPS multi-writer DB" $([[ "${LOCKING_OVERRIDE:-}" == tps-strict ]] && echo ON || echo OFF) \
+                    profile-default "Relaxed (modern default)"           "$l_def"     \
+                    relaxed         "Relaxed (explicit)"                 "$l_relaxed" \
+                    tps-strict      "Strict — ISAM/.TPS multi-writer DB" "$l_strict"  \
                     3>&1 1>&2 2>&3) || continue
                 LOCKING_OVERRIDE="$newlock"
                 [[ "$LOCKING_OVERRIDE" == "profile-default" ]] && LOCKING_OVERRIDE=""
@@ -2570,7 +2600,7 @@ diag_time() {
 
 diag_locks() {
     local out=/tmp/smbproxy-locks.$$
-    smbstatus -L 2>&1 > "$out"
+    smbstatus -L > "$out" 2>&1
     whiptail --title "smbstatus -L" --scrolltext --textbox "$out" "$WT_HEIGHT" "$WT_WIDTH"
     rm -f "$out"
 }
