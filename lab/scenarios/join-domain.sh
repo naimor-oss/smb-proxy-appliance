@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # lab/scenarios/join-domain.sh — join the SMB1<->SMB3 proxy to the
 # WS2025 forest the samba-addc-appliance lab already runs (lab.test /
 # WS2025-DC1 @ 10.10.10.10) as a member server.

@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # lab/scenarios/end-to-end.sh — single-shot release-gate test that
 # walks the whole appliance through a green-field deployment:
 #

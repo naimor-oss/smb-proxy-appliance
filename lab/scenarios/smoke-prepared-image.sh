@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # lab/scenarios/smoke-prepared-image.sh - verify the golden proxy image
 # before any domain or backend operation.
 #

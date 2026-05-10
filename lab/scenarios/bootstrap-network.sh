@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # lab/scenarios/bootstrap-network.sh — headless equivalent of the
 # smbproxy-init wizard's "assign NIC roles + bring up legacy NIC"
 # step. Without this, every other scenario (join-domain,

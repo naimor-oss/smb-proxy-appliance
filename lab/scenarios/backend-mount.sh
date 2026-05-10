@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # lab/scenarios/backend-mount.sh — configure ONE proxied share's
 # backend half via `smbproxy-sconfig --configure-share` (without
 # --group, so smb.conf is not touched), and verify the cifs mount

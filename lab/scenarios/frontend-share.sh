@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # lab/scenarios/frontend-share.sh — publish ONE proxied share end to
 # end via `smbproxy-sconfig --configure-share` WITH --group, then
 # apply the firewall. Verifies the smb.conf section has the strict-

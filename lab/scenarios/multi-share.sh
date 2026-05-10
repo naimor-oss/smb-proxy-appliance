@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # lab/scenarios/multi-share.sh — configure TWO proxied shares from
 # the SAME legacy backend with DIFFERENT credentials and DIFFERENT
 # AD access groups + force-users. This is the use case the

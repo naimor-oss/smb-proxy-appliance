@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # lab/scenarios/collision-refused.sh — NEGATIVE-path scenario.
 #
 # Verifies the AD-name-collision defense in configure_share. With the
