@@ -1385,8 +1385,25 @@ shares_list_status() {
 # Frontend pieces are skipped if not domain-joined (the operator can
 # add the share's backend pre-join and publish the frontend later).
 # BACKEND_PASS is consumed and then unset — never persisted to disk.
-# Returns 0 on success, 2 on missing required fields, 4 on testparm
-# rejection.
+# Return codes:
+#   0  success
+#   2  missing required field, or invalid --locking value
+#   4  testparm rejected the rendered smb.conf (see /tmp/smbproxy-tp.*)
+#   5  could not resolve LOCAL UID/GID for FRONT_FORCE_USER from
+#      /etc/passwd (no local account)
+#   6  could not resolve FRONT_GROUP to a SID via wbinfo (group missing,
+#      winbind unreachable, or NSS-only group with no AD presence)
+#   7  legacy-profile share but no LEGACY_NIC_NAME role assigned
+#   8  unknown PROFILE value (expected: $PROFILE_LEGACY|$PROFILE_MODERN)
+#   9  AD-name-collision REFUSAL — the chosen FRONT_FORCE_USER also
+#      exists in AD; the share is not configured. See AGENTS.md
+#      "force-user contract" and lab/scenarios/collision-refused.sh.
+#
+# Pre-flight semantics (commit 2368853): all validations that can fail
+# (UID/GID lookup, AD group SID resolve, smb.conf candidate +
+# testparm) run BEFORE any persistent writes (creds, fstab, smb.conf,
+# share-state). A non-zero return therefore leaves the filesystem
+# unchanged from the call's pre-state.
 configure_share() {
     [[ -n "$SHARE_NAME" && -n "$BACKEND_IP" && -n "$BACKEND_USER" \
         && -n "${BACKEND_PASS:-}" && -n "$BACKEND_DOMAIN" \
@@ -1607,8 +1624,10 @@ EOF
 #   - fstab line + the option list
 #   - live mount state + live option list (from /proc/mounts)
 #   - drift diff: which expected options are absent from the live mount
-#   - smb.conf section presence + identity resolution (force_user UID
-#     in /etc/passwd, valid_users SID via wbinfo)
+#   - smb.conf section presence + identity resolution
+#       * force user / force group are non-numeric usernames matching
+#         FRONT_FORCE_USER's local /etc/passwd entry
+#       * valid_users is a SID that resolves via wbinfo
 #   - backend reachability (TCP probe to BACKEND_IP:445)
 #
 # Read-only — no state mutation, no service restart. Safe to run
@@ -2021,7 +2040,7 @@ shares_add_wizard() {
         info "Share '${SHARE_NAME}' configured.\n\nUse 'Mount / unmount a share' to mount it, or just access\n${BACKEND_MOUNT} — automount triggers."
     else
         local rc=$?
-        info "configure_share failed (rc=$rc).\n  rc=2: missing required field\n  rc=4: testparm rejected the smb.conf — see /tmp/smbproxy-tp.*"
+        info "configure_share failed (rc=$rc).\n  rc=2: missing required field / bad --locking value\n  rc=4: testparm rejected the smb.conf — see /tmp/smbproxy-tp.*\n  rc=5: no /etc/passwd entry for the force-user\n  rc=6: AD group could not be resolved to a SID (winbind down? group missing?)\n  rc=7: legacy profile but no legacy NIC role assigned\n  rc=8: invalid profile value\n  rc=9: AD-name collision — '${FRONT_FORCE_USER}' also exists in AD; pick a different force-user."
     fi
     BACKEND_PASS=""
 }
@@ -2702,8 +2721,9 @@ Usage:
         profile would emit, the live /proc/mounts options, drift
         between fstab and live (with the umount/mount fix-up command),
         backend TCP/445 reachability, and identity resolution
-        (force_user UID matches /etc/passwd; valid_users SID resolves
-        via wbinfo). Safe to run during production traffic — no
+        (force_user / force_group are non-numeric usernames matching
+        FRONT_FORCE_USER's local /etc/passwd entry; valid_users SID
+        resolves via wbinfo). Safe to run during production traffic — no
         mutation, no service restart. Exit codes:
             0 — all good
             1 — drift or identity-resolution problem

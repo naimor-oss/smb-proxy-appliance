@@ -198,37 +198,16 @@ verify() {
         rc=1
     fi
 
-    # If running under the adversarial profile (force-user known to
-    # collide with an AD account), assert the WARN actually fired in
-    # /var/log/smbproxy-share.log AND that the local /etc/passwd entry
-    # exists with a UID distinct from the AD account's UID. This is
-    # the regression test for the d480a7c default-domain ambiguity bug
-    # — it cannot fail under the cooperative default profile (no
-    # collision) but it MUST fail loudly if configure_share regresses
-    # to `id NAME` under any profile that picks a colliding name.
-    if ssh_vm "id '${SC_FORCE_USER}' 2>/dev/null | grep -q 'gid=.*domain users'"; then
-        say "force-user '${SC_FORCE_USER}' collides with an AD account — adversarial-profile checks active"
-
-        say "  configure log recorded the collision WARN"
-        out=$(ssh_vm "sudo grep -E 'WARN: requested force-user' /var/log/smbproxy-share.log 2>/dev/null" || true)
-        echo "$out"
-        grep -qF "${SC_FORCE_USER}" <<< "$out" || { say "  WARN about colliding name not in /var/log/smbproxy-share.log"; rc=1; }
-
-        say "  local /etc/passwd entry was created (not just NSS-resolved to the AD account)"
-        ssh_vm "grep -q '^${SC_FORCE_USER}:' /etc/passwd" || { say "  no /etc/passwd entry for ${SC_FORCE_USER} — useradd was skipped"; rc=1; }
-
-        say "  the smb.conf force-user UID is the LOCAL one, not the AD one"
-        local local_uid ad_uid
-        local_uid=$(ssh_vm "awk -F: -v u='${SC_FORCE_USER}' '\$1==u {print \$3; exit}' /etc/passwd" 2>&1 || true)
-        ad_uid=$(ssh_vm "wbinfo --name-to-sid='${SC_FORCE_USER}' 2>/dev/null | awk '{print \$1}' | xargs -I{} wbinfo --sid-to-uid={} 2>/dev/null" || true)
-        echo "  local /etc/passwd UID=${local_uid}; AD UID=${ad_uid}; smb.conf UID=${fu_uid_smb}"
-        if [[ -n "$local_uid" && -n "$fu_uid_smb" && "$local_uid" != "$fu_uid_smb" ]]; then
-            say "  smb.conf UID $fu_uid_smb does not match local /etc/passwd UID $local_uid — defense breach"; rc=1
-        fi
-        if [[ -n "$ad_uid" && "$ad_uid" == "$fu_uid_smb" ]]; then
-            say "  smb.conf UID $fu_uid_smb is the AD UID, NOT the local /etc/passwd UID — defense breach"; rc=1
-        fi
-    fi
+    # AD-name-collision is now a REFUSAL (rc=9) at configure time, so
+    # there is no "WARN + local-shadow-user + UID-comparison" branch
+    # to exercise here — the configure_share short-circuit prevents
+    # any of those artifacts from existing for a colliding name. The
+    # negative path lives in lab/scenarios/collision-refused.sh,
+    # which asserts rc=9 and verifies no creds/fstab/smb.conf/share-
+    # state/passwd entries leaked from the refused attempt. This
+    # scenario only exercises ACCEPT paths (default profile +
+    # adversarial-positive); a colliding force-user under those
+    # profiles would itself be a misconfiguration, not a regression.
 
     return "$rc"
 }
