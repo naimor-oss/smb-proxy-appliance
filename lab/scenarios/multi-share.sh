@@ -163,33 +163,65 @@ verify() {
     fstab_lines=$(grep -c 'cifs ' <<< "$out" 2>/dev/null || echo 0)
     [[ "${fstab_lines:-0}" -ge 2 ]] || { say "expected ≥2 cifs lines in fstab, got $fstab_lines"; rc=1; }
 
-    say "smb.conf has BOTH share sections with their own (numeric) force user + (SID) valid users"
+    say "smb.conf has BOTH share sections with their own (username) force user + (SID) valid users"
     for s in "$SC_SHARE_A" "$SC_SHARE_B"; do
         out=$(ssh_vm "sudo grep -n \"^\\[$s\\]\" /etc/samba/smb.conf" 2>&1 || true)
         [[ -n "$out" ]] || { say "smb.conf missing [$s] section"; rc=1; }
     done
-    # Per-section content check. force user / force group are written
-    # as numeric LOCAL UID/GID (default-domain ambiguity defense), and
-    # valid users is written as a SID (NSS-independent, immune to the
-    # default-domain @"DOMAIN\Group" parsing quirk in Samba 4.22).
-    local sec_a sec_b uid_a uid_b sid_a sid_b
+    # Per-section content check. force user / force group are now written
+    # as the LOCAL username (Samba's getpwnam() needs a name string;
+    # numeric strings don't resolve there). The default-domain ambiguity
+    # defense lives at write time — wbinfo --name-to-sid REFUSES the
+    # config (rc=9) if the chosen name also exists in AD, and the
+    # appliance's NSS files-first ordering means the local /etc/passwd
+    # entry always wins over winbind. valid users stays as a SID for
+    # the unrelated @"DOMAIN\Group" parsing-quirk defense.
+    local sec_a sec_b user_a user_b sid_a sid_b uid_a uid_b
     sec_a=$(ssh_vm "sudo awk -v s='[$SC_SHARE_A]' 'BEGIN{p=0} \$0==s{p=1; print; next} /^\\[/{p=0} p' /etc/samba/smb.conf" 2>&1 || true)
     sec_b=$(ssh_vm "sudo awk -v s='[$SC_SHARE_B]' 'BEGIN{p=0} \$0==s{p=1; print; next} /^\\[/{p=0} p' /etc/samba/smb.conf" 2>&1 || true)
-    grep -qE '^[[:space:]]*force user[[:space:]]*=[[:space:]]*[0-9]+'  <<< "$sec_a" || { say "[$SC_SHARE_A] force user not numeric";  rc=1; }
-    grep -qE '^[[:space:]]*force user[[:space:]]*=[[:space:]]*[0-9]+'  <<< "$sec_b" || { say "[$SC_SHARE_B] force user not numeric";  rc=1; }
-    grep -qE '^[[:space:]]*valid users[[:space:]]*=[[:space:]]*S-1-'   <<< "$sec_a" || { say "[$SC_SHARE_A] valid users not a SID";   rc=1; }
-    grep -qE '^[[:space:]]*valid users[[:space:]]*=[[:space:]]*S-1-'   <<< "$sec_b" || { say "[$SC_SHARE_B] valid users not a SID";   rc=1; }
-    # Cross-check: the two sections MUST have distinct UIDs and SIDs —
-    # the whole point of multi-share is independent identities.
-    uid_a=$(grep -oE 'force user[[:space:]]*=[[:space:]]*[0-9]+' <<< "$sec_a" | grep -oE '[0-9]+$' | head -1)
-    uid_b=$(grep -oE 'force user[[:space:]]*=[[:space:]]*[0-9]+' <<< "$sec_b" | grep -oE '[0-9]+$' | head -1)
+    grep -qE '^[[:space:]]*force user[[:space:]]*=[[:space:]]*[A-Za-z_][A-Za-z0-9_-]*[[:space:]]*$' <<< "$sec_a" \
+        || { say "[$SC_SHARE_A] force user not a username"; rc=1; }
+    grep -qE '^[[:space:]]*force user[[:space:]]*=[[:space:]]*[A-Za-z_][A-Za-z0-9_-]*[[:space:]]*$' <<< "$sec_b" \
+        || { say "[$SC_SHARE_B] force user not a username"; rc=1; }
+    # Belt-and-suspenders: a numeric force user would silently break
+    # tree-connect via getpwnam("1003") — pin the regression both ways.
+    grep -qE '^[[:space:]]*force user[[:space:]]*=[[:space:]]*[0-9]+[[:space:]]*$' <<< "$sec_a" \
+        && { say "[$SC_SHARE_A] force user is numeric (Samba getpwnam() would fail)"; rc=1; }
+    grep -qE '^[[:space:]]*force user[[:space:]]*=[[:space:]]*[0-9]+[[:space:]]*$' <<< "$sec_b" \
+        && { say "[$SC_SHARE_B] force user is numeric (Samba getpwnam() would fail)"; rc=1; }
+    grep -qE '^[[:space:]]*valid users[[:space:]]*=[[:space:]]*S-1-' <<< "$sec_a" \
+        || { say "[$SC_SHARE_A] valid users not a SID"; rc=1; }
+    grep -qE '^[[:space:]]*valid users[[:space:]]*=[[:space:]]*S-1-' <<< "$sec_b" \
+        || { say "[$SC_SHARE_B] valid users not a SID"; rc=1; }
+    # Cross-check: the two sections MUST name DIFFERENT force-users and
+    # carry DIFFERENT SIDs — the whole point of multi-share is independent
+    # identities. We additionally cross-check that each force-user's
+    # /etc/passwd UID exists locally (resolves via files NSS, not winbind).
+    user_a=$(grep -oE 'force user[[:space:]]*=[[:space:]]*[A-Za-z_][A-Za-z0-9_-]*' <<< "$sec_a" \
+        | sed -E 's/^force user[[:space:]]*=[[:space:]]*//' | head -1)
+    user_b=$(grep -oE 'force user[[:space:]]*=[[:space:]]*[A-Za-z_][A-Za-z0-9_-]*' <<< "$sec_b" \
+        | sed -E 's/^force user[[:space:]]*=[[:space:]]*//' | head -1)
     sid_a=$(grep -oE 'valid users[[:space:]]*=[[:space:]]*S-1-[0-9-]+' <<< "$sec_a" | awk -F= '{gsub(/^[[:space:]]+|[[:space:]]+$/,"",$2); print $2}')
     sid_b=$(grep -oE 'valid users[[:space:]]*=[[:space:]]*S-1-[0-9-]+' <<< "$sec_b" | awk -F= '{gsub(/^[[:space:]]+|[[:space:]]+$/,"",$2); print $2}')
-    if [[ -n "$uid_a" && "$uid_a" == "$uid_b" ]]; then
-        say "shares A and B share the same force-user UID $uid_a — multi-share independence broken"; rc=1
+    if [[ -n "$user_a" && "$user_a" == "$user_b" ]]; then
+        say "shares A and B share the same force-user '$user_a' — multi-share independence broken"; rc=1
     fi
     if [[ -n "$sid_a" && "$sid_a" == "$sid_b" ]]; then
         say "shares A and B share the same valid-users SID — distinct AD groups expected"; rc=1
+    fi
+    # Resolve each force-user's UID via /etc/passwd files-only (matches
+    # the contract: cifs uid=/gid= mount options are numeric and must
+    # come from /etc/passwd, NOT winbind).
+    if [[ -n "$user_a" ]]; then
+        uid_a=$(ssh_vm "awk -F: -v u='${user_a}' '\$1==u {print \$3; exit}' /etc/passwd" 2>&1 || true)
+        [[ -n "$uid_a" ]] || { say "[$SC_SHARE_A] no /etc/passwd entry for force-user '$user_a'"; rc=1; }
+    fi
+    if [[ -n "$user_b" ]]; then
+        uid_b=$(ssh_vm "awk -F: -v u='${user_b}' '\$1==u {print \$3; exit}' /etc/passwd" 2>&1 || true)
+        [[ -n "$uid_b" ]] || { say "[$SC_SHARE_B] no /etc/passwd entry for force-user '$user_b'"; rc=1; }
+    fi
+    if [[ -n "$uid_a" && -n "$uid_b" && "$uid_a" == "$uid_b" ]]; then
+        say "shares A and B resolve to the same /etc/passwd UID $uid_a — independence breach"; rc=1
     fi
 
     say "testparm -s reports no warnings for the combined config"
@@ -217,62 +249,14 @@ verify() {
     grep -qF "$SC_SHARE_A" <<< "$out" || { say "smbclient -L missing $SC_SHARE_A"; rc=1; }
     grep -qF "$SC_SHARE_B" <<< "$out" || { say "smbclient -L missing $SC_SHARE_B"; rc=1; }
 
-    # Adversarial-profile checks: if either force-user collides with an
-    # AD account, verify the d480a7c default-domain ambiguity defense
-    # held under multi-share. The check self-activates when collision
-    # is detected on the live system — no need to gate on $PROFILE_NAME.
-    # Run BEFORE the destructive --remove-share step so both shares are
-    # still in place to inspect.
-    _multi_share_collision_check() {
-        local share_name="$1" force_user="$2" smb_section="$3"
-        local smb_uid file_uid ad_uid
-
-        say "  ${share_name}: configure log recorded the collision WARN"
-        out=$(ssh_vm "sudo grep -E \"WARN: requested force-user '${force_user}'\" /var/log/smbproxy-share.log 2>/dev/null" || true)
-        echo "$out"
-        [[ -n "$out" ]] || { say "  WARN about colliding name '${force_user}' not in /var/log/smbproxy-share.log"; rc=1; }
-
-        say "  ${share_name}: local /etc/passwd entry exists for '${force_user}'"
-        ssh_vm "grep -q '^${force_user}:' /etc/passwd" || { say "  no /etc/passwd entry for ${force_user} — useradd was skipped"; rc=1; }
-
-        say "  ${share_name}: smb.conf force-user UID is the LOCAL one, not the AD one"
-        smb_uid=$(grep -oE 'force user[[:space:]]*=[[:space:]]*[0-9]+' <<< "$smb_section" | grep -oE '[0-9]+$' | head -1)
-        file_uid=$(ssh_vm "awk -F: -v u='${force_user}' '\$1==u {print \$3; exit}' /etc/passwd" 2>&1 || true)
-        ad_uid=$(ssh_vm "wbinfo --name-to-sid='${force_user}' 2>/dev/null | awk '{print \$1}' | xargs -I{} wbinfo --sid-to-uid={} 2>/dev/null" || true)
-        echo "  ${share_name}: local=${file_uid} AD=${ad_uid} smb.conf=${smb_uid}"
-        if [[ -n "$file_uid" && -n "$smb_uid" && "$file_uid" != "$smb_uid" ]]; then
-            say "  ${share_name}: smb.conf UID $smb_uid != local /etc/passwd UID $file_uid — defense breach"; rc=1
-        fi
-        if [[ -n "$ad_uid" && "$ad_uid" == "$smb_uid" ]]; then
-            say "  ${share_name}: smb.conf UID $smb_uid is the AD UID — defense breach"; rc=1
-        fi
-    }
-
-    if ssh_vm "id '${SC_FORCE_USER_A}' 2>/dev/null | grep -q 'gid=.*domain users'"; then
-        say "share A force-user '${SC_FORCE_USER_A}' collides with an AD account — adversarial checks active"
-        _multi_share_collision_check "[$SC_SHARE_A]" "$SC_FORCE_USER_A" "$sec_a"
-    fi
-    if ssh_vm "id '${SC_FORCE_USER_B}' 2>/dev/null | grep -q 'gid=.*domain users'"; then
-        say "share B force-user '${SC_FORCE_USER_B}' collides with an AD account — adversarial checks active"
-        _multi_share_collision_check "[$SC_SHARE_B]" "$SC_FORCE_USER_B" "$sec_b"
-    fi
-
-    # When BOTH force-users collide with AD accounts, additionally
-    # confirm the two LOCAL accounts ended up with distinct UIDs (i.e.
-    # we actually created two separate /etc/passwd entries — not
-    # silently reused one). This is the adversarial mirror of the
-    # standard multi-share independence cross-check above.
-    if ssh_vm "id '${SC_FORCE_USER_A}' 2>/dev/null | grep -q 'gid=.*domain users'" && \
-       ssh_vm "id '${SC_FORCE_USER_B}' 2>/dev/null | grep -q 'gid=.*domain users'"; then
-        say "both force-users collide with AD — checking the two LOCAL UIDs are distinct"
-        local local_uid_a local_uid_b
-        local_uid_a=$(ssh_vm "awk -F: -v u='${SC_FORCE_USER_A}' '\$1==u {print \$3; exit}' /etc/passwd" 2>&1 || true)
-        local_uid_b=$(ssh_vm "awk -F: -v u='${SC_FORCE_USER_B}' '\$1==u {print \$3; exit}' /etc/passwd" 2>&1 || true)
-        echo "  local UIDs: A=${local_uid_a} B=${local_uid_b}"
-        if [[ -n "$local_uid_a" && "$local_uid_a" == "$local_uid_b" ]]; then
-            say "  both local accounts share UID $local_uid_a — useradd was reused, not separate"; rc=1
-        fi
-    fi
+    # AD-name collision is now a REFUSAL (rc=9) at configure time, not
+    # a warn-and-allow. The historical "multi-share collision check"
+    # block that lived here verified that warn-and-allow stayed sane
+    # under multi-share; it is unreachable now (configure_share short-
+    # circuits before any share writes happen). The negative path is
+    # exercised by lab/scenarios/collision-refused.sh, which expects
+    # rc=9 and verifies no creds / fstab / smb.conf / share-state /
+    # local-passwd entries leaked from the refused attempt.
 
     say "removing share B leaves share A intact"
     # The destructive part of this scenario — exercises remove_share

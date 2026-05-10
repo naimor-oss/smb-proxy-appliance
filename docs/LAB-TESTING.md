@@ -266,14 +266,24 @@ Verification:
 - The `[$SC_SHARE_NAME]` block exists in `smb.conf` with
   `oplocks=no`, `level2 oplocks=no`, `strict locking=yes`,
   `kernel oplocks=no`, `posix locking=yes`, the configured `path`,
-  and the identity stanza in its strict numeric-/SID-only form:
-  `force user = <numeric UID>`, `force group = <numeric GID>`, and
-  `valid users = <SID>`. Symbolic forms (`force user = NAME`,
-  `valid users = @"DOMAIN\Group"`) are NOT accepted by the verify
-  step — they re-introduce the default-domain ambiguity bug
-  diagnosed in production 2026-05-05. The verify also cross-checks
-  that the UID matches `/etc/passwd` for `SC_FORCE_USER` and that
-  the SID resolves back to `SC_GROUP` via `wbinfo --sid-to-name`.
+  and the identity stanza in its contract-correct form:
+  `force user = <username>`, `force group = <username>`, and
+  `valid users = <SID>`. The `force user`/`force group` values are
+  USERNAMES, not numeric UIDs/GIDs — Samba resolves these via
+  `getpwnam()`, and `getpwnam("1003")` fails even when the UID is
+  valid, causing `NT_STATUS_NO_SUCH_USER` at tree-connect (confirmed
+  2026-05-07). The cifs `uid=`/`gid=` mount options in `/etc/fstab`
+  stay numeric — those ARE UID/GID values to the kernel cifs driver.
+  AD-name collision is handled at write time: configure_share calls
+  `wbinfo --name-to-sid` on the chosen force-user and REFUSES (rc=9)
+  if the name resolves in AD, before any creds/fstab/smb.conf/
+  share-state writes happen. The verify step asserts:
+    - `force user`/`force group` match `^[A-Za-z_][A-Za-z0-9_-]*$`
+    - a NUMERIC `force user` is actively rejected (regression pin)
+    - the username in smb.conf matches `SC_FORCE_USER`
+    - `/etc/passwd` files-only resolves it to a real UID
+    - `valid users` is a SID that resolves back to `SC_GROUP` via
+      `wbinfo --sid-to-name`
 - `testparm -s` reports no warnings/errors.
 - `smbd` is listening on 445/tcp; nmbd-style 137/138 sockets are
   not open.
@@ -314,10 +324,12 @@ Verification:
   mode 0600 root:root, each with its own username.
 - Two distinct fstab cifs lines with distinct `credentials=` paths.
 - Two distinct `[SHARE]` sections in `smb.conf`, each with its own
-  numeric `force user` / `force group` and SID-form `valid users`.
-  Cross-check: the two sections must have DISTINCT UIDs and
-  DISTINCT SIDs — sharing either would defeat the multi-share
-  independence guarantee.
+  username-form `force user` / `force group` and SID-form
+  `valid users`. Cross-check: the two sections must name DIFFERENT
+  force-users, those usernames must each resolve via `/etc/passwd`
+  files-only to a UID, the two UIDs must be DISTINCT, and the two
+  SIDs must be DISTINCT — sharing any of these would defeat the
+  multi-share independence guarantee.
 - `testparm -s` clean for the combined config.
 - `smbproxy-sconfig --list-shares` enumerates both.
 - `smbproxy-sconfig --status` shows both as active with
@@ -363,6 +375,49 @@ Run:
 lab/run-scenario.sh end-to-end
 SC_WRITE_ROUNDTRIP=1 lab/run-scenario.sh end-to-end
 ```
+
+### `collision-refused`
+
+Purpose: NEGATIVE-path test for the AD-name collision defense in
+`configure_share`. With the proxy domain-joined and `winbind use
+default domain = yes`, picking a force-user name that ALSO exists
+in AD would silently capture the mapping at tree-connect (prod
+incident 2026-05-05). The defense is `wbinfo --name-to-sid` BEFORE
+any persistent writes, returning rc=9 if the name resolves.
+
+Driven by `lab/profiles/adversarial-collision.env`
+(`SC_FORCE_USER=Administrator`). The scenario:
+
+1. Snapshots whether each verifiable artifact already exists on
+   the proxy (so the verify can require a no-DELTA outcome
+   regardless of what the test left from earlier runs).
+2. Invokes `--configure-share --force-user Administrator` against
+   a domain-joined proxy.
+3. Asserts rc=9.
+4. Asserts that the refused attempt left NO new state behind:
+   no creds file, no fstab cifs line, no smb.conf section, no
+   per-share state file, AND no new `/etc/passwd` entry for the
+   colliding name (the wbinfo guard fires before useradd).
+
+```bash
+lab/run-scenario.sh collision-refused --profile adversarial-collision
+```
+
+The companion POSITIVE adversarial profile is
+`adversarial-positive` (weird-but-valid inputs that the appliance
+should accept, e.g. shop-flavor non-AD-colliding force-users like
+`tubelaser` / `millhand`, single-word AD groups, and a share name
+with both a `$`-suffix and a dot). Use it with the standard
+scenarios:
+
+```bash
+lab/run-scenario.sh frontend-share --profile adversarial-positive
+lab/run-scenario.sh multi-share    --profile adversarial-positive
+```
+
+Do NOT use `--profile adversarial-collision` with frontend-share
+/ multi-share / etc.; those expect rc=0 and would all fail by
+design with a force-user that the appliance refuses.
 
 ## Important Tests To Add
 
