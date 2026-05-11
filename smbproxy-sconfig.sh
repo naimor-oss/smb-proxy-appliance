@@ -98,6 +98,22 @@ yesno() {
     fi
 }
 
+# info_text — sized dialog for message bodies that contain LITERAL
+# backslashes (DOMAIN\Group examples, UNC paths). Delegates to
+# appcore_tui_show_text which uses --textbox and reads the body
+# byte-for-byte, so `LAB\Domain Admins` displays as-is instead of
+# whiptail interpreting `\D` / `\A` as escape sequences.
+# Fallback doubles `\` so single-backslash content still renders
+# correctly under the --msgbox path.
+info_text() {
+    local title="$1" body="$2"
+    if command -v appcore_tui_show_text >/dev/null 2>&1; then
+        appcore_tui_show_text "$title" "$body"
+    else
+        info "${body//\\/\\\\}"
+    fi
+}
+
 check_root() {
     if [[ $EUID -ne 0 ]]; then
         echo "ERROR: Run as root (sudo smbproxy-sconfig)." >&2
@@ -2061,7 +2077,9 @@ shares_add_wizard() {
                 FRONT_GROUP=$(appcore_id_domgroup_normalize "$_raw_group")
                 break
             fi
-            info "Invalid AD group name. Examples of accepted forms:\n  ${DOMAIN_SHORT:-LAB}\\\\Domain Admins\n  ${DOMAIN_SHORT:-LAB}\\\\Engineering Users"
+            info_text "Invalid AD group" "Invalid AD group name. Examples of accepted forms:
+  ${DOMAIN_SHORT:-LAB}\\Domain Admins
+  ${DOMAIN_SHORT:-LAB}\\Engineering Users"
         done
     else
         info "Not domain-joined — backend will be configured but the\nfrontend [smb.conf] section is skipped. Re-run Edit after\njoining the domain to publish the share."
@@ -2154,7 +2172,9 @@ shares_edit_picker() {
                         FRONT_GROUP=$(appcore_id_domgroup_normalize "$_raw_grp")
                         break
                     fi
-                    info "Invalid AD group name. Examples:\n  LAB\\\\Domain Admins\n  LAB\\\\Engineering Users"
+                    info_text "Invalid AD group" "Invalid AD group name. Examples:
+  LAB\\Domain Admins
+  LAB\\Engineering Users"
                 done
                 save_share
                 # Need a re-write of smb.conf, which configure_share does.
