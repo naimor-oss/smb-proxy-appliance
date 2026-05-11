@@ -2044,9 +2044,25 @@ shares_add_wizard() {
     done <<< "$existing_names"
 
     if is_joined; then
-        FRONT_GROUP=$(whiptail --title "Add proxied share — AD access group" \
-            --inputbox "${body_ctx}\n\nAD security group authorized to use this share.\nFormat: DOMAIN_SHORT\\Group Name (e.g. ${DOMAIN_SHORT:-LAB}\\${SHARE_NAME%\$} Users).\nThe @\"\" wrapper in smb.conf is added automatically." \
-            14 74 "${DOMAIN_SHORT:-DOMAIN}\\${SHARE_NAME%\$} Users" 3>&1 1>&2 2>&3) || { BACKEND_PASS=""; return; }
+        # Loop on appcore_id_domgroup_validate so the operator can
+        # type any of the accepted forms (literal space, '\ ' shell
+        # escape, double-backslash, quoted) and a bad input gets a
+        # clear retry instead of a silent acceptance that fails later
+        # at wbinfo. The validator surfaces the same accept set as
+        # the samba-addc sudo-grant site (field-bug Phase 1).
+        local _raw_group _validate_err
+        while true; do
+            _raw_group=$(whiptail --title "Add proxied share — AD access group" \
+                --inputbox "${body_ctx}\n\nAD security group authorized to use this share.\nFormat: DOMAIN_SHORT\\Group Name (e.g. ${DOMAIN_SHORT:-LAB}\\${SHARE_NAME%\$} Users).\nThe @\"\" wrapper in smb.conf is added automatically." \
+                14 74 "${DOMAIN_SHORT:-DOMAIN}\\${SHARE_NAME%\$} Users" 3>&1 1>&2 2>&3) || { BACKEND_PASS=""; return; }
+            if appcore_id_domgroup_validate "$_raw_group" 2>/dev/null; then
+                # Canonicalize to the smb.conf-ready form so display +
+                # config storage agree on the single form.
+                FRONT_GROUP=$(appcore_id_domgroup_normalize "$_raw_group")
+                break
+            fi
+            info "Invalid AD group name. Examples of accepted forms:\n  ${DOMAIN_SHORT:-LAB}\\\\Domain Admins\n  ${DOMAIN_SHORT:-LAB}\\\\Engineering Users"
+        done
     else
         info "Not domain-joined — backend will be configured but the\nfrontend [smb.conf] section is skipped. Re-run Edit after\njoining the domain to publish the share."
     fi
@@ -2127,9 +2143,19 @@ shares_edit_picker() {
                 BACKEND_PASS=""
                 ;;
             2)
-                FRONT_GROUP=$(whiptail --title "Edit share: $name — AD group" \
-                    --inputbox "${body_ctx}\n\nAD security group authorized:" 12 70 \
-                    "$FRONT_GROUP" 3>&1 1>&2 2>&3) || continue
+                # Same validate-loop as the add-wizard: accept any
+                # form, canonicalize via appcore, retry on bad input.
+                local _raw_grp _err
+                while true; do
+                    _raw_grp=$(whiptail --title "Edit share: $name — AD group" \
+                        --inputbox "${body_ctx}\n\nAD security group authorized:" 12 70 \
+                        "$FRONT_GROUP" 3>&1 1>&2 2>&3) || continue 2
+                    if appcore_id_domgroup_validate "$_raw_grp" 2>/dev/null; then
+                        FRONT_GROUP=$(appcore_id_domgroup_normalize "$_raw_grp")
+                        break
+                    fi
+                    info "Invalid AD group name. Examples:\n  LAB\\\\Domain Admins\n  LAB\\\\Engineering Users"
+                done
                 save_share
                 # Need a re-write of smb.conf, which configure_share does.
                 # But it requires BACKEND_PASS — re-prompt.
