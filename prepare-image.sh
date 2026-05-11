@@ -487,13 +487,47 @@ table inet filter {
         # Legacy NIC carries no listeners. Drop everything inbound; the
         # established/related rule above lets backend SMB1 replies through.
 
-        log prefix "nft-drop: " limit rate 5/minute
+        # level info keeps drop messages off the system console (see
+        # /etc/sysctl.d/30-quiet-console.conf for the printk threshold).
+        log prefix "nft-drop: " level info limit rate 5/minute
         drop
     }
     chain forward { type filter hook forward priority 0; policy drop; }
     chain output  { type filter hook output priority 0; policy accept; }
 }
 NFTEOF
+
+#===============================================================================
+# 18b. CONSOLE QUIET + JOURNALD CAPS
+#
+# Same defaults as the samba-addc sibling — see that file's matching
+# section for the full rationale. Short version:
+#   1. Pin printk console threshold to 4 so kernel info/debug lines
+#      (most visibly nftables drop logs) stay off the system console.
+#   2. Cap journald at 200M total / 50M per file so a chatty kernel
+#      doesn't fill the rootfs.
+#===============================================================================
+log "Installing console-quiet + journald-size drop-ins..."
+cat > /etc/sysctl.d/30-quiet-console.conf <<'SYSCTLEOF'
+# Only WARN and above print to console. info/notice/debug still land
+# in journald (`journalctl -k`) but don't reach /dev/console. The
+# nftables `log` rules use `level info` to land just above this
+# threshold.
+kernel.printk = 4 4 1 7
+SYSCTLEOF
+chmod 0644 /etc/sysctl.d/30-quiet-console.conf
+
+install -d -m 0755 /etc/systemd/journald.conf.d
+cat > /etc/systemd/journald.conf.d/30-appliance-caps.conf <<'JOURNALEOF'
+# Cap journald disk usage. Journald rotates automatically at
+# SystemMaxFileSize, deletes oldest archives when SystemMaxUse is
+# exceeded, and reserves SystemKeepFree free space for other writers.
+[Journal]
+SystemMaxUse=200M
+SystemMaxFileSize=50M
+SystemKeepFree=200M
+JOURNALEOF
+chmod 0644 /etc/systemd/journald.conf.d/30-appliance-caps.conf
 
 #===============================================================================
 # 19. FIRST-BOOT HOST INTEGRATION
