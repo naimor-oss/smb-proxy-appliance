@@ -69,9 +69,34 @@ if [[ -d "$APPCORE_LIBS" ]]; then
     [[ -f "$APPCORE_LIBS/netconfig.sh"  ]] && source "$APPCORE_LIBS/netconfig.sh"
 fi
 
-die()  { whiptail --msgbox "FATAL: $*" 10 60; exit 1; }
-info() { whiptail --msgbox "$*" 12 64; }
-yesno(){ whiptail --yesno "$*" 10 60; }
+# info / yesno / die delegate to appliance-core's sized whiptail
+# wrappers when available. The old hand-fixed dimensions (12x64,
+# 10x60) clipped wide content and looked starved on roomy consoles;
+# the appcore variants compute size from `tput` and cap at 24x100
+# for readability. Fallbacks preserve the old behavior when the
+# lib isn't vendored (older images, smoke tests).
+die() {
+    if command -v appcore_tui_msgbox >/dev/null 2>&1; then
+        appcore_tui_msgbox "FATAL: $*"
+    else
+        whiptail --msgbox "FATAL: $*" 10 60
+    fi
+    exit 1
+}
+info() {
+    if command -v appcore_tui_msgbox >/dev/null 2>&1; then
+        appcore_tui_msgbox "$*"
+    else
+        whiptail --msgbox "$*" 12 64
+    fi
+}
+yesno() {
+    if command -v appcore_tui_yesno >/dev/null 2>&1; then
+        appcore_tui_yesno "$*"
+    else
+        whiptail --yesno "$*" 10 60
+    fi
+}
 
 check_root() {
     if [[ $EUID -ne 0 ]]; then
