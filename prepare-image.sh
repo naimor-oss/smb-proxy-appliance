@@ -734,13 +734,29 @@ printf '%s\n' "$RECS" | tee -a "$LOGFILE"
 log ""
 log "checking image freshness (apt-get update + upgradable count)..."
 APT_FRESHNESS=""
+apt_update_with_lock_retry() {
+    local attempt
+    for attempt in $(seq 1 12); do
+        if apt-get update -qq >>"$LOGFILE" 2>&1; then
+            return 0
+        fi
+        if tail -n 6 "$LOGFILE" \
+            | grep -qE 'Could not get lock|Unable to lock'; then
+            log "  apt lock busy; retrying freshness check (${attempt}/12)"
+            sleep 5
+        else
+            return 1
+        fi
+    done
+    return 1
+}
 for _ in $(seq 1 10); do
     [[ -n "$(ip route show default 2>/dev/null)" ]] && break
     sleep 2
 done
 if [[ -z "$(ip route show default 2>/dev/null)" ]]; then
     APT_FRESHNESS="apt: offline (no default route) — freshness check skipped"
-elif apt-get update -qq >>"$LOGFILE" 2>&1; then
+elif apt_update_with_lock_retry; then
     upg=$(apt list --upgradable 2>/dev/null | grep -cv '^Listing')
     sec=$(apt list --upgradable 2>/dev/null | grep -c -- '-security' || true)
     if [[ "$upg" -eq 0 ]]; then

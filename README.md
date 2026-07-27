@@ -26,12 +26,13 @@ other shop-floor appliances that need to be consolidated into DFS-N — see
 
 The proxy appliance is exercised against the same Windows Server 2025
 forest that the [`samba-addc-appliance`](../samba-addc-appliance/) sibling
-joins. The lab is built from five sibling repositories living next to each
+joins. The lab is built from six sibling repositories living next to each
 other on disk:
 
 - [`dev-commons`](../dev-commons/) — cross-cutting docs, templates, tooling
 - [`lab-kit`](../lab-kit/) — reusable appliance lab orchestration
 - [`lab-router`](../lab-router/) — simple reusable lab router VM
+- [`appliance-core`](../appliance-core/) — shared runtime libraries vendored during image preparation
 - [`samba-addc-appliance`](../samba-addc-appliance/) — Samba AD DC member
   test fixture (the proxy joins as a domain member of the WS2025 forest;
   the Samba sibling exists for separate testing)

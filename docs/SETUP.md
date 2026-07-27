@@ -180,11 +180,12 @@ places you need to touch for host-specific settings.
 ## Verify Your Setup
 
 Run these from the `smb-proxy-appliance/` directory after cloning all
-four repos. Every line should succeed.
+six repositories. Every line should succeed.
 
 ```bash
 # 1. The siblings exist at the expected paths.
-ls -d ../lab-kit ../lab-router ../samba-addc-appliance >/dev/null && echo "siblings OK"
+ls -d ../appliance-core ../dev-commons ../lab-kit ../lab-router \
+    ../samba-addc-appliance >/dev/null && echo "siblings OK"
 
 # 2. Mac tools.
 for t in qemu-img hdiutil curl ssh scp git; do

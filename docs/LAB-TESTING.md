@@ -180,7 +180,8 @@ Verification:
   krbtgt entry.
 - `/etc/krb5.conf` no longer mentions `YOURREALM.LAN`; default_realm
   is the deployed realm.
-- chrony's source is the DC (or its FQDN), not a public pool.
+- chrony includes the DC (or its FQDN) as an AD time source; the documented
+  public fallback may also remain for DCs that do not serve NTP.
 - `smb.conf` reflects `realm=lab.test`, `workgroup=LAB`,
   `security=ads`.
 - `Get-ADComputer smbproxy-1` succeeds on WS2025-DC1.

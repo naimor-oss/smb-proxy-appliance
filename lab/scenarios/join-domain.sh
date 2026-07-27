@@ -43,15 +43,12 @@ do_ad_cleanup_proxy() {
     local dry_note=""
     [[ "${SC_DRY_CLEANUP:-0}" == "1" ]] && dry_note=" (dry-run)"
     step "remove smbproxy-1 computer account from WS2025-DC1${dry_note}"
-    # A member-server join leaves only the computer account in AD —
-    # no NTDS Settings, no replication links, no SYSVOL Policies. The
-    # cleanup is correspondingly simpler than the samba sibling's
-    # Reset-LabDomainState.ps1.
-    if [[ "${SC_DRY_CLEANUP:-0}" == "1" ]]; then
-        ssh_host "pwsh -Command \"Get-ADComputer -Identity 'smbproxy-1' -ErrorAction SilentlyContinue | Format-List Name,DistinguishedName,Enabled\""
-    else
-        ssh_host "pwsh -Command \"Get-ADComputer -Identity 'smbproxy-1' -ErrorAction SilentlyContinue | Remove-ADComputer -Confirm:\\\$false; Write-Host 'cleanup ok'\""
-    fi
+    # Reuse the Samba lab's PowerShell Direct helper with a single-host
+    # pattern. That guarantees the query runs inside WS2025-DC1's lab.test
+    # domain rather than against the Hyper-V host's own domain context.
+    local dry=""
+    [[ "${SC_DRY_CLEANUP:-0}" == "1" ]] && dry="-DryRun"
+    ssh_host "pwsh -NoProfile -File ${LAB_HOST_STAGE_DIR}\\Reset-LabDomainState.ps1 -Pattern 'smbproxy-1' $dry"
 }
 
 do_join_domain() {
@@ -113,14 +110,12 @@ verify() {
     grep -qiE "default_realm[[:space:]]*=[[:space:]]*${SC_REALM_UC}" <<< "$out" \
         || { say "krb5.conf default_realm != $SC_REALM_UC"; rc=1; }
 
-    say "chrony source is the DC, not a public pool"
+    say "chrony includes the joined DC as an AD time source"
     out=$(ssh_vm 'grep -E "^(server|pool) " /etc/chrony/chrony.conf || true' 2>&1 || true)
     echo "$out"
-    if grep -qE 'time\.cloudflare|time\.google|debian\.pool' <<< "$out"; then
-        say "chrony.conf has a public pool baked in"; rc=1
-    fi
-    # Allow either the DC IP or its FQDN as an acceptable source.
-    if [[ -n "$out" ]] && ! grep -qE "(${SC_DC}\b|WS2025-DC1|dc[0-9]?\.${SC_REALM})" <<< "$out"; then
+    # A public fallback is intentional: Windows time service is not always
+    # configured to serve NTP even when the DC is otherwise healthy.
+    if [[ -z "$out" ]] || ! grep -qE "(${SC_DC}\b|WS2025-DC1|dc[0-9]?\.${SC_REALM})" <<< "$out"; then
         say "chrony source is set but doesn't reference the DC ($SC_DC)"; rc=1
     fi
 
@@ -132,9 +127,11 @@ verify() {
     grep -qiE "security[[:space:]]*=[[:space:]]*ads" <<< "$out" || { say "smb.conf security != ads"; rc=1; }
 
     say "computer account is visible from WS2025-DC1"
-    out=$(ssh_host "pwsh -Command \"Get-ADComputer -Identity 'smbproxy-1' | Format-List Name,DistinguishedName,Enabled\"" 2>&1 || true)
+    out=$(ssh_host "pwsh -NoProfile -File ${LAB_HOST_STAGE_DIR}\\Reset-LabDomainState.ps1 -Pattern 'smbproxy-1' -DryRun" 2>&1 || true)
     echo "$out"
-    grep -qE 'Name\s*:\s*smbproxy-1' <<< "$out" || { say "computer account not in AD"; rc=1; }
+    if ! grep -qE 'Computer.*smbproxy-1|smbproxy-1.*Computer' <<< "$out"; then
+        say "computer account not in AD"; rc=1
+    fi
 
     return "$rc"
 }

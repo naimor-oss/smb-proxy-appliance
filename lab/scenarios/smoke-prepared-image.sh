@@ -80,6 +80,11 @@ verify() {
     say "smbproxy-firstboot has run (golden image is the post-firstboot snapshot)"
     ssh_vm 'test -f /var/lib/smbproxy-firstboot.done' || rc=1
 
+    say "firstboot freshness check completed without an apt lock failure"
+    out=$(ssh_vm 'sudo grep "apt: " /var/log/smbproxy-firstboot.log | tail -1' 2>&1 || true)
+    echo "$out"
+    grep -q 'apt: image is current (0 upgrades pending)' <<< "$out" || rc=1
+
     say "smbproxy-init has NOT been completed (operator hasn't logged in yet)"
     ssh_vm 'test ! -f /var/lib/smbproxy-init.done' || rc=1
 
