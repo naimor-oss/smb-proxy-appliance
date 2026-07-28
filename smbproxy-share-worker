@@ -1,0 +1,435 @@
+#!/usr/bin/env bash
+#===============================================================================
+# smbproxy-share-worker — backend health and queued CNC-file delivery
+#
+# Runs from smbproxy-share-worker.timer. Direct shares are withdrawn from
+# new Samba tree connects after bounded TCP/445 failures. Queued shares keep
+# serving their local data-disk copy and deliver office-managed file changes
+# to the backend whenever it is reachable.
+#
+# Queued delivery is deliberately one-way:
+#   - a successful upload records the local checksum in a manifest;
+#   - an unchanged local file is never re-applied, so a machine-side manual
+#     edit survives until the office changes and redeploys that file;
+#   - a local deletion removes only a path recorded in the manifest;
+#   - machine-only files are never imported, overwritten, or deleted.
+#===============================================================================
+set -uo pipefail
+
+STATE_DIR="${SMBPROXY_STATE_DIR:-/var/lib/smbproxy}"
+SHARES_DIR="${SMBPROXY_SHARES_DIR:-${STATE_DIR}/shares}"
+HEALTH_DIR="${SMBPROXY_HEALTH_DIR:-${STATE_DIR}/health}"
+DATA_ROOT="${SMBPROXY_DATA_ROOT:-/srv/smbproxy-data}"
+SMB_CONF="${SMBPROXY_SMB_CONF:-/etc/samba/smb.conf}"
+SMB_CONF_LOCK="${SMBPROXY_SMB_CONF_LOCK:-/run/lock/smbproxy-smb-conf.lock}"
+LOCK_FILE="${SMBPROXY_WORKER_LOCK:-/run/lock/smbproxy-share-worker.lock}"
+FAIL_THRESHOLD="${SMBPROXY_FAIL_THRESHOLD:-2}"
+PROBE_SECONDS="${SMBPROXY_PROBE_SECONDS:-1}"
+MOUNT_SECONDS="${SMBPROXY_MOUNT_SECONDS:-8}"
+SKIP_RELOAD="${SMBPROXY_SKIP_RELOAD:-0}"
+
+MANAGED_MARKER="    # smbproxy-health: backend unavailable"
+MANAGED_AVAILABLE="    available = no"
+
+log() {
+    printf '%s\n' "$*"
+    command -v logger >/dev/null 2>&1 && logger -t smbproxy-worker -- "$*" || true
+}
+
+share_safe_name() {
+    printf '%s' "${1//[^A-Za-z0-9_]/_}"
+}
+
+hash_text() {
+    printf '%s' "$1" | sha256sum | awk '{print $1}'
+}
+
+hash_file() {
+    sha256sum -- "$1" 2>/dev/null | awk '{print $1}'
+}
+
+safe_relative_path() {
+    local path="$1"
+    [[ -n "$path" && "$path" != /* && "$path" != ".." \
+        && "$path" != ../* && "$path" != */../* && "$path" != */.. \
+        && "$path" != *$'\n'* ]]
+}
+
+data_root_ready() {
+    local target
+    target=$(findmnt -rn -T "$DATA_ROOT" -o TARGET 2>/dev/null || true)
+    [[ "$target" == "$DATA_ROOT" ]]
+}
+
+backend_reachable() {
+    local ip="$1"
+    [[ -n "$ip" ]] || return 1
+    timeout "$PROBE_SECONDS" bash -c ">/dev/tcp/${ip}/445" 2>/dev/null
+}
+
+backend_mount_active() {
+    local mount_path="$1"
+    [[ -n "$mount_path" ]] || return 1
+    awk -v mp="$mount_path" '$2 == mp && $3 == "cifs" { found=1; exit }
+        END { exit !found }' /proc/mounts 2>/dev/null
+}
+
+backend_mount_ready() {
+    local mount_path="$1"
+    [[ -n "$mount_path" ]] || return 1
+    timeout "$MOUNT_SECONDS" ls -A -- "$mount_path" >/dev/null 2>&1 \
+        || return 1
+    backend_mount_active "$mount_path"
+}
+
+load_health() {
+    local safe="$1"
+    local file="${HEALTH_DIR}/${safe}.env"
+    HEALTH_FAILURES=0
+    HEALTH_LAST_SUCCESS=0
+    if [[ -r "$file" ]]; then
+        # shellcheck disable=SC1090
+        source "$file"
+        HEALTH_FAILURES="${CONSECUTIVE_FAILURES:-0}"
+        HEALTH_LAST_SUCCESS="${LAST_SUCCESS_EPOCH:-0}"
+    fi
+    [[ "$HEALTH_FAILURES" =~ ^[0-9]+$ ]] || HEALTH_FAILURES=0
+    [[ "$HEALTH_LAST_SUCCESS" =~ ^[0-9]+$ ]] || HEALTH_LAST_SUCCESS=0
+}
+
+write_health() {
+    local safe="$1" mode="$2" reachable="$3" failures="$4"
+    local uploads="$5" deletes="$6" last_success="$7" error="${8:-}"
+    local file="${HEALTH_DIR}/${safe}.env"
+    local tmp="${file}.new.$$"
+    install -d -m 0755 "$HEALTH_DIR"
+    {
+        printf 'MODE=%q\n' "$mode"
+        printf 'BACKEND_REACHABLE=%q\n' "$reachable"
+        printf 'CONSECUTIVE_FAILURES=%q\n' "$failures"
+        printf 'PENDING_UPLOADS=%q\n' "$uploads"
+        printf 'PENDING_DELETES=%q\n' "$deletes"
+        printf 'LAST_CHECK_EPOCH=%q\n' "$(date +%s)"
+        printf 'LAST_SUCCESS_EPOCH=%q\n' "$last_success"
+        printf 'LAST_ERROR=%q\n' "$error"
+    } > "$tmp"
+    chmod 0644 "$tmp"
+    mv "$tmp" "$file"
+}
+
+write_manifest_entry() {
+    local manifest="$1" id="$2" rel="$3" checksum="$4"
+    local path_tmp="${manifest}/${id}.path.new.$$"
+    local sha_tmp="${manifest}/${id}.sha256.new.$$"
+    printf '%s\n' "$rel" > "$path_tmp"
+    printf '%s\n' "$checksum" > "$sha_tmp"
+    mv "$path_tmp" "${manifest}/${id}.path"
+    mv "$sha_tmp" "${manifest}/${id}.sha256"
+}
+
+deploy_file() {
+    local local_root="$1" backend_root="$2" manifest="$3"
+    local rel="$4" id="$5" checksum_before="$6"
+    local src="${local_root}/${rel}" dst="${backend_root}/${rel}"
+    local dst_dir tmp checksum_after
+
+    backend_mount_active "$backend_root" || return 1
+    dst_dir=$(dirname "$dst")
+    mkdir -p -- "$dst_dir" || return 1
+    tmp="${dst}.smbproxy-part-${id:0:12}"
+    rm -f -- "$tmp"
+    if ! cp -- "$src" "$tmp"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+    touch -r "$src" "$tmp" 2>/dev/null || true
+
+    # Do not publish a mixed/partial version if the office file changed
+    # while it was being copied.
+    checksum_after=$(hash_file "$src")
+    if [[ -z "$checksum_after" || "$checksum_after" != "$checksum_before" ]]; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+    if ! mv -f -- "$tmp" "$dst"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+    # If the mount dropped after the rename, leave the manifest pending.
+    # Retrying an acknowledged upload is safe; falsely recording a write
+    # that landed under an unmounted automount directory is not.
+    backend_mount_active "$backend_root" || return 1
+    write_manifest_entry "$manifest" "$id" "$rel" "$checksum_after"
+}
+
+sync_queued_share() {
+    local safe="$1" reachable="$2"
+    local local_root="${DATA_ROOT}/shares/${safe}"
+    local state_root="${DATA_ROOT}/state/${safe}"
+    local manifest="${state_root}/manifest"
+    local pending_upload="${state_root}/pending-upload"
+    local pending_delete="${state_root}/pending-delete"
+    local can_deploy=0 src rel id checksum recorded
+
+    SYNC_PENDING_UPLOADS=0
+    SYNC_PENDING_DELETES=0
+    SYNC_LAST_ERROR=""
+
+    if ! data_root_ready; then
+        SYNC_LAST_ERROR="data filesystem is not mounted at ${DATA_ROOT}"
+        return 1
+    fi
+
+    install -d -m 0755 "$local_root" "$state_root" "$manifest" \
+        "$pending_upload" "$pending_delete"
+    if [[ -n "${FRONT_FORCE_USER:-}" ]]; then
+        chown "$FRONT_FORCE_USER:$FRONT_FORCE_USER" "$local_root" 2>/dev/null || true
+        chmod 0770 "$local_root" 2>/dev/null || true
+    fi
+
+    if [[ "$reachable" == "yes" ]] && backend_mount_ready "$BACKEND_MOUNT"; then
+        can_deploy=1
+    elif [[ "$reachable" == "yes" ]]; then
+        SYNC_LAST_ERROR="backend SMB mount did not become ready within ${MOUNT_SECONDS}s"
+    else
+        SYNC_LAST_ERROR="backend tcp/445 is unreachable"
+    fi
+
+    # Uploads and updates happen before deletions. An office-side rename is
+    # therefore deployed under the new name before its old managed path is
+    # removed from the machine.
+    while IFS= read -r -d '' src; do
+        rel="${src#"$local_root"/}"
+        if ! safe_relative_path "$rel"; then
+            log "share=${SHARE_NAME} skipped unsupported path"
+            continue
+        fi
+        id=$(hash_text "$rel")
+        checksum=$(hash_file "$src")
+        [[ -n "$checksum" ]] || {
+            SYNC_PENDING_UPLOADS=$((SYNC_PENDING_UPLOADS + 1))
+            continue
+        }
+        recorded=""
+        [[ -r "${manifest}/${id}.sha256" ]] \
+            && IFS= read -r recorded < "${manifest}/${id}.sha256"
+        if [[ "$recorded" == "$checksum" ]]; then
+            rm -f -- "${pending_upload}/${id}.path" \
+                "${pending_upload}/${id}.sha256" \
+                "${pending_delete}/${id}"
+            continue
+        fi
+        rm -f -- "${pending_delete}/${id}"
+
+        # Require the same checksum on two worker passes before publishing.
+        # This keeps a file that is still being copied into the office share
+        # from appearing briefly as a partial CNC program on the machine.
+        local pending_checksum=""
+        [[ -r "${pending_upload}/${id}.sha256" ]] \
+            && IFS= read -r pending_checksum < "${pending_upload}/${id}.sha256"
+        if [[ "$pending_checksum" != "$checksum" ]]; then
+            write_manifest_entry "$pending_upload" "$id" "$rel" "$checksum"
+            SYNC_PENDING_UPLOADS=$((SYNC_PENDING_UPLOADS + 1))
+            continue
+        fi
+        if [[ "$can_deploy" -eq 1 ]] \
+            && deploy_file "$local_root" "$BACKEND_MOUNT" "$manifest" \
+                "$rel" "$id" "$checksum"; then
+            rm -f -- "${pending_upload}/${id}.path" \
+                "${pending_upload}/${id}.sha256"
+            log "share=${SHARE_NAME} uploaded path=${rel}"
+        else
+            SYNC_PENDING_UPLOADS=$((SYNC_PENDING_UPLOADS + 1))
+        fi
+    done < <(find "$local_root" -xdev -type f -print0 2>/dev/null)
+
+    # Drop stability candidates for files that disappeared before they
+    # became deployable (for example an editor's short-lived temp file).
+    local pending_path
+    shopt -s nullglob
+    for pending_path in "$pending_upload"/*.path; do
+        rel=""
+        IFS= read -r rel < "$pending_path"
+        if ! safe_relative_path "$rel" || [[ ! -e "${local_root}/${rel}" ]]; then
+            rm -f -- "$pending_path" "${pending_path%.path}.sha256"
+        fi
+    done
+
+    local path_file target
+    for path_file in "$manifest"/*.path; do
+        rel=""
+        IFS= read -r rel < "$path_file"
+        if ! safe_relative_path "$rel"; then
+            log "share=${SHARE_NAME} ignored invalid manifest path"
+            continue
+        fi
+        id=$(basename "${path_file%.path}")
+        if [[ -e "${local_root}/${rel}" ]]; then
+            rm -f -- "${pending_delete}/${id}"
+            continue
+        fi
+
+        # Like uploads, require two observations. Also never delete while
+        # any upload is pending, preserving upload-new-before-delete-old
+        # ordering for office-side renames.
+        if [[ ! -e "${pending_delete}/${id}" ]]; then
+            : > "${pending_delete}/${id}"
+            SYNC_PENDING_DELETES=$((SYNC_PENDING_DELETES + 1))
+            continue
+        fi
+        if [[ "$SYNC_PENDING_UPLOADS" -gt 0 ]]; then
+            SYNC_PENDING_DELETES=$((SYNC_PENDING_DELETES + 1))
+            continue
+        fi
+
+        if [[ "$can_deploy" -eq 1 ]]; then
+            target="${BACKEND_MOUNT}/${rel}"
+            if rm -f -- "$target" && backend_mount_active "$BACKEND_MOUNT"; then
+                rm -f -- "$path_file" "${path_file%.path}.sha256" \
+                    "${pending_delete}/${id}"
+                log "share=${SHARE_NAME} deleted managed path=${rel}"
+            else
+                SYNC_PENDING_DELETES=$((SYNC_PENDING_DELETES + 1))
+            fi
+        else
+            SYNC_PENDING_DELETES=$((SYNC_PENDING_DELETES + 1))
+        fi
+    done
+    shopt -u nullglob
+    return 0
+}
+
+render_direct_availability_unlocked() {
+    local offline_file="$1"
+    [[ -f "$SMB_CONF" ]] || return 0
+    local candidate="${SMB_CONF}.health.$$"
+
+    awk -v marker="$MANAGED_MARKER" -v setting="$MANAGED_AVAILABLE" '
+        FILENAME == ARGV[1] {
+            offline["[" $0 "]"] = 1
+            next
+        }
+        $0 == marker {
+            remove_setting = 1
+            next
+        }
+        remove_setting && $0 == setting {
+            remove_setting = 0
+            next
+        }
+        {
+            remove_setting = 0
+            print
+            if ($0 in offline) {
+                print marker
+                print setting
+            }
+        }
+    ' "$offline_file" "$SMB_CONF" > "$candidate"
+
+    if cmp -s "$candidate" "$SMB_CONF"; then
+        rm -f "$candidate"
+        return 0
+    fi
+    if command -v testparm >/dev/null 2>&1 \
+        && ! testparm -s "$candidate" >/dev/null 2>&1; then
+        log "availability update rejected by testparm; keeping current smb.conf"
+        rm -f "$candidate"
+        return 1
+    fi
+    chmod 0644 "$candidate"
+    mv "$candidate" "$SMB_CONF"
+    if [[ "$SKIP_RELOAD" != "1" ]] && systemctl is-active --quiet smbd 2>/dev/null; then
+        smbcontrol smbd reload-config >/dev/null 2>&1 || {
+            log "smbd reload-config failed after availability update"
+            return 1
+        }
+    fi
+}
+
+render_direct_availability() {
+    local offline_file="$1"
+    if ! command -v flock >/dev/null 2>&1; then
+        render_direct_availability_unlocked "$offline_file"
+        return
+    fi
+    local lock_fd rc
+    install -d -m 0755 "$(dirname "$SMB_CONF_LOCK")"
+    exec {lock_fd}>"$SMB_CONF_LOCK"
+    flock -x "$lock_fd"
+    render_direct_availability_unlocked "$offline_file"
+    rc=$?
+    exec {lock_fd}>&-
+    return "$rc"
+}
+
+worker_run() {
+    install -d -m 0755 "$HEALTH_DIR"
+    local offline_file="${HEALTH_DIR}/offline-direct.$$"
+    : > "$offline_file"
+
+    shopt -s nullglob
+    local share_file safe mode reachable failures last_success mode_error
+    for share_file in "$SHARES_DIR"/*.env; do
+        SHARE_NAME="" PROFILE="" OFFLINE_MODE="" BACKEND_IP=""
+        BACKEND_MOUNT="" FRONT_FORCE_USER=""
+        # shellcheck disable=SC1090
+        source "$share_file"
+        [[ -n "$SHARE_NAME" ]] || continue
+        safe=$(share_safe_name "$SHARE_NAME")
+        mode="${OFFLINE_MODE:-direct}"
+        mode_error=""
+        if [[ "$mode" == "queued" && "${PROFILE:-legacy}" != "modern" ]]; then
+            mode_error="queued mode refused for non-modern profile"
+            log "share=${SHARE_NAME} ${mode_error}"
+            mode="direct"
+        elif [[ "$mode" != "queued" && "$mode" != "direct" ]]; then
+            mode_error="unknown offline mode '${mode}'; using direct"
+            log "share=${SHARE_NAME} ${mode_error}"
+            mode="direct"
+        fi
+        load_health "$safe"
+        failures="$HEALTH_FAILURES"
+        last_success="$HEALTH_LAST_SUCCESS"
+
+        if backend_reachable "${BACKEND_IP:-}"; then
+            reachable="yes"
+            failures=0
+        else
+            reachable="no"
+            failures=$((failures + 1))
+        fi
+
+        case "$mode" in
+            queued)
+                sync_queued_share "$safe" "$reachable" || true
+                if [[ "$reachable" == "yes" && "$SYNC_PENDING_UPLOADS" -eq 0 \
+                    && "$SYNC_PENDING_DELETES" -eq 0 && -z "$SYNC_LAST_ERROR" ]]; then
+                    last_success=$(date +%s)
+                fi
+                write_health "$safe" "$mode" "$reachable" "$failures" \
+                    "$SYNC_PENDING_UPLOADS" "$SYNC_PENDING_DELETES" \
+                    "$last_success" "$SYNC_LAST_ERROR"
+                ;;
+            *)
+                if (( failures >= FAIL_THRESHOLD )); then
+                    printf '%s\n' "$SHARE_NAME" >> "$offline_file"
+                fi
+                [[ "$reachable" == "yes" ]] && last_success=$(date +%s)
+                write_health "$safe" "direct" "$reachable" "$failures" \
+                    0 0 "$last_success" "$mode_error"
+                ;;
+        esac
+    done
+    shopt -u nullglob
+
+    render_direct_availability "$offline_file"
+    rm -f "$offline_file"
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    install -d -m 0755 "$(dirname "$LOCK_FILE")"
+    exec 9>"$LOCK_FILE"
+    flock -n 9 || exit 0
+    worker_run
+fi

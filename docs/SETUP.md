@@ -234,6 +234,29 @@ lab/run-scenario.sh smoke-prepared-image
 See [LAB-TESTING.md](LAB-TESTING.md) for scenario authoring and the
 full test plan.
 
+## Optional queued-share data disk
+
+The release image contains only the appliance OS disk. If a shop-machine
+share must stay available while its backend is powered off, attach a
+separate thin-provisioned virtual disk to the deployed VM. Size it for
+the office-authoritative CNC program set plus normal growth.
+
+Initialize it from `sudo smbproxy-sconfig` under **System Configuration
+→ Offline-share Data Disk**. The operation erases the selected disk,
+formats the whole device as ext4, and mounts it by UUID at
+`/srv/smbproxy-data`. Then configure a modern share with offline mode
+`queued`.
+
+Do not put legacy ISAM shares in queued mode. They require live
+end-to-end locking and are restricted to `direct`.
+
+If the volume later needs more room, expand that virtual disk in the
+hypervisor and select **Grow ext4** in the same menu, or run:
+
+```bash
+sudo smbproxy-sconfig --grow-data-disk
+```
+
 ## Release export
 
 To produce host-agnostic distributable artifacts (vhdx, qcow2, vmdk,

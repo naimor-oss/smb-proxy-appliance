@@ -210,6 +210,8 @@ apt-get install -y \
     htop \
     tree \
     rsync \
+    e2fsprogs \
+    util-linux \
     bash-completion \
     locales-all \
     whiptail \
@@ -357,7 +359,8 @@ chmod 0755 /etc/smbproxy /var/lib/smbproxy
 # 16. INSTALL SMBPROXY-SCONFIG
 #===============================================================================
 log "Installing smbproxy-sconfig tool..."
-for src in /root/smbproxy-sconfig.sh /root/smbproxy-sconfig; do
+for src in /tmp/smbproxy-sconfig.sh /tmp/smbproxy-sconfig \
+           /root/smbproxy-sconfig.sh /root/smbproxy-sconfig; do
     if [[ -f "$src" ]]; then
         cp "$src" /usr/local/sbin/smbproxy-sconfig
         chmod +x /usr/local/sbin/smbproxy-sconfig
@@ -367,10 +370,11 @@ for src in /root/smbproxy-sconfig.sh /root/smbproxy-sconfig; do
 done
 [[ -x /usr/local/sbin/smbproxy-sconfig ]] || warn "smbproxy-sconfig not found — copy it manually to /usr/local/sbin/"
 
-# Pre-connect probe used by modern-profile shares' `root preexec` to
+# Pre-connect probe used by direct shares' `root preexec` to
 # fail-fast when the backend is offline (see smbproxy-probe-backend
 # header for the rationale).
-for src in /root/smbproxy-probe-backend /root/smbproxy-probe-backend.sh; do
+for src in /tmp/smbproxy-probe-backend /tmp/smbproxy-probe-backend.sh \
+           /root/smbproxy-probe-backend /root/smbproxy-probe-backend.sh; do
     if [[ -f "$src" ]]; then
         cp "$src" /usr/local/sbin/smbproxy-probe-backend
         chmod +x /usr/local/sbin/smbproxy-probe-backend
@@ -379,6 +383,50 @@ for src in /root/smbproxy-probe-backend /root/smbproxy-probe-backend.sh; do
     fi
 done
 [[ -x /usr/local/sbin/smbproxy-probe-backend ]] || warn "smbproxy-probe-backend not found — copy it manually to /usr/local/sbin/"
+
+# Periodic direct-share health and queued-share delivery worker.
+for src in /tmp/smbproxy-share-worker /tmp/smbproxy-share-worker.sh \
+           /root/smbproxy-share-worker /root/smbproxy-share-worker.sh; do
+    if [[ -f "$src" ]]; then
+        cp "$src" /usr/local/sbin/smbproxy-share-worker
+        chmod +x /usr/local/sbin/smbproxy-share-worker
+        log "  Installed from $src to /usr/local/sbin/smbproxy-share-worker"
+        break
+    fi
+done
+if [[ -x /usr/local/sbin/smbproxy-share-worker ]]; then
+    cat > /etc/systemd/system/smbproxy-share-worker.service <<'UNIT'
+[Unit]
+Description=SMB Proxy backend health and queued delivery worker
+After=network-online.target local-fs.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/smbproxy-share-worker
+TimeoutStartSec=infinity
+UNIT
+
+    cat > /etc/systemd/system/smbproxy-share-worker.timer <<'UNIT'
+[Unit]
+Description=Run SMB Proxy share worker every 15 seconds
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=15s
+AccuracySec=1s
+Persistent=true
+Unit=smbproxy-share-worker.service
+
+[Install]
+WantedBy=timers.target
+UNIT
+
+    systemctl daemon-reload
+    systemctl enable smbproxy-share-worker.timer
+else
+    warn "smbproxy-share-worker not found — queued delivery and dynamic fail-fast are unavailable"
+fi
 
 grep -q 'smbproxy-sconfig' /root/.bashrc 2>/dev/null || \
     echo 'alias sconfig="sudo smbproxy-sconfig"' >> /root/.bashrc

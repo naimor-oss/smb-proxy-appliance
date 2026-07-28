@@ -187,6 +187,7 @@ step "5. push appliance scripts and appliance-core lib/ to the VM"
 scp -J "${HV_USER}@${HV_HOST}" \
     -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
     "$REPO_DIR/prepare-image.sh" "$REPO_DIR/smbproxy-sconfig.sh" \
+    "$REPO_DIR/smbproxy-probe-backend" "$REPO_DIR/smbproxy-share-worker" \
     "${VM_USER}@${VM_IP}:/tmp/"
 
 # Cross-repo: vendor the shared libs from the sibling appliance-core
@@ -216,7 +217,7 @@ if ! ssh_vm "sudo APPCORE_BUILD_COMMIT='$APPCORE_BUILD_COMMIT' bash /tmp/prepare
     ssh_vm 'sudo tail -30 /var/log/smbproxy-prepare.log 2>/dev/null || journalctl -n 30 --no-pager'
     exit 1
 fi
-ssh_vm 'sudo install -m 0755 /tmp/smbproxy-sconfig.sh /usr/local/sbin/smbproxy-sconfig'
+ssh_vm 'sudo install -m 0755 /tmp/smbproxy-sconfig.sh /usr/local/sbin/smbproxy-sconfig; sudo install -m 0755 /tmp/smbproxy-probe-backend /usr/local/sbin/smbproxy-probe-backend; sudo install -m 0755 /tmp/smbproxy-share-worker /usr/local/sbin/smbproxy-share-worker'
 
 step "7. shutdown for deploy-master snapshot"
 # This is the host-agnostic master: prepare-image.sh has finished, but

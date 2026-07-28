@@ -11,7 +11,10 @@ backend, but the appliance is useful for any aging SMB1/SMB2 file server
 that needs to be re-published into a modern AD forest. A second profile
 (`modern`) covers standalone SMB2/3 devices like CNC HMIs, NAS units, and
 other shop-floor appliances that need to be consolidated into DFS-N — see
-[`AGENTS.md`](AGENTS.md) for the profile choices.
+[`AGENTS.md`](AGENTS.md) for the profile choices. Each share also chooses
+an offline policy: serve the live backend and fail fast, or remain
+available from a local data disk and deliver office-managed files
+one-way when the machine returns.
 
 ## Where do I start?
 
@@ -44,6 +47,7 @@ other on disk:
 | --- | --- |
 | `prepare-image.sh` | One-time Debian image preparation. Installs Samba member-server, Winbind, Kerberos, cifs-utils, chrony, nftables, and appliance helper scripts. Vendor-, realm-, and credential-neutral. |
 | `smbproxy-sconfig.sh` | Main appliance configuration tool. Provides the whiptail TUI and a small headless CLI. Handles NIC role assignment, AD join, backend SMB1 mount, and frontend SMB3 share. |
+| `smbproxy-share-worker` | Periodic backend health and one-way queued-file delivery worker. |
 | `lab/proxy.env` | Lab environment file consumed by the generic runner. |
 | `lab/run-scenario.sh` | Proxy-specific wrapper around `../lab-kit/bin/run-scenario.sh`. |
 | `lab/stage-proxy-base.sh` | Mac-side stager: produces the shared base VHDX and per-VM cloud-init seed ISO. |
@@ -91,6 +95,10 @@ other on disk:
    - configure the frontend SMB3 share (share name, mount path, the AD
      group allowed to access it, the local backend force-user);
    - enable `smbd`, `winbind`, and the systemd-mounted cifs backend.
+6. For shares that must remain available while a shop machine is off,
+   attach a separate thin-provisioned virtual disk, initialize it under
+   **System Configuration → Offline-share Data Disk**, and select the
+   share's `queued` offline mode. Direct shares need no data disk.
 
 ## Lab Topology
 

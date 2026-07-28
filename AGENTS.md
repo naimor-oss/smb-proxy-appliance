@@ -113,17 +113,37 @@ Companion defenses ship alongside `soft`:
   connect at ~1 s instead of letting the client cycle through
   chdir-on-automount.
 
-The legacy profile deliberately stays HARD with no probe — under
-.TPS multi-writer workloads, a soft-mount mid-write error would
-corrupt the database, and the legacy zone is expected to be
-always-on so the offline annoyance doesn't apply there.
+The legacy profile deliberately stays HARD — under .TPS multi-writer
+workloads, a soft-mount mid-write error would corrupt the database.
+Modern/direct shares still use the bounded tree-connect TCP probe.
+The periodic share worker marks every direct share `available = no`
+after two failed probes and reloads Samba, so new connections fail
+with an unavailable-share response. Existing sessions are not
+force-closed.
 
-A residual ~30 s Windows-retry wait remains in the modern-profile
-offline case because Samba returns `NT_STATUS_ACCESS_DENIED` for
-preexec failures (hardcoded), which Windows treats as a transient
-condition and retries in bursts. The deferred design that closes it
-(periodic `available = no` toggling via a systemd timer) is
-documented in [`docs/OFFLINE-DEVICE-FAILFAST.md`](docs/OFFLINE-DEVICE-FAILFAST.md).
+## Offline behavior
+
+`PROFILE` selects backend protocol, caching, and locking. `OFFLINE_MODE`
+selects what office clients see when that backend is unavailable:
+
+- `direct` (default and migration behavior) publishes the live cifs
+  mount and fails new connections quickly while the backend is down.
+- `queued` publishes a local directory on `/srv/smbproxy-data` at all
+  times and delivers office-managed changes one-way when the backend
+  returns. It is supported only for the modern file-copy profile.
+
+Queued mode never imports machine-side files. It requires a stable
+checksum on two worker passes, uploads changed office files by temporary
+name plus atomic rename, records successful local checksums in a
+manifest, and deletes only previously managed paths.
+Thus machine-only nests and operator-renamed copies remain untouched.
+An unchanged office source does not overwrite a same-name machine edit;
+the next office update intentionally does. Office-side deletion is
+authoritative for previously managed programs.
+
+Queued data must live on a separately attached ext4 disk mounted at
+`/srv/smbproxy-data`; it is not embedded in the release OVA. See
+[`docs/OFFLINE-DEVICE-FAILFAST.md`](docs/OFFLINE-DEVICE-FAILFAST.md).
 
 ## Persistent Infrastructure
 
@@ -169,13 +189,15 @@ Each proxied share has independent state:
 - `/var/lib/smbproxy/shares/<safe>.env` — the share's
   non-credential coordinates (`SHARE_NAME`, `BACKEND_IP`,
   `BACKEND_USER`, `BACKEND_DOMAIN`, `BACKEND_MOUNT`, `FRONT_GROUP`,
-  `FRONT_FORCE_USER`).
+  `FRONT_FORCE_USER`, `PROFILE`, `OFFLINE_MODE`).
 - `/etc/samba/.creds-<safe>` (mode 0600 root:root) — the cifs
   username / password / domain for THIS share's backend mount. Each
   share authenticates to the backend with its own account.
 - One line in `/etc/fstab` per share, each pointing at its own
   creds file.
 - One `[SHARE_NAME]` section in `/etc/samba/smb.conf` per share.
+- Queued office data under `/srv/smbproxy-data/shares/<safe>` and its
+  delivery manifest under `/srv/smbproxy-data/state/<safe>/manifest`.
 
 `SHARE_NAME` is used as **both** the backend share name and the
 published SMB3 share name (operator picks one name; it appears at
@@ -192,7 +214,10 @@ kept there.
 ## Checks
 
 ```bash
-bash -n prepare-image.sh smbproxy-sconfig.sh lab/run-scenario.sh lab/scenarios/*.sh tests/unit-helpers.sh
+bash -n prepare-image.sh smbproxy-sconfig.sh smbproxy-share-worker \
+  lab/run-scenario.sh lab/scenarios/*.sh tests/*.sh
+bash tests/unit-helpers.sh
+bash tests/share-worker.sh
 ```
 
 ## Development Rules

@@ -21,11 +21,15 @@ verify() {
     say "smbproxy-sconfig is installed"
     ssh_vm 'test -x /usr/local/sbin/smbproxy-sconfig && sudo /usr/local/sbin/smbproxy-sconfig --help | head -20' || rc=1
 
+    say "share health/delivery helpers and timer are installed"
+    # shellcheck disable=SC2016 # command substitution expands on the VM
+    ssh_vm 'test -x /usr/local/sbin/smbproxy-probe-backend; test -x /usr/local/sbin/smbproxy-share-worker; test "$(systemctl is-enabled smbproxy-share-worker.timer)" = enabled' || rc=1
+
     say "required appliance tools are present"
     # Outer single quotes preserve the literal $c through ssh; the \$c
     # below survives the remote shell's parsing of the double-quoted
     # bash -lc argument and is only expanded by bash -lc's loop.
-    out=$(ssh_vm 'sudo bash -lc "for c in samba smbd winbindd smbclient mount.cifs net wbinfo kinit klist nft chronyd dig whiptail; do printf \"%s \" \"\$c\"; command -v \"\$c\" || exit 1; done"' 2>&1 || true)
+    out=$(ssh_vm 'sudo bash -lc "for c in samba smbd winbindd smbclient mount.cifs net wbinfo kinit klist nft chronyd dig whiptail mkfs.ext4 resize2fs findmnt flock lsblk blkid wipefs; do printf \"%s \" \"\$c\"; command -v \"\$c\" || exit 1; done"' 2>&1 || true)
     echo "$out"
     if grep -qi 'not found' <<< "$out" || ! grep -q 'smbd' <<< "$out"; then
         rc=1
@@ -76,6 +80,10 @@ verify() {
     out=$(ssh_vm 'mount | grep -E "type cifs " || true' 2>&1 || true)
     echo "$out"
     [[ -z "$out" ]] || { say "stray cifs mount in golden image"; rc=1; }
+
+    say "no queued-share data disk is preconfigured"
+    # shellcheck disable=SC2016 # command substitution expands on the VM
+    ssh_vm 'test "$(findmnt -rn -T /srv/smbproxy-data -o TARGET 2>/dev/null || true)" != /srv/smbproxy-data; ! grep -qE "[[:space:]]/srv/smbproxy-data[[:space:]]" /etc/fstab' || rc=1
 
     say "smbproxy-firstboot has run (golden image is the post-firstboot snapshot)"
     ssh_vm 'test -f /var/lib/smbproxy-firstboot.done' || rc=1

@@ -182,6 +182,37 @@ check_eq "unknown profile falls through to legacy default" \
     "/mnt/legacy/X" "$(share_default_mount 'X' nonsense)"
 
 #-------------------------------------------------------------------------------
+# offline mode and frontend path — protocol/locking and availability
+# behavior are deliberately separate choices.
+#-------------------------------------------------------------------------------
+echo "== offline_mode_validate / share_frontend_path =="
+offline_mode_validate legacy direct
+check_rc "legacy + direct accepted" 0 $?
+offline_mode_validate modern direct
+check_rc "modern + direct accepted" 0 $?
+offline_mode_validate modern queued
+check_rc "modern + queued accepted" 0 $?
+offline_mode_validate legacy queued
+check_rc "legacy + queued rejected (locking safety)" 1 $?
+offline_mode_validate modern nonsense
+check_rc "unknown offline mode rejected" 2 $?
+
+check_eq "direct frontend is live backend mount" \
+    "/mnt/backend/CNC" \
+    "$(share_frontend_path CNC direct /mnt/backend/CNC /fixture/data)"
+check_eq "queued frontend is secondary data disk" \
+    "/fixture/data/shares/Engineering_" \
+    "$(share_frontend_path 'Engineering$' queued /mnt/backend/Engineering /fixture/data)"
+
+DIRECT_PROBE=$(frontend_offline_probe_stanza modern direct)
+check_eq "modern/direct emits pre-connect probe" "yes" \
+    "$(grep -qF 'root preexec = /usr/local/sbin/smbproxy-probe-backend' <<< "$DIRECT_PROBE" && echo yes || echo no)"
+check_eq "modern/queued emits no pre-connect probe" "" \
+    "$(frontend_offline_probe_stanza modern queued)"
+check_eq "legacy/direct retains no-preexec behavior" "" \
+    "$(frontend_offline_probe_stanza legacy direct)"
+
+#-------------------------------------------------------------------------------
 # resolve_locking_kind — (profile, override) → effective kind.
 #-------------------------------------------------------------------------------
 echo "== resolve_locking_kind =="
