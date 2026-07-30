@@ -82,12 +82,19 @@ other on disk:
    host-agnostic master image.
 4. Boot the deployed appliance. The console TTY1 wizard
    (`smbproxy-init`) walks the operator through:
-   - identifying which NIC is the domain NIC and which is the legacy NIC
-     (operator picks by MAC; the wizard shows MAC + link-up state +
-     DHCP lease per interface);
+   - confirming which NIC is the domain NIC and which is the legacy NIC
+     (the default-route/DHCP NIC is preselected as Domain/LAN; the wizard
+     shows MAC + link-up state + DHCP lease per interface, then persists
+     both roles by MAC);
    - applying static IP on the legacy NIC;
    - confirming or pinning a static IP on the domain NIC;
    - hostname, password, SSH key paste, timezone.
+
+Only the persisted Domain/LAN NIC contributes the appliance IP, default
+gateway, DNS, DHCP domain, reverse DNS, hostname domain, and AD discovery.
+The LegacyZone NIC is static-only with DHCP, DNS, default routes, IPv6 RA,
+and link-local addressing disabled.
+
 5. Log in over SSH and run `sudo smbproxy-sconfig` to:
    - join the AD forest;
    - configure backend SMB1 mount credentials (backend IP, share, user,

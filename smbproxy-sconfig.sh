@@ -25,13 +25,14 @@
 #===============================================================================
 set -uo pipefail
 
-readonly VERSION="0.2.0"
+readonly VERSION="0.3.0"
 readonly SCRIPT_NAME="smbproxy-sconfig"
 readonly WT_HEIGHT=22
 readonly WT_WIDTH=78
 readonly WT_MENU_HEIGHT=14
 
-readonly ROLES_FILE="/etc/smbproxy/nic-roles.env"
+readonly ROLES_FILE="${SMBPROXY_ROLES_FILE:-/etc/smbproxy/nic-roles.env}"
+readonly DETECT_FILE="${SMBPROXY_DETECT_FILE:-/var/lib/smbproxy-init-detected.env}"
 readonly STATE_DIR="/var/lib/smbproxy"
 readonly DEPLOY_FILE="${STATE_DIR}/deploy.env"
 readonly SHARES_DIR="${STATE_DIR}/shares"
@@ -72,6 +73,7 @@ if [[ -d "$APPCORE_LIBS" ]]; then
     [[ -f "$APPCORE_LIBS/hostname.sh"   ]] && source "$APPCORE_LIBS/hostname.sh"
     [[ -f "$APPCORE_LIBS/detect-net.sh" ]] && source "$APPCORE_LIBS/detect-net.sh"
     [[ -f "$APPCORE_LIBS/netconfig.sh"  ]] && source "$APPCORE_LIBS/netconfig.sh"
+    [[ -f "$APPCORE_LIBS/timezone.sh"   ]] && source "$APPCORE_LIBS/timezone.sh"
 fi
 
 # info / yesno / die delegate to appliance-core's sized whiptail
@@ -161,6 +163,61 @@ load_deploy() {
         # shellcheck disable=SC1090
         source "$DEPLOY_FILE"
     fi
+}
+
+_proxy_detect_cache_value() {
+    local key="$1"
+    [[ -r "$DETECT_FILE" ]] || return 0
+    awk -F= -v key="$key" '
+        $1 == key {
+            value=substr($0, index($0, "=") + 1)
+            sub(/^"/, "", value); sub(/"$/, "", value)
+            print value
+            exit
+        }
+    ' "$DETECT_FILE"
+}
+
+# Canonical deployment context. Only the persisted Domain/LAN NIC may
+# contribute the appliance IP, gateway, resolver, DHCP domain, or PTR.
+# Before roles are assigned, appliance-core safely falls back to the
+# default-route interface; the gateway-less legacy link cannot win.
+refresh_proxy_network_context() {
+    load_roles
+    APPCORE_DET_IFACE="" APPCORE_DET_IP="" APPCORE_DET_GATEWAY=""
+    APPCORE_DET_DHCP_DNS="" APPCORE_DET_DHCP_DOMAIN=""
+    APPCORE_DET_PTR_FQDN=""
+    APPCORE_DET_PTR_DOMAIN="" APPCORE_DET_EFFECTIVE_DOMAIN=""
+    APPCORE_DET_EFFECTIVE_DOMAIN_SOURCE=""
+    if command -v appcore_detect_net_init >/dev/null 2>&1; then
+        appcore_detect_net_init "$DETECT_FILE" "${DOMAIN_NIC_NAME:-}" \
+            >/dev/null 2>&1 || true
+        return
+    fi
+
+    # Compatibility path for an older image without the shared detector.
+    APPCORE_DET_IFACE=$(_proxy_detect_cache_value APPCORE_DET_IFACE)
+    APPCORE_DET_IP=$(_proxy_detect_cache_value APPCORE_DET_IP)
+    APPCORE_DET_GATEWAY=$(_proxy_detect_cache_value APPCORE_DET_GATEWAY)
+    APPCORE_DET_DHCP_DNS=$(_proxy_detect_cache_value APPCORE_DET_DHCP_DNS)
+    APPCORE_DET_DHCP_DOMAIN=$(_proxy_detect_cache_value APPCORE_DET_DHCP_DOMAIN)
+    APPCORE_DET_PTR_DOMAIN=$(_proxy_detect_cache_value APPCORE_DET_PTR_DOMAIN)
+    APPCORE_DET_EFFECTIVE_DOMAIN="${APPCORE_DET_DHCP_DOMAIN:-$APPCORE_DET_PTR_DOMAIN}"
+}
+
+refresh_proxy_domain_defaults() {
+    refresh_proxy_network_context
+    PROXY_DEFAULT_REALM=$(printf '%s' "${APPCORE_DET_EFFECTIVE_DOMAIN:-}" \
+        | tr '[:lower:]' '[:upper:]')
+    PROXY_DEFAULT_DOMAIN_SHORT="${PROXY_DEFAULT_REALM%%.*}"
+    PROXY_DEFAULT_DC=""
+    local domain="${APPCORE_DET_EFFECTIVE_DOMAIN:-}" dc
+    if [[ -n "$domain" ]]; then
+        dc=$(timeout 5 dig +short -t SRV "_ldap._tcp.${domain}" 2>/dev/null \
+            | awk 'NR==1 {sub(/\.$/,"",$4); print $4}') || dc=""
+        PROXY_DEFAULT_DC="$dc"
+    fi
+    export PROXY_DEFAULT_REALM PROXY_DEFAULT_DOMAIN_SHORT PROXY_DEFAULT_DC
 }
 
 #-------------------------------------------------------------------------------
@@ -987,7 +1044,7 @@ config_hostname() {
     fi
 
     # The actual rename flow lives in the appliance-core hostname.sh
-    # lib (live DHCP/PTR/dnsdomainname domain detection,
+    # lib (LAN-scoped DHCP/PTR domain detection,
     # NetBIOS-rules short-name validation, safe /etc/hosts rewrite,
     # .local rejection). The is_joined guard above is the only
     # product-specific bit; everything else is shared with samba-addc
@@ -997,17 +1054,35 @@ config_hostname() {
         return
     fi
 
-    if appcore_hostname_change_tui; then
+    refresh_proxy_network_context
+    if appcore_hostname_change_tui "" \
+            "${APPCORE_DET_EFFECTIVE_DOMAIN:-}" "${DOMAIN_NIC_NAME:-}"; then
         info "Hostname set to: ${APPCORE_HOSTNAME_NEW_FQDN}\n\nReboot recommended after the join is complete."
     fi
 }
 
 config_timezone() {
-    local cur new
+    local cur suggested="" failure="" new prompt
     cur=$(timedatectl show --property=Timezone --value 2>/dev/null || echo Etc/UTC)
+    cur="${cur:-Etc/UTC}"
+    if command -v appcore_timezone_suggest >/dev/null 2>&1; then
+        if appcore_timezone_suggest >/dev/null; then
+            suggested="$APPCORE_TIMEZONE_SUGGESTION"
+        else
+            failure="$APPCORE_TIMEZONE_ERROR"
+        fi
+    else
+        failure="Automatic suggestion unavailable on this image."
+    fi
+    prompt="Current timezone: ${cur}"
+    if [[ -n "$suggested" ]]; then
+        prompt+="\nDetected suggestion: ${suggested}"
+    else
+        prompt+="\n${failure}"
+    fi
+    prompt+="\n\nEnter Region/City. Examples:\n  America/Los_Angeles  Europe/London  Asia/Tokyo  Etc/UTC"
     new=$(whiptail --inputbox \
-        "Region/City. Examples:\n  America/Los_Angeles  Europe/London  Asia/Tokyo  Etc/UTC\n\nCurrent: $cur" \
-        14 64 "$cur" 3>&1 1>&2 2>&3) || return
+        "$prompt" 14 70 "${suggested:-$cur}" 3>&1 1>&2 2>&3) || return
     [[ -z "$new" ]] && return
     if timedatectl list-timezones 2>/dev/null | grep -qx "$new"; then
         timedatectl set-timezone "$new"
@@ -1050,10 +1125,19 @@ run_updates_now() {
 }
 
 show_system_info() {
+    refresh_proxy_network_context
     {
         echo "=== Identity ==="
         echo "Host:    $(hostname -f)"
         echo "Realm:   $(get_realm_status)"
+        echo
+        echo "=== Domain/LAN environment ==="
+        echo "Interface: ${APPCORE_DET_IFACE:-(not detected)}"
+        echo "IPv4:     ${APPCORE_DET_IP:-(not detected)}"
+        echo "Gateway:  ${APPCORE_DET_GATEWAY:-(not detected)}"
+        echo "DNS:      ${APPCORE_DET_DHCP_DNS:-(not detected)}"
+        echo "Domain:   ${APPCORE_DET_EFFECTIVE_DOMAIN:-(not detected)} (${APPCORE_DET_EFFECTIVE_DOMAIN_SOURCE:-no source})"
+        echo "PTR:      ${APPCORE_DET_PTR_FQDN:-(not detected)}"
         echo
         echo "=== Network interfaces ==="
         ip -br addr show
@@ -1201,9 +1285,12 @@ menu_domain_ops() {
 
 probe_dc_tui() {
     load_deploy
+    refresh_proxy_domain_defaults
     local realm dc
-    realm=$(whiptail --inputbox "AD realm (e.g. example.com):" 10 64 "${REALM:-}" 3>&1 1>&2 2>&3) || return
-    dc=$(whiptail --inputbox "DC hostname or IP (e.g. dc1.example.com or 10.0.0.10):" 10 70 "${DC_HOST:-}" 3>&1 1>&2 2>&3) || return
+    realm=$(whiptail --inputbox "AD realm (e.g. example.com):" 10 64 \
+        "${REALM:-$PROXY_DEFAULT_REALM}" 3>&1 1>&2 2>&3) || return
+    dc=$(whiptail --inputbox "DC hostname or IP (e.g. dc1.example.com or 10.0.0.10):" 10 70 \
+        "${DC_HOST:-$PROXY_DEFAULT_DC}" 3>&1 1>&2 2>&3) || return
     [[ -z "$realm" || -z "$dc" ]] && return
     local ip
     if ! ip=$(resolve_dc_ip "$dc"); then
@@ -1412,6 +1499,11 @@ EOF
         return 6
     fi
 
+    if command -v appcore_hostname_align_to_realm >/dev/null 2>&1; then
+        appcore_hostname_align_to_realm "${REALM,,}" 2>>"$logf" || \
+            log_join "WARN: failed to align hostname and /etc/hosts to ${REALM,,}"
+    fi
+
     # 6b. Register cifs/ SPNs in AD and re-sync into the local keytab.
     #
     # `net ads join` registers HOST/<short>, HOST/<fqdn>,
@@ -1462,15 +1554,19 @@ EOF
 
 join_domain_tui() {
     load_deploy
+    refresh_proxy_domain_defaults
     if is_joined; then
         if ! whiptail --yesno "This host appears to be joined already.\n\nRe-running the join will overwrite smb.conf, krb5.conf, chrony.conf, and resolv.conf. Continue?" 12 64; then
             return
         fi
     fi
-    REALM=$(whiptail --inputbox "AD realm (e.g. example.com):" 10 64 "${REALM:-}" 3>&1 1>&2 2>&3) || return
-    DOMAIN_SHORT=$(whiptail --inputbox "NetBIOS short domain name (pre-Win2000):" 10 64 "${DOMAIN_SHORT:-${REALM%%.*}}" 3>&1 1>&2 2>&3) || return
+    REALM=$(whiptail --inputbox "AD realm (e.g. example.com):" 10 64 \
+        "${REALM:-$PROXY_DEFAULT_REALM}" 3>&1 1>&2 2>&3) || return
+    DOMAIN_SHORT=$(whiptail --inputbox "NetBIOS short domain name (pre-Win2000):" 10 64 \
+        "${DOMAIN_SHORT:-${PROXY_DEFAULT_DOMAIN_SHORT:-${REALM%%.*}}}" 3>&1 1>&2 2>&3) || return
     DOMAIN_SHORT="${DOMAIN_SHORT^^}"
-    DC_HOST=$(whiptail --inputbox "DC hostname or IP:" 10 64 "${DC_HOST:-}" 3>&1 1>&2 2>&3) || return
+    DC_HOST=$(whiptail --inputbox "DC hostname or IP:" 10 64 \
+        "${DC_HOST:-$PROXY_DEFAULT_DC}" 3>&1 1>&2 2>&3) || return
     AD_USER=$(whiptail --inputbox "Domain admin username (e.g. Administrator):" 10 64 "Administrator" 3>&1 1>&2 2>&3) || return
     AD_PASS=$(whiptail --passwordbox "Password for ${AD_USER}@${REALM^^}:" 10 64 3>&1 1>&2 2>&3) || return
     [[ -z "$AD_PASS" ]] && { info "Password required."; return; }
