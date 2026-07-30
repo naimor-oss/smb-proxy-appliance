@@ -108,6 +108,7 @@ step() { echo
 
 ssh_host() { ssh "${HV_USER}@${HV_HOST}" "$@"; }
 ssh_vm()   { ssh -J "${HV_USER}@${HV_HOST}" \
+                 -o IdentitiesOnly=yes -o IdentityAgent=none \
                  -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
                  "${VM_USER}@${VM_IP}" "$@"; }
 
@@ -172,6 +173,7 @@ step "4. wait for cloud-init + SSH on $VM_IP (up to 180s)"
 ssh_up=0
 for _ in $(seq 1 90); do
     if ssh -o ConnectTimeout=3 -o BatchMode=yes \
+           -o IdentitiesOnly=yes -o IdentityAgent=none \
            -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
            -J "${HV_USER}@${HV_HOST}" "${VM_USER}@${VM_IP}" true 2>/dev/null; then
         ssh_up=1
@@ -185,6 +187,7 @@ ssh_vm 'hostname; ip -4 addr show | grep -E "inet " | head -3; \
 
 step "5. push appliance scripts and appliance-core lib/ to the VM"
 scp -J "${HV_USER}@${HV_HOST}" \
+    -o IdentitiesOnly=yes -o IdentityAgent=none \
     -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
     "$REPO_DIR/prepare-image.sh" "$REPO_DIR/smbproxy-sconfig.sh" \
     "$REPO_DIR/smbproxy-probe-backend" "$REPO_DIR/smbproxy-share-worker" \
@@ -201,6 +204,7 @@ if [[ ! -d "$APPCORE_REPO/lib" ]]; then
     exit 1
 fi
 scp -J "${HV_USER}@${HV_HOST}" -r \
+    -o IdentitiesOnly=yes -o IdentityAgent=none \
     -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
     "$APPCORE_REPO/lib" \
     "${VM_USER}@${VM_IP}:/tmp/"
@@ -262,6 +266,7 @@ say "wait for smbproxy-firstboot.done marker (up to 120s)"
 done_marker=0
 for _ in $(seq 1 60); do
     if ssh -o ConnectTimeout=3 -o BatchMode=yes \
+           -o IdentitiesOnly=yes -o IdentityAgent=none \
            -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
            -J "${HV_USER}@${HV_HOST}" "${VM_USER}@${VM_IP}" \
            'test -f /var/lib/smbproxy-firstboot.done' 2>/dev/null; then

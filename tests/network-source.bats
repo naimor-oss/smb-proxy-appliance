@@ -3,6 +3,11 @@
 setup() {
     REPO_DIR="${BATS_TEST_DIRNAME}/.."
     PREPARE="${REPO_DIR}/prepare-image.sh"
+    BUILD="${REPO_DIR}/lab/build-fresh-base.sh"
+}
+
+@test "release build bypasses the local SSH agent for guest access" {
+    [ "$(grep -c -- '-o IdentitiesOnly=yes -o IdentityAgent=none' "$BUILD")" -eq 5 ]
 }
 
 @test "firstboot snapshots the canonical LAN deployment context" {
