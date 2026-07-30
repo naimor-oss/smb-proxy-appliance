@@ -94,7 +94,6 @@ REMOVE_PKGS=(
     debconf-i18n
 
     # Real-hardware bits that never apply to a VM proxy.
-    eject
     discover discover-data
     # Wireless — VMs don't have radios.
     wpasupplicant wireless-regdb crda iw
@@ -112,6 +111,15 @@ REMOVE_PKGS=(
     # configure smbd as a member.
     samba-ad-dc
 )
+
+# cloud-init depends on eject, so removing eject in the initial pass would also
+# remove the command needed to erase the build seed. Purge both afterward.
+DEFERRED_REMOVE_PKGS=(cloud-init eject)
+for pkg in "${DEFERRED_REMOVE_PKGS[@]}"; do
+    if dpkg-query -W -f='${db:Status-Status}' "$pkg" 2>/dev/null | grep -qx installed; then
+        apt-mark manual "$pkg" >/dev/null
+    fi
+done
 
 for pkg in "${REMOVE_PKGS[@]}"; do
     if dpkg -l "$pkg" &>/dev/null 2>&1; then
@@ -2010,6 +2018,7 @@ if ! command -v cloud-init >/dev/null 2>&1; then
     exit 1
 fi
 cloud-init clean --logs --seed
+apt-get purge -y "${DEFERRED_REMOVE_PKGS[@]}"
 if [[ "$build_fqdn" == *.* ]]; then
     if grep -Fq "$build_fqdn" /etc/hostname /etc/hosts; then
         err "build-time FQDN remains active after generalization: $build_fqdn"
@@ -2042,7 +2051,7 @@ echo "  Chrony:        $(chronyc --version 2>/dev/null || echo 'check manually')
 echo "  cifs-utils:    $(dpkg -s cifs-utils 2>/dev/null | awk '/^Version:/{print $2}')"
 echo "  Guest agents:  $(find /var/cache/smbproxy-appliance/vmtools -maxdepth 1 -mindepth 1 -not -name manifest -printf '%f ' 2>/dev/null)"
 echo ""
-echo "  Removed:       ${REMOVE_PKGS[*]}"
+echo "  Removed:       ${REMOVE_PKGS[*]} ${DEFERRED_REMOVE_PKGS[*]}"
 echo ""
 echo "  Next steps:"
 echo "    1. Shut down this VM. The shutdown-state disk is the host-agnostic"
