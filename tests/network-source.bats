@@ -7,7 +7,7 @@ setup() {
 }
 
 @test "release build bypasses the local SSH agent for guest access" {
-    [ "$(grep -c -- '-o IdentitiesOnly=yes -o IdentityAgent=none' "$BUILD")" -eq 5 ]
+    [ "$(grep -c -- '-o IdentitiesOnly=yes -o IdentityAgent=none' "$BUILD")" -eq 6 ]
 }
 
 @test "firstboot snapshots the canonical LAN deployment context" {
@@ -26,6 +26,13 @@ setup() {
     grep -q 'The Legacy NIC requires a static IPv4/CIDR' "$PREPARE"
     grep -q 'The Legacy NIC must not carry a default route' "$PREPARE"
     grep -q 'The Legacy NIC must not carry DNS servers' "$PREPARE"
+}
+
+@test "Samba and AD DNS are limited to the domain NIC" {
+    grep -q 'interfaces = lo ${DOMAIN_NIC_NAME}' "${REPO_DIR}/smbproxy-sconfig.sh"
+    grep -q 'bind interfaces only = yes' "${REPO_DIR}/smbproxy-sconfig.sh"
+    grep -q 'server multi channel support = no' "${REPO_DIR}/smbproxy-sconfig.sh"
+    grep -q 'ExecStartPre=/usr/local/sbin/smbproxy-domain-dns' "$PREPARE"
 }
 
 @test "dual-NIC renderer keeps LAN domain data and isolates LegacyZone" {

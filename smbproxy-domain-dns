@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# Keep the AD DNS record for this member server limited to its domain NIC.
+# The legacy NIC is a private point-to-point backend link and must never be
+# returned to office SMB clients.
+
+set -euo pipefail
+
+ROLES_FILE="${SMBPROXY_ROLES_FILE:-/etc/smbproxy/nic-roles.env}"
+DEPLOY_FILE="${SMBPROXY_DEPLOY_FILE:-/var/lib/smbproxy/deploy.env}"
+IP_BIN="${SMBPROXY_IP_BIN:-ip}"
+NET_BIN="${SMBPROXY_NET_BIN:-net}"
+TIMEOUT_BIN="${SMBPROXY_TIMEOUT_BIN:-timeout}"
+LOGGER_BIN="${SMBPROXY_LOGGER_BIN:-logger}"
+SLEEP_BIN="${SMBPROXY_SLEEP_BIN:-sleep}"
+ALLOW_NON_ROOT_TEST="${SMBPROXY_ALLOW_NON_ROOT_TEST:-0}"
+DRY_RUN="${SMBPROXY_DNS_DRY_RUN:-0}"
+
+log() {
+    "$LOGGER_BIN" -t smbproxy-domain-dns -- "$*"
+}
+
+if [[ $EUID -ne 0 && "$ALLOW_NON_ROOT_TEST" != "1" ]]; then
+    echo "smbproxy-domain-dns: must run as root" >&2
+    exit 2
+fi
+
+if [[ ! -r "$ROLES_FILE" || ! -r "$DEPLOY_FILE" ]]; then
+    log "DNS refresh skipped: NIC role or domain state is unavailable"
+    exit 0
+fi
+
+DOMAIN_NIC_NAME="" REALM=""
+# Both files are root-owned configuration written by smbproxy-sconfig.
+# shellcheck disable=SC1090
+source "$ROLES_FILE"
+# shellcheck disable=SC1090
+source "$DEPLOY_FILE"
+
+if [[ -z "$DOMAIN_NIC_NAME" || -z "$REALM" ]] \
+    || [[ ! "$DOMAIN_NIC_NAME" =~ ^[A-Za-z0-9_.:-]+$ ]] \
+    || [[ ! "$REALM" =~ ^[A-Za-z0-9.-]+$ ]]; then
+    log "DNS refresh skipped: invalid domain NIC or realm state"
+    exit 0
+fi
+
+short_name=$(hostname -s | tr '[:upper:]' '[:lower:]')
+realm_lc=$(printf '%s' "$REALM" | tr '[:upper:]' '[:lower:]')
+fqdn="${short_name}.${realm_lc}"
+domain_ips=()
+while IFS= read -r address; do
+    [[ -n "$address" ]] && domain_ips+=("$address")
+done < <("$IP_BIN" -o -4 addr show dev "$DOMAIN_NIC_NAME" scope global \
+    | awk '{split($4, parts, "/"); print parts[1]}')
+
+if [[ ${#domain_ips[@]} -eq 0 ]]; then
+    log "DNS refresh skipped: no IPv4 address is active on ${DOMAIN_NIC_NAME}"
+    exit 0
+fi
+
+if [[ "$DRY_RUN" == "1" ]]; then
+    printf 'fqdn=%s interface=%s ips=%s\n' \
+        "$fqdn" "$DOMAIN_NIC_NAME" "${domain_ips[*]}"
+    exit 0
+fi
+
+# Never remove the current RRset unless the machine trust and DC path work.
+# DNS failure is logged but must not prevent smbd from starting.
+if ! "$TIMEOUT_BIN" 10s "$NET_BIN" ads testjoin >/dev/null 2>&1; then
+    log "DNS refresh skipped: domain trust is unavailable"
+    exit 0
+fi
+
+if ! "$TIMEOUT_BIN" 10s "$NET_BIN" ads dns unregister "$fqdn" -P \
+    >/dev/null 2>&1; then
+    log "DNS unregister did not complete for ${fqdn}; continuing with registration"
+fi
+
+for attempt in 1 2 3; do
+    if "$TIMEOUT_BIN" 10s "$NET_BIN" ads dns register \
+        "$fqdn" "${domain_ips[@]}" --force -P >/dev/null 2>&1; then
+        log "DNS registered ${fqdn} on ${DOMAIN_NIC_NAME}: ${domain_ips[*]}"
+        exit 0
+    fi
+    [[ "$attempt" -eq 3 ]] || "$SLEEP_BIN" 2
+done
+
+log "DNS registration failed for ${fqdn}; smbd startup will continue"
+exit 0

@@ -180,12 +180,13 @@ places you need to touch for host-specific settings.
 ## Verify Your Setup
 
 Run these from the `smb-proxy-appliance/` directory after cloning all
-six repositories. Every line should succeed.
+seven repositories. Every line should succeed.
 
 ```bash
 # 1. The siblings exist at the expected paths.
 ls -d ../appliance-core ../dev-commons ../lab-kit ../lab-router \
-    ../samba-addc-appliance >/dev/null && echo "siblings OK"
+    ../samba-addc-appliance ../smbproxy-session-vfs >/dev/null \
+    && echo "siblings OK"
 
 # 2. Mac tools.
 for t in qemu-img hdiutil curl ssh scp git; do
@@ -205,9 +206,10 @@ touch /Volumes/ISO/.write-test && rm /Volumes/ISO/.write-test && echo "ISO share
 ssh nmadmin@server 'Test-NetConnection -ComputerName 172.29.137.1 -Port 445 -InformationLevel Quiet'
 
 # 7. Syntax check the proxy scripts.
-bash -n prepare-image.sh smbproxy-sconfig.sh \
+bash -n prepare-image.sh smbproxy-sconfig.sh smbproxy-session-mount \
+    smbproxy-vfs-version-check ../smbproxy-session-vfs/scripts/*.sh \
     lab/run-scenario.sh lab/stage-proxy-base.sh lab/build-fresh-base.sh \
-    lab/export-deploy-master.sh lab/scenarios/*.sh
+    lab/export-deploy-master.sh lab/scenarios/*.sh tests/*.sh
 echo "syntax checks OK"
 ```
 

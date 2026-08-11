@@ -86,7 +86,11 @@ verify() {
     grep -qE 'strict locking[[:space:]]*=[[:space:]]*yes' <<< "$out" || { say "strict locking != yes"; rc=1; }
     grep -qE 'kernel oplocks[[:space:]]*=[[:space:]]*no'  <<< "$out" || { say "kernel oplocks != no"; rc=1; }
     grep -qE 'posix locking[[:space:]]*=[[:space:]]*yes'  <<< "$out" || { say "posix locking != yes"; rc=1; }
-    grep -qF "path = ${SC_BACKEND_MOUNT}"                  <<< "$out" || { say "path wrong";          rc=1; }
+    grep -qF "path = /run/smbproxy/sessions"               <<< "$out" || { say "path wrong";          rc=1; }
+    grep -qE 'vfs objects[[:space:]]*=[[:space:]]*smbproxy_session[[:space:]]+fileid' <<< "$out" \
+        || { say "session/fileid VFS stack missing"; rc=1; }
+    grep -qE 'fileid:algorithm[[:space:]]*=[[:space:]]*fsname' <<< "$out" \
+        || { say "file identity normalization missing"; rc=1; }
     # force user / force group are written as the LOCAL username
     # (NOT a numeric UID — Samba resolves these via getpwnam(), and
     # numeric strings don't resolve there even though getpwuid()
@@ -168,6 +172,15 @@ verify() {
     echo "$out"
     grep -qE "Sharename|Disk\|" <<< "$out" || { say "smbclient -L returned no shares"; rc=1; }
     grep -qF "$SC_SHARE_NAME" <<< "$out" || { say "advertised share list does not include $SC_SHARE_NAME"; rc=1; }
+
+    say "SMB3 tree connect reaches the backend through a dynamic SMB1 session"
+    out=$(ssh_vm "sudo bash -c 'echo \"$SC_PASS\" | kinit \"$SC_ADMIN@$SC_REALM_UC\" && smbclient -k //$LAB_VM_IP/$SC_SHARE_NAME -m SMB3 -c ls'" 2>&1 || true)
+    echo "$out"
+    grep -qiE 'NT_STATUS|tree connect failed|session setup failed' <<< "$out" \
+        && { say "SMB3 tree connect failed"; rc=1; }
+    out=$(ssh_vm "sudo grep -F 'action=CONNECT share=$SC_SHARE_NAME ' /var/log/smbproxy-session-mount.log | tail -1" 2>&1 || true)
+    echo "$out"
+    grep -qF "share=$SC_SHARE_NAME" <<< "$out" || { say "no upstream SMB1 session was recorded"; rc=1; }
 
     say "per-share state file persisted the frontend coordinates"
     out=$(ssh_vm "sudo cat '$state'" 2>&1 || true)

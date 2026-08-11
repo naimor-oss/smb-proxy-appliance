@@ -21,10 +21,11 @@ AD-joined SMB3 shares — each share with independent backend credentials
 and AD access groups.
 
 Motivating use case: serving multi-user ISAM-style database files
-(e.g. Clarion `.TPS`) to AD-joined Windows clients while the byte-range
-locking and oplock semantics those databases require are enforced **at
-the proxy** rather than across the WAN to the legacy backend. The same
-machinery generalizes to any aging SMB1/SMB2 file server that needs to
+(e.g. Clarion `.TPS`) to AD-joined Windows clients while Samba preserves one
+frontend share-mode/lock namespace and byte-range locks also reach the legacy
+SMB1 server. The proxy preserves independent client lock ownership by mapping
+every downstream authenticated tree to a distinct upstream SMB1 session while
+normalizing their Samba file IDs. The same machinery generalizes to any aging SMB1/SMB2 file server that needs to
 be re-published into a modern AD forest, plus a `modern` profile for
 standalone SMB2/3 devices (CNC HMIs, NAS units) being consolidated
 into DFS-N — see `Profiles` below.
@@ -47,9 +48,10 @@ This repo is a sibling of:
 
 ## Dual-NIC Model
 
-For the legacy profile, the proxy is the only writer the legacy backend
-ever sees, so all locking is enforced locally by Samba and the backend
-mount uses `nobrl` to avoid pushing locks across SMB1.
+For the legacy profile, the dedicated link contains the SMB1 traffic. Each
+downstream authenticated tree gets a distinct upstream SMB1 session and
+forwards byte-range locks to the legacy server. Samba must also remain the
+shared frontend lock/share-mode arbiter across those sessions.
 
 | NIC role | Network | Initial state | Final state |
 | --- | --- | --- | --- |
@@ -62,15 +64,42 @@ shows MAC, link-up state, and any DHCP lease present, so the choice is
 unambiguous). The mapping is persisted as `/etc/smbproxy/nic-roles.env`
 and consumed by `smbproxy-sconfig` thereafter.
 
+Samba binds only to the loopback and domain interfaces. Before `smbd` starts,
+the member server replaces its AD DNS A-record set with the current IPv4
+address(es) from the domain NIC; the private legacy address must never be
+published to office clients.
+
 ## Locking Semantics for ISAM-style Databases (legacy profile)
 
-The frontend share enforces strict locking; the backend mount delegates
-nothing. This is correct for `.TPS`-style ISAM databases because the
-proxy is the single arbiter of all writes the legacy backend sees.
+The frontend share disables oplocks and requests strict locking. A private VFS
+module maps each downstream authenticated tree to its own CIFS mount, SMB1
+transport/session, and CIFS superblock. Samba's real `vuid` (authenticated
+session wire ID) and `cnum` (tree wire ID), plus the serving process ID, form
+the lifecycle key; usernames and process-name heuristics are not used.
+
+The canonical module source, exact-Samba package build, compatibility ledger,
+and Trixie update automation live in the sibling
+[`../smbproxy-session-vfs`](../smbproxy-session-vfs/) repository. This
+appliance owns the mount helper and configuration, and pins the component in
+`components/smbproxy-session-vfs.env`. Advance the component first and the
+appliance pin second.
+
+Distinct CIFS superblocks have distinct `st_dev` values. Without correction,
+Samba therefore treats the same backend inode as unrelated files and splits
+its share-mode and lock databases, which breaks SMB semantics and can corrupt
+multi-user ISAM data. The standard `fileid` VFS module must follow
+`smbproxy_session` with `fileid:algorithm = fsname`; it maps mounts of the same
+backend share to one Samba device identity while leaving the upstream SMB1
+transports distinct. With `posix locking = yes` and no `nobrl`, byte-range
+locks are also translated to SMB1 locking requests. Reusing the same
+credentials is valid: lock ownership is separated by upstream sessions and
+opens, not by usernames.
 
 Frontend (`/etc/samba/smb.conf` per share):
 
 ```
+vfs objects     = smbproxy_session fileid
+fileid:algorithm = fsname
 oplocks         = no
 level2 oplocks  = no
 strict locking  = yes
@@ -81,17 +110,24 @@ posix locking   = yes
 Backend (cifs mount options) — diverges per profile:
 
 ```
-legacy:  vers=1.0,nobrl,cache=none,serverino,nosharesock
+legacy:  vers=1.0,cache=none,hard,serverino,nosharesock
 modern:  vers=3,seal,serverino,nosharesock,soft,echo_interval=10
 ```
 
-`nobrl` (legacy only) deliberately silences kernel-level byte-range
-lock propagation so the backend never sees lock requests; `cache=none`
-(legacy only) removes the read cache that could mask conflicts;
-`serverino` keeps inode numbers stable across remounts; `nosharesock`
-forces a separate TCP/SMB session per cifs mount so multi-share
-configs against the same backend don't multiplex onto a single
-session and silently reuse the first share's credentials.
+Legacy mounts are transient under `/run/smbproxy/sessions/` and never appear
+in `/etc/fstab`. `nobrl` is forbidden because it would suppress the lock
+requests the design must preserve. `cache=none` avoids client data caching;
+each tree uses a separate mount point and `nosharesock` forces a distinct SMB1
+transport/session. The lock-isolation gate must confirm distinct live `st_dev`
+identities and one normalized Samba file ID for the same file across them;
+`serverino` supplies backend inode numbers. `hard` is explicit so an in-flight database write waits for the
+backend rather than failing mid-write. A tree disconnect unmounts its upstream session. Service start/stop
+also sweeps stale mounts left by crashes.
+
+The VFS module uses Samba's private source3 ABI and is built against the exact
+Debian Samba package revision installed in the image. If that package revision
+changes, the service version guard fails closed for configured legacy shares
+until the module is rebuilt. Do not weaken that guard.
 
 **`soft,echo_interval=10` (modern only)** is one of several layered
 defenses that target the offline-device hang. The kernel cifs default
@@ -176,10 +212,10 @@ ssh -J nmadmin@server debadmin@<proxy> 'sudo smbproxy-sconfig --list-shares'
 ssh -J nmadmin@server debadmin@<proxy> 'sudo smbproxy-sconfig --status'
 ```
 
-Verify backend mounts + share locks (one cifs entry per share):
+Verify active upstream sessions + frontend lock state:
 
 ```bash
-ssh -J nmadmin@server debadmin@<proxy> 'sudo mount | grep cifs; sudo smbstatus -L'
+ssh -J nmadmin@server debadmin@<proxy> 'sudo findmnt -t cifs; sudo smbstatus -L; sudo tail -40 /var/log/smbproxy-session-mount.log'
 ```
 
 ## Multi-share data model
@@ -193,8 +229,9 @@ Each proxied share has independent state:
 - `/etc/samba/.creds-<safe>` (mode 0600 root:root) — the cifs
   username / password / domain for THIS share's backend mount. Each
   share authenticates to the backend with its own account.
-- One line in `/etc/fstab` per share, each pointing at its own
-  creds file.
+- Modern/direct shares have one `/etc/fstab` line pointing at their own creds
+  file. Legacy/direct shares have no static mount; each downstream tree gets a
+  runtime mount under `/run/smbproxy/sessions/` using that share's creds file.
 - One `[SHARE_NAME]` section in `/etc/samba/smb.conf` per share.
 - Queued office data under `/srv/smbproxy-data/shares/<safe>` and its
   delivery manifest under `/srv/smbproxy-data/state/<safe>/manifest`.
@@ -218,6 +255,10 @@ bash -n prepare-image.sh smbproxy-sconfig.sh smbproxy-share-worker \
   lab/run-scenario.sh lab/scenarios/*.sh tests/*.sh
 bash tests/unit-helpers.sh
 bash tests/share-worker.sh
+bash tests/domain-dns.sh
+bash tests/session-mount.sh
+bash tests/vfs-contract.sh
+bash tests/vfs-version-check.sh
 ```
 
 ## Development Rules
@@ -289,11 +330,11 @@ bash tests/share-worker.sh
     The cifs `uid=` and `gid=` mount options continue to use the
     numeric UID (that is a kernel cifs option and is correctly
     interpreted as a UID).
-- **`nosharesock` is non-optional in cifs fstab options.** Without
-  it, two cifs mounts to the same backend with different per-share
-  creds get multiplexed onto a single TCP/SMB session and the second
-  mount silently reuses the first's credentials, defeating the
-  multi-share model. Same prod incident, 2026-05-05.
+- **`nosharesock` is non-optional for every CIFS mount.** For legacy
+  session mounts it creates the distinct upstream SMB1 transports required by
+  the locking contract. For static modern mounts it prevents two shares from
+  silently multiplexing onto the first share's credentials. Legacy mounts
+  must never contain `nobrl`.
 - **Operator mental model: the force-user is a backend identity,
   not a login.** Treat `force user` as "the local Linux account that
   owns the cifs mount and presents to the legacy backend" — it is

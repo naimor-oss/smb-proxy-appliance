@@ -242,9 +242,22 @@ apt-get install -y \
     libpam-winbind \
     krb5-user \
     smbclient \
+    samba-testsuite \
     cifs-utils \
     acl \
     attr
+
+# Build and install the standalone session-aware VFS component against the
+# exact Samba package now installed. The component package declares an exact
+# Samba dependency because samba-dev does not expose the source3 VFS ABI.
+log "Building session-aware SMB1 VFS module..."
+if [[ -x /tmp/smbproxy-session-vfs/scripts/build-and-install.sh ]] \
+    && [[ -f /tmp/smbproxy-session-vfs/src/vfs_smbproxy_session.c ]]; then
+    /tmp/smbproxy-session-vfs/scripts/build-and-install.sh
+else
+    err "smbproxy-session-vfs build payload is missing from /tmp"
+    exit 1
+fi
 
 #===============================================================================
 # 6. CHRONY NTP
@@ -377,6 +390,41 @@ for src in /tmp/smbproxy-sconfig.sh /tmp/smbproxy-sconfig \
     fi
 done
 [[ -x /usr/local/sbin/smbproxy-sconfig ]] || warn "smbproxy-sconfig not found — copy it manually to /usr/local/sbin/"
+
+# VFS lifecycle helper: one SMB1 CIFS mount/socket/superblock for every
+# downstream Samba tree connection.  The version check makes Samba fail closed
+# after a package upgrade until the private-ABI module is rebuilt.
+for helper in smbproxy-session-mount smbproxy-vfs-version-check \
+              smbproxy-domain-dns; do
+    src="/tmp/${helper}"
+    if [[ -f "$src" ]]; then
+        install -m 0755 "$src" "/usr/local/sbin/${helper}"
+    else
+        err "${helper} not found at ${src}"
+        exit 1
+    fi
+done
+
+install -d -o root -g root -m 0755 \
+    /run/smbproxy/sessions /run/smbproxy/session-state \
+    /etc/tmpfiles.d /etc/systemd/system/smbd.service.d
+rm -f /etc/systemd/system/smbd.service.d/20-smbproxy-vfs-version.conf
+cat > /etc/tmpfiles.d/smbproxy-sessions.conf <<'TMPFILES'
+d /run/smbproxy 0755 root root -
+d /run/smbproxy/sessions 0755 root root -
+d /run/smbproxy/session-state 0755 root root -
+TMPFILES
+cat > /etc/systemd/system/smbd.service.d/20-smbproxy-session-integrity.conf <<'UNIT'
+[Service]
+ExecStartPre=/usr/local/sbin/smbproxy-vfs-version-check
+ExecStartPre=/usr/local/sbin/smbproxy-session-mount cleanup-all
+ExecStopPost=/usr/local/sbin/smbproxy-session-mount cleanup-all
+UNIT
+cat > /etc/systemd/system/smbd.service.d/10-smbproxy-domain-interface.conf <<'UNIT'
+[Service]
+ExecStartPre=/usr/local/sbin/smbproxy-domain-dns
+UNIT
+systemctl daemon-reload
 
 # Pre-connect probe used by direct shares' `root preexec` to
 # fail-fast when the backend is offline (see smbproxy-probe-backend

@@ -23,13 +23,25 @@ verify() {
 
     say "share health/delivery helpers and timer are installed"
     # shellcheck disable=SC2016 # command substitution expands on the VM
-    ssh_vm 'test -x /usr/local/sbin/smbproxy-probe-backend; test -x /usr/local/sbin/smbproxy-share-worker; test "$(systemctl is-enabled smbproxy-share-worker.timer)" = enabled' || rc=1
+    ssh_vm 'test -x /usr/local/sbin/smbproxy-probe-backend; test -x /usr/local/sbin/smbproxy-share-worker; test -x /usr/local/sbin/smbproxy-domain-dns; test "$(systemctl is-enabled smbproxy-share-worker.timer)" = enabled' || rc=1
+
+    say "session VFS, lifecycle helpers, and exact package guard are installed"
+    # shellcheck disable=SC2016 # all substitutions expand on the VM
+    ssh_vm '
+        test -x /usr/local/sbin/smbproxy-session-mount
+        test -x /usr/local/sbin/smbproxy-vfs-version-check
+        module_root=$(smbd -b | sed -n "s/^[[:space:]]*MODULESDIR: //p" | head -1)
+        test -r "$module_root/vfs/smbproxy_session.so"
+        test -r "$module_root/vfs/fileid.so"
+        test "$(cat /usr/share/smbproxy-session-vfs/samba-package-version)" = "$(dpkg-query -W -f=\${Version} samba)"
+        test -f /etc/systemd/system/smbd.service.d/20-smbproxy-session-integrity.conf
+    ' || rc=1
 
     say "required appliance tools are present"
     # Outer single quotes preserve the literal $c through ssh; the \$c
     # below survives the remote shell's parsing of the double-quoted
     # bash -lc argument and is only expanded by bash -lc's loop.
-    out=$(ssh_vm 'sudo bash -lc "for c in samba smbd winbindd smbclient mount.cifs net wbinfo kinit klist nft chronyd dig whiptail mkfs.ext4 resize2fs findmnt flock lsblk blkid wipefs; do printf \"%s \" \"\$c\"; command -v \"\$c\" || exit 1; done"' 2>&1 || true)
+    out=$(ssh_vm 'sudo bash -lc "for c in samba smbd winbindd smbclient smbtorture mount.cifs net wbinfo kinit klist nft chronyd dig whiptail mkfs.ext4 resize2fs findmnt flock lsblk blkid wipefs; do printf \"%s \" \"\$c\"; command -v \"\$c\" || exit 1; done"' 2>&1 || true)
     echo "$out"
     if grep -qi 'not found' <<< "$out" || ! grep -q 'smbd' <<< "$out"; then
         rc=1
@@ -80,6 +92,7 @@ verify() {
     out=$(ssh_vm 'mount | grep -E "type cifs " || true' 2>&1 || true)
     echo "$out"
     [[ -z "$out" ]] || { say "stray cifs mount in golden image"; rc=1; }
+    ssh_vm 'sudo /usr/local/sbin/smbproxy-session-mount cleanup-all; test -z "$(find /run/smbproxy/session-state -mindepth 1 -maxdepth 1 -type f -print -quit)"' || rc=1
 
     say "no queued-share data disk is preconfigured"
     # shellcheck disable=SC2016 # command substitution expands on the VM

@@ -6,7 +6,7 @@ appliance and how to add them to the lab scenario runner.
 The goal is not only "does smbd start?" The goal is to prove the proxy
 faithfully bridges a hardened Windows Server 2025 forest to a legacy
 SMB1 file server: NIC role assignment, AD join, backend SMB1
-mount with the right `nobrl` / `cache=none` semantics, frontend SMB3
+session isolation with `cache=none` and lock forwarding enabled, frontend SMB3
 share with strict locking and oplocks-off, identity mapping via
 winbind to a single local backend `force user`, and recovery from the
 common deployment mistakes.
@@ -34,7 +34,8 @@ The generic pipeline (from `lab-kit`) is:
    WS2025-DC1 helpers — the samba-addc-appliance lab already provides
    the DC and we just join it.
 2. Revert `smbproxy-1` to `golden-image` via `Revert-TestVM.ps1`.
-3. Push `prepare-image.sh` and `smbproxy-sconfig.sh` to the VM.
+3. Push `prepare-image.sh`, `smbproxy-sconfig.sh`, and the two session
+   lifecycle/version helpers to the VM.
 4. Run `LAB_POST_PUSH_CMD` (installs `smbproxy-sconfig` under
    `/usr/local/sbin`).
 5. `pre_hook` (scenario-owned — this is where AD or backend-mount
@@ -52,6 +53,7 @@ scenarios drive the upstream pipeline as their `pre_hook`.
 ```text
 bootstrap-network ── used by ──► join-domain
                               └► backend-mount ── used by ──► frontend-share ──► end-to-end
+                                                          │                 └► tps-lock-isolation
                                                           └► multi-share
 ```
 
@@ -65,6 +67,8 @@ Source-time relationships:
 - `end-to-end` sources `frontend-share` and adds the per-share
   `--status` check + the optional legacy backend read/write roundtrip
   (`SC_WRITE_ROUNDTRIP=1`).
+- `tps-lock-isolation` sources `frontend-share`, then adds the two-session
+  Samba lock-overlap test and live upstream-session proof.
 
 Backend credentials handling: scenarios that need the legacy backend password
 read it from `SC_BACKEND_PASS`. `lab/run-scenario.sh` automatically
@@ -88,7 +92,11 @@ Assertions (see `lab/scenarios/smoke-prepared-image.sh` for the full list):
 
 - `smbproxy-sconfig` is installed and executable.
 - The required tooling is present: samba/smbd/winbindd, smbclient,
-  mount.cifs, net, wbinfo, kinit/klist, nft, chronyd, dig, whiptail.
+  smbtorture, mount.cifs, net, wbinfo, kinit/klist, nft, chronyd, dig,
+  whiptail.
+- The session VFS module, lifecycle helper, version guard, and smbd integrity
+  drop-in are installed; the recorded Debian package revision matches the
+  installed Samba package exactly.
 - `samba-ad-dc` is **not** installed (the proxy is a member server only).
 - `/etc/samba/smb.conf` does not exist.
 - `smbd`, `nmbd`, and `winbind` are not enabled yet.
@@ -198,9 +206,9 @@ lab/run-scenario.sh join-domain --no-cleanup     # skip AD cleanup entirely
 
 Purpose: configure ONE proxied share's backend half via
 `smbproxy-sconfig --configure-share` (without `--group`, so smb.conf
-is not touched) and verify the cifs mount comes up with the
-locking-correct options. This is the "configure backend pre-join"
-test path.
+is not touched) and verify a held diagnostic session mount comes up with the
+same lock-forwarding options used by the VFS. This is the "configure backend
+pre-join" test path.
 
 Requires `SC_BACKEND_PASS` in the environment — see
 `lab/backend-creds.env.example` for the recommended
@@ -213,25 +221,22 @@ so this scenario is safe to run on a non-joined proxy.
 
 `run_scenario` drives `smbproxy-sconfig --configure-share
 --name SC_SHARE_NAME --backend-ip ... --pass-stdin` (omitting
-`--group` so the smb.conf section is deliberately skipped), then
-triggers the systemd automount by `ls`-ing the mount path.
+`--group` so the smb.conf section is deliberately skipped), then creates a
+temporary held session with `smbproxy-session-mount`. The post-hook releases
+that session.
 
 Verification:
 
 - The per-share creds file at `/etc/samba/.creds-<safe>` is mode
   0600 root:root with the right username and domain (the password
   is never echoed).
-- The per-share fstab line carries `vers=1.0`, `nobrl`,
-  `cache=none`, `serverino`, `nosharesock`, `x-systemd.automount`,
-  numeric `uid=`/`gid=`, and points at the share's own creds file.
-  (`nosharesock` is non-optional — without it two cifs mounts to
-  the same backend silently multiplex on one TCP/SMB session and
-  the second mount reuses the first's creds; numeric `uid=`/`gid=`
-  locks in the LOCAL `/etc/passwd` account so an AD account by the
-  same name can't silently capture the mount.)
+- No static legacy line exists in `/etc/fstab`.
+- The temporary live mount carries `vers=1.0`, `cache=none`,
+  `serverino`, `nosharesock`, numeric `uid=`/`gid=`,
+  and points at the share's own creds file. `nobrl` must be absent: its
+  presence would disable the backend lock requests this appliance exists to
+  preserve.
 - Force-user account exists with `/usr/sbin/nologin`.
-- The live cifs mount carries the same options including
-  `nosharesock`.
 - The mount is readable and contains at least one entry (an empty
   share is warned about, not a failure — fresh labs may legitimately
   be empty).
@@ -246,7 +251,7 @@ lab/run-scenario.sh backend-mount
 
 ### `frontend-share`
 
-Purpose: publish ONE proxied share end-to-end (backend cifs mount +
+Purpose: publish ONE proxied share end-to-end (session-managed backend +
 frontend smb.conf section + smbd reload + firewall) and prove the
 share answers SMB3 + Kerberos with the strict-locking stanza intact.
 
@@ -273,8 +278,8 @@ Verification:
   USERNAMES, not numeric UIDs/GIDs — Samba resolves these via
   `getpwnam()`, and `getpwnam("1003")` fails even when the UID is
   valid, causing `NT_STATUS_NO_SUCH_USER` at tree-connect (confirmed
-  2026-05-07). The cifs `uid=`/`gid=` mount options in `/etc/fstab`
-  stay numeric — those ARE UID/GID values to the kernel cifs driver.
+  2026-05-07). The cifs `uid=`/`gid=` mount options stay numeric —
+  those ARE UID/GID values to the kernel cifs driver.
   AD-name collision is handled at write time: configure_share calls
   `wbinfo --name-to-sid` on the chosen force-user and REFUSES (rc=9)
   if the name resolves in AD, before any creds/fstab/smb.conf/
@@ -323,7 +328,9 @@ Verification:
   `/var/lib/smbproxy/shares/<safe-B>.env`.
 - Two distinct creds files at `/etc/samba/.creds-<safe>`, both
   mode 0600 root:root, each with its own username.
-- Two distinct fstab cifs lines with distinct `credentials=` paths.
+- No static legacy CIFS lines in fstab; both share sections use
+  `vfs objects = smbproxy_session fileid`, set `fileid:algorithm = fsname`,
+  and create transient mounts on access.
 - Two distinct `[SHARE]` sections in `smb.conf`, each with its own
   username-form `force user` / `force group` and SID-form
   `valid users`. Cross-check: the two sections must name DIFFERENT
@@ -337,7 +344,7 @@ Verification:
   `smb_section: yes`.
 - `smbclient -k -L` from the proxy lists both.
 - Final destructive step: `--remove-share --name $SC_SHARE_B` and
-  assert share A's state, fstab line, and smb.conf section are
+  assert share A's state, creds, and smb.conf section are
   intact while share B's are gone — exercises `remove_share`'s
   per-share sed pattern under the exact "another share is
   configured against the same backend" condition where a wrong
@@ -363,7 +370,7 @@ via the standard `eval $(declare -f ... | sed)` pattern) and adds:
 - `smbproxy-sconfig --status` shows `joined: yes`, `smbd` +
   `winbind` active, and the configured share present with
   `active=yes` and `smb_section: yes`.
-- `ls $SC_BACKEND_MOUNT` is readable.
+- An SMB3 tree connect is readable and creates an upstream SMB1 session.
 - Optional legacy backend read/write roundtrip when `SC_WRITE_ROUNDTRIP=1`:
   writes a uniquely-named test file
   (`.smb-proxy-roundtrip-<ts>-<pid>.tmp`) through the proxy, reads
@@ -420,28 +427,35 @@ Do NOT use `--profile adversarial-collision` with frontend-share
 / multi-share / etc.; those expect rc=0 and would all fail by
 design with a force-user that the appliance refuses.
 
+### `tps-lock-isolation`
+
+Purpose: release gate for the hard legacy-locking guarantee. It runs Samba's
+SMB2 byte-range, share-mode, and rename/delete-exclusion torture cases over
+independent downstream sessions.
+
+While those sessions are alive, the scenario also requires:
+
+- Two distinct VFS lifecycle keys built from the serving PID, authenticated
+  session wire ID, and tree wire ID.
+- Two concurrent CIFS mounts under `/run/smbproxy/sessions/`.
+- Distinct filesystem device IDs for those mounts, proving distinct upstream
+  CIFS superblocks/transports.
+- One normalized Samba file ID for the same test file across those mounts,
+  proving Samba's frontend share modes and lock database remain coherent.
+- `vers=1.0`, `cache=none`, and `nosharesock` on the live mounts, with no
+  `nobrl`.
+
+Run:
+
+```bash
+lab/run-scenario.sh tps-lock-isolation
+```
+
 ## Important Tests To Add
 
 The following tests are the highest-value next additions.
 
-### 1. `.TPS` lock concentration: `tps-lock-isolation`
-
-Purpose: prove the proxy is genuinely the single arbiter of byte-range
-locks against the legacy backend.
-
-Assertions:
-
-- Two concurrent SMB3 clients open the same `.TPS` file through the
-  proxy; the second open observing strict-locking behavior matches
-  what the application expects.
-- `smbstatus -L` on the proxy lists the locks.
-- `mount | grep cifs` confirms `nobrl` is still in effect (so locks
-  never propagate to legacy backend).
-- `Get-SmbOpenFile` on the legacy backend server (or a `psexec`
-  shell + `openfiles /query`) shows only the proxy's session, with no
-  byte-range lock churn.
-
-### 2. Hardening compatibility: `hardening-ws2025`
+### 1. Hardening compatibility: `hardening-ws2025`
 
 Purpose: prove the appliance keeps up with WS2025 security posture.
 
@@ -455,7 +469,7 @@ Assertions:
 - Kerberos uses strong encryption.
 - `testparm -s` clean.
 
-### 3. Firewall apply: `firewall-apply`
+### 2. Firewall apply: `firewall-apply`
 
 Purpose: deeper assertions on the nftables ruleset than `frontend-share`
 already does. Beyond "ruleset is loaded", verify:
@@ -466,22 +480,22 @@ already does. Beyond "ruleset is loaded", verify:
   pretend-backend (using a temp listener on the LegacyZone segment) is
   rejected.
 
-### 4. legacy backend unreachable resilience: `legacy-backend-down-recovery`
+### 3. legacy backend unreachable resilience: `legacy-backend-down-recovery`
 
 Purpose: prove the proxy degrades gracefully when the backend goes
 away and recovers when it returns.
 
 Assertions:
 
-- Stop the backend cifs mount; the cifs auto-unmount logic reflects
-  the failure within a bounded time.
+- Block or stop the legacy backend while an authenticated tree/session mount
+  is active; the hard CIFS behavior must not silently discard an in-flight
+  database write.
 - Frontend share `dir` returns a clear I/O error rather than hanging
   indefinitely.
-- After the backend is reachable again, `systemctl restart
-  remote-fs.target` (or the systemd-automount equivalent) re-attaches
-  cleanly without restarting `smbd`.
+- After the backend is reachable again, a fresh tree connect creates a clean
+  upstream SMB1 session without stale state.
 
-### 5. Cross-host frontend access: `verify-from-ws2025`
+### 4. Cross-host frontend access: `verify-from-ws2025`
 
 Purpose: prove the SMB3 frontend share is reachable from a real
 Windows client, not just from the proxy itself.
@@ -541,8 +555,9 @@ sudo systemctl is-active smbd winbind
 sudo net ads info -P
 sudo wbinfo -t
 sudo wbinfo -u | head
-sudo mount | grep cifs
+sudo findmnt -t cifs
 sudo smbstatus -L
+sudo tail -40 /var/log/smbproxy-session-mount.log
 sudo testparm -s
 sudo nft list ruleset
 sudo cat /etc/smbproxy/nic-roles.env

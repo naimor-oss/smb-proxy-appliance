@@ -1,0 +1,5 @@
+Types: deb
+URIs: https://naimor-oss.github.io/smbproxy-session-vfs
+Suites: trixie
+Components: main
+Signed-By: /usr/share/keyrings/smbproxy-session-vfs-archive-keyring.gpg

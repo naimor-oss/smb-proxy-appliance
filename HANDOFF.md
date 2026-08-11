@@ -8,10 +8,13 @@ This file is a placeholder. The maintained docs are:
   reusing the samba-addc-appliance lab, LegacyZone vSwitch, dnsmasq
   reservation for `smbproxy-1`
 - [`docs/LAB-TESTING.md`](docs/LAB-TESTING.md) — scenario authoring,
-  existing `smoke-prepared-image`, and the prioritized backlog of
-  scenarios to add (NIC roles, join, backend mount, frontend share,
-  `.TPS` lock isolation, hardening, firewall, recovery, end-to-end)
+  existing scenario catalog (including the `.TPS` lock-isolation release
+  gate) and the prioritized hardening, firewall, recovery, and cross-host
+  backlog
 - [`docs/sketch-smb1-smb3-proxy.sh`](docs/sketch-smb1-smb3-proxy.sh) —
   the original single-script sketch this appliance supersedes,
   preserved for historical reference and as the source of the legacy backend
   backend coordinates the lab uses
+- [`../smbproxy-session-vfs`](../smbproxy-session-vfs/) — canonical custom VFS
+  source, exact-Samba build artifacts, Trixie tracking, and SMB1/Samba issue
+  ledger; this appliance owns the mount helper and consumes a pinned release
