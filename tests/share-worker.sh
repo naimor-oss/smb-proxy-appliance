@@ -13,24 +13,33 @@ export SMBPROXY_STATE_DIR="${TEST_ROOT}/state"
 export SMBPROXY_SHARES_DIR="${TEST_ROOT}/state/shares"
 export SMBPROXY_HEALTH_DIR="${TEST_ROOT}/state/health"
 export SMBPROXY_DATA_ROOT="${TEST_ROOT}/data"
+export SMBPROXY_SESSION_ROOT="${TEST_ROOT}/sessions"
 export SMBPROXY_SMB_CONF="${TEST_ROOT}/smb.conf"
 export SMBPROXY_SMB_CONF_LOCK="${TEST_ROOT}/smb-conf.lock"
 export SMBPROXY_WORKER_LOCK="${TEST_ROOT}/worker.lock"
+export SMBPROXY_OFFLINE_PATH="${TEST_ROOT}/offline"
+export SMBPROXY_PROBE_HINT_DIR="${TEST_ROOT}/probe-fail"
 export SMBPROXY_SKIP_RELOAD=1
 export SMBPROXY_FAIL_THRESHOLD=2
 
 # shellcheck disable=SC1090
 source "$WORKER"
+REAL_AUTOMOUNT_FN=$(declare -f set_direct_automount_availability)
+eval "${REAL_AUTOMOUNT_FN/set_direct_automount_availability/set_direct_automount_availability_real}"
 
 PASS=0
 FAIL=0
 TEST_REACHABLE=yes
+AUTOMOUNT_ACTION=""
 
 # Keep tests independent of real mounts, TCP endpoints, syslog, and users.
 data_root_ready() { [[ -d "$DATA_ROOT" ]]; }
 backend_reachable() { [[ "$TEST_REACHABLE" == yes ]]; }
 backend_mount_ready() { [[ -d "$1" ]]; }
 backend_mount_active() { [[ -d "$1" ]]; }
+set_direct_automount_availability() {
+    AUTOMOUNT_ACTION="$1:$2:$3"
+}
 log() { :; }
 
 check_eq() {
@@ -161,22 +170,107 @@ printf '%s\n' \
     "BACKEND_MOUNT=\"${TEST_ROOT}/backend-direct\"" \
     'FRONT_FORCE_USER=""' \
     > "$SHARES_DIR/Direct.env"
-printf '[global]\n\n[Direct]\n    path = /fixture/direct\n' > "$SMB_CONF"
+printf '[global]\n\n[Direct]\n    path = %s\n' \
+    "$TEST_ROOT/backend-direct" > "$SMB_CONF"
 
 TEST_REACHABLE=no
 worker_run
+check_eq "first failed health check keeps direct automount available" \
+    "Direct:$TEST_ROOT/backend-direct:online" "$AUTOMOUNT_ACTION"
 check_eq "first failed health check does not withdraw share" "no" \
     "$(grep -qF "$MANAGED_AVAILABLE" "$SMB_CONF" && echo yes || echo no)"
 worker_run
+check_eq "withdrawal pass defers backend cleanup until config is reloaded" \
+    "Direct:$TEST_ROOT/backend-direct:online" "$AUTOMOUNT_ACTION"
 check_eq "second failed health check withdraws new tree connects" "yes" \
     "$(grep -qF "$MANAGED_AVAILABLE" "$SMB_CONF" && echo yes || echo no)"
+check_path "offline direct share uses an existing inert local path" yes \
+    "$SMBPROXY_OFFLINE_PATH"
+direct_path=$(awk -F= '
+    $0 == "[Direct]" { in_section=1; next }
+    in_section && /^\[/ { in_section=0 }
+    in_section && /^[[:space:]]*path[[:space:]]*=/ {
+        sub(/^[^=]*=[[:space:]]*/, "")
+        path=$0
+    }
+    END { print path }
+' "$SMB_CONF")
+check_eq "offline direct share overrides a disconnected backend path" \
+    "$SMBPROXY_OFFLINE_PATH" "$direct_path"
+
+worker_run
+check_eq "next offline pass reconciles the idle automount" \
+    "Direct:$TEST_ROOT/backend-direct:offline" "$AUTOMOUNT_ACTION"
 
 TEST_REACHABLE=yes
+mkdir -p "$TEST_ROOT/backend-direct"
 worker_run
+check_eq "recovered direct share restores its automount" \
+    "Direct:$TEST_ROOT/backend-direct:online" "$AUTOMOUNT_ACTION"
 check_eq "successful health check restores share availability" "no" \
     "$(grep -qF "$MANAGED_AVAILABLE" "$SMB_CONF" && echo yes || echo no)"
 check_eq "health marker is also removed on recovery" "no" \
     "$(grep -qF "$MANAGED_MARKER" "$SMB_CONF" && echo yes || echo no)"
+direct_path=$(awk -F= '
+    $0 == "[Direct]" { in_section=1; next }
+    in_section && /^\[/ { in_section=0 }
+    in_section && /^[[:space:]]*path[[:space:]]*=/ {
+        sub(/^[^=]*=[[:space:]]*/, "")
+        path=$0
+    }
+    END { print path }
+' "$SMB_CONF")
+check_eq "successful health check restores the configured backend path" \
+    "$TEST_ROOT/backend-direct" "$direct_path"
+
+echo "== pre-connect failure hint =="
+rm -f "$HEALTH_DIR/Direct.env"
+mkdir -p "$SMBPROXY_PROBE_HINT_DIR"
+: > "$SMBPROXY_PROBE_HINT_DIR/Direct"
+TEST_REACHABLE=no
+worker_run
+check_eq "hint plus independent worker failure withdraws in one pass" "yes" \
+    "$(grep -qF "$MANAGED_AVAILABLE" "$SMB_CONF" && echo yes || echo no)"
+check_path "worker consumes the pre-connect failure hint" no \
+    "$SMBPROXY_PROBE_HINT_DIR/Direct"
+
+echo "== active mount cleanup guard =="
+TEST_AUTOMOUNT_ACTIVE=yes
+TEST_DIRECT_MOUNT_ACTIVE=yes
+TEST_FRONTEND_ACTIVE=yes
+SYSTEMCTL_ACTION=""
+backend_automount_unit() { printf 'fixture.automount'; }
+backend_mount_unit() { printf 'fixture.mount'; }
+backend_mount_active() { [[ "$TEST_DIRECT_MOUNT_ACTIVE" == yes ]]; }
+frontend_share_active() { [[ "$TEST_FRONTEND_ACTIVE" == yes ]]; }
+systemctl() {
+    local action="$1" unit="${2:-}"
+    case "$action" in
+        show) printf 'loaded\n' ;;
+        is-active) [[ "$TEST_AUTOMOUNT_ACTIVE" == yes ]] ;;
+        stop)
+            SYSTEMCTL_ACTION="stop:${*:2}"
+            TEST_AUTOMOUNT_ACTIVE=no
+            [[ " $* " == *' fixture.mount '* ]] && TEST_DIRECT_MOUNT_ACTIVE=no
+            ;;
+        start)
+            SYSTEMCTL_ACTION="start:${*:2}"
+            TEST_AUTOMOUNT_ACTIVE=yes
+            ;;
+        reset-failed) : ;;
+    esac
+}
+set_direct_automount_availability_real Direct /fixture/direct offline
+check_eq "active frontend session defers mounted-backend cleanup" "" \
+    "$SYSTEMCTL_ACTION"
+TEST_FRONTEND_ACTIVE=no
+set_direct_automount_availability_real Direct /fixture/direct offline
+check_eq "session-free offline share stops mount and automount together" \
+    "stop:fixture.automount fixture.mount" "$SYSTEMCTL_ACTION"
+SYSTEMCTL_ACTION=""
+set_direct_automount_availability_real Direct /fixture/direct online
+check_eq "recovery restarts the idle automount" \
+    "start:fixture.automount" "$SYSTEMCTL_ACTION"
 
 echo
 echo "summary: $PASS passed, $FAIL failed"

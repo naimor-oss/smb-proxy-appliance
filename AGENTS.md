@@ -147,15 +147,27 @@ Companion defenses ship alongside `soft`:
   `root preexec close = yes` runs a 1 s TCP probe of the backend at
   tree-connect time. An unreachable backend short-circuits the tree
   connect at ~1 s instead of letting the client cycle through
-  chdir-on-automount.
+  chdir-on-automount. This applies to both direct profiles. A failed probe
+  writes a runtime hint and wakes the health worker; the worker still performs
+  its own independent probe before withdrawing the share.
 
 The legacy profile deliberately stays HARD — under .TPS multi-writer
-workloads, a soft-mount mid-write error would corrupt the database.
-Modern/direct shares still use the bounded tree-connect TCP probe.
+workloads, a soft-mount mid-write error would corrupt the database. The legacy
+pre-connect TCP probe affects only new trees and never closes an existing hard
+session mount.
 The periodic share worker marks every direct share `available = no`
-after two failed probes and reloads Samba, so new connections fail
-with an unavailable-share response. Existing sessions are not
-force-closed.
+after two failed probes, overrides its effective path with the inert local
+`/run/smbproxy/offline` directory, and reloads Samba. The path override keeps
+unrelated tree connects from blocking while Samba checks a disconnected CIFS
+mount. New connections fail with an unavailable-share response; existing
+sessions are not force-closed.
+
+For a modern/direct share whose backend is offline, the worker waits until a
+later pass after the Samba withdrawal. It then stops the generated `.mount`
+and `.automount` units only if `smbstatus` reports no frontend session for that
+share. If a session exists or session state cannot be read, cleanup is deferred
+and retried. Recovery starts the automount and must pass a bounded backend
+mount/list probe before the share is published again.
 
 ## Offline behavior
 

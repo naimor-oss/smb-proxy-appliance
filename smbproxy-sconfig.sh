@@ -629,9 +629,9 @@ STANZA
     esac
 }
 
-# Emits the share's `root preexec` probe stanza for modern/direct
-# shares. Queued shares serve the local data disk, and legacy ISAM
-# shares retain their existing no-preexec behavior.
+# Emits the share's `root preexec` probe stanza for every direct share.
+# Queued shares serve the local data disk and therefore do not probe the
+# delivery backend when an office client connects.
 #
 # Direct mode: a 1s TCP probe of the backend at tree-connect time,
 # with `close = yes` so an offline device aborts the tree connect
@@ -644,7 +644,7 @@ STANZA
 frontend_offline_probe_stanza() {
     local profile="${1:-$PROFILE_LEGACY}"
     local mode="${2:-$OFFLINE_DIRECT}"
-    if [[ "$profile" == "$PROFILE_MODERN" && "$mode" == "$OFFLINE_DIRECT" ]]; then
+    if [[ "$mode" == "$OFFLINE_DIRECT" ]]; then
         cat <<'STANZA'
     # Pre-connect backend probe (see smbproxy-probe-backend). Aborts
     # the tree connect in ~1s if the backend device is powered off,

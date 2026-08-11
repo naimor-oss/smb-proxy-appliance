@@ -82,7 +82,7 @@ run_migration
 [[ "$first_fstab" == "$(shasum "$TEST_ROOT/fstab")" ]]
 [[ $(grep -cF 'vfs objects = smbproxy_session fileid acl_xattr' "$TEST_ROOT/smb.conf") -eq 1 ]]
 [[ $(grep -cF 'fileid:algorithm = fsname' "$TEST_ROOT/smb.conf") -eq 1 ]]
-[[ $(grep -cF 'root preexec = /usr/local/sbin/smbproxy-probe-backend "%S"' "$TEST_ROOT/smb.conf") -eq 1 ]]
+[[ $(grep -cF 'root preexec = /usr/local/sbin/smbproxy-probe-backend "%S"' "$TEST_ROOT/smb.conf") -eq 2 ]]
 
 # A custom hook is never overwritten silently.
 sed -i.bak '/\[CNC\]/a\

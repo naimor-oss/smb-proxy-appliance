@@ -15,32 +15,47 @@ live locking contract.
 
 ## Direct mode
 
-Direct mode layers three bounded failure controls:
+Direct mode layers four bounded failure controls:
 
 1. `soft,echo_interval=10` on modern cifs mounts returns an I/O error
    when an established connection dies. Legacy mounts remain hard for
    ISAM write integrity.
 2. `x-systemd.mount-timeout=4` caps modern automount attempts.
-3. Modern/direct shares use `root preexec = smbproxy-probe-backend`
-   for a one-second TCP/445 check at tree-connect time.
+3. Every direct share, including legacy per-tree shares, uses
+   `root preexec = smbproxy-probe-backend` for a one-second TCP/445 check at
+   tree-connect time. A failed client probe wakes the health worker, which
+   performs an independent confirmation immediately instead of waiting for
+   the next timer tick.
+4. After withdrawal, the next worker pass stops the modern backend's mount and
+   automount only when that share has no active frontend session. Cleanup is
+   deferred and retried while a session exists.
 
-The `smbproxy-share-worker.timer` runs every 15 seconds. After two
-consecutive failed TCP/445 probes it inserts this managed setting into
-the share section and reloads Samba:
+The `smbproxy-share-worker.timer` runs every 15 seconds. Normally two
+consecutive failed TCP/445 probes withdraw a direct share. A failed
+tree-connect probe supplies the first failure hint and wakes the worker, so an
+immediate independent failure can withdraw it without waiting 15 seconds. The
+worker inserts this managed setting and reloads Samba:
 
 ```ini
+path = /run/smbproxy/offline
 # smbproxy-health: backend unavailable
 available = no
 ```
 
 New tree connects then receive the normal unavailable-share response
-instead of Windows repeatedly retrying a failed preexec. A successful
-probe removes the managed lines and reloads the configuration.
+instead of Windows repeatedly retrying a failed preexec. The worker replaces
+the configured backend path in place because `smbd` validates the path as it
+loads that line; a later duplicate `path` directive would still block against
+the disconnected CIFS mount. For a modern/direct share, recovery also requires
+a bounded successful mount/list probe; TCP/445 alone is insufficient. The
+worker then restores the configured path from per-share state, removes the
+managed availability lines, and reloads the configuration.
 
 The worker does not force-close existing Samba sessions. This is
 intentional: for a legacy hard-mounted ISAM share, an in-flight write
 must either finish when the backend returns or remain blocked. Health
-state only controls new tree connects.
+state first controls new tree connects. A soft modern mount may be stopped on a
+later pass only after `smbstatus` confirms that its own share has no session.
 
 Runtime status is written to:
 
@@ -117,4 +132,5 @@ sudo journalctl -u smbproxy-share-worker.service
 
 bash tests/unit-helpers.sh
 bash tests/share-worker.sh
+bash tests/probe-backend.sh
 ```

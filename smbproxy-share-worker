@@ -20,9 +20,12 @@ STATE_DIR="${SMBPROXY_STATE_DIR:-/var/lib/smbproxy}"
 SHARES_DIR="${SMBPROXY_SHARES_DIR:-${STATE_DIR}/shares}"
 HEALTH_DIR="${SMBPROXY_HEALTH_DIR:-${STATE_DIR}/health}"
 DATA_ROOT="${SMBPROXY_DATA_ROOT:-/srv/smbproxy-data}"
+SESSION_ROOT="${SMBPROXY_SESSION_ROOT:-/run/smbproxy/sessions}"
 SMB_CONF="${SMBPROXY_SMB_CONF:-/etc/samba/smb.conf}"
 SMB_CONF_LOCK="${SMBPROXY_SMB_CONF_LOCK:-/run/lock/smbproxy-smb-conf.lock}"
 LOCK_FILE="${SMBPROXY_WORKER_LOCK:-/run/lock/smbproxy-share-worker.lock}"
+OFFLINE_PATH="${SMBPROXY_OFFLINE_PATH:-/run/smbproxy/offline}"
+PROBE_HINT_DIR="${SMBPROXY_PROBE_HINT_DIR:-/run/smbproxy/probe-fail}"
 FAIL_THRESHOLD="${SMBPROXY_FAIL_THRESHOLD:-2}"
 PROBE_SECONDS="${SMBPROXY_PROBE_SECONDS:-1}"
 MOUNT_SECONDS="${SMBPROXY_MOUNT_SECONDS:-8}"
@@ -80,6 +83,77 @@ backend_mount_ready() {
     timeout "$MOUNT_SECONDS" ls -A -- "$mount_path" >/dev/null 2>&1 \
         || return 1
     backend_mount_active "$mount_path"
+}
+
+backend_automount_unit() {
+    local mount_path="$1"
+    command -v systemd-escape >/dev/null 2>&1 || return 1
+    systemd-escape --path --suffix=automount -- "$mount_path" 2>/dev/null
+}
+
+backend_mount_unit() {
+    local mount_path="$1"
+    command -v systemd-escape >/dev/null 2>&1 || return 1
+    systemd-escape --path --suffix=mount -- "$mount_path" 2>/dev/null
+}
+
+frontend_share_active() {
+    local share_name="$1" output
+    command -v smbstatus >/dev/null 2>&1 || return 0
+    output=$(smbstatus --shares 2>/dev/null) || return 0
+    awk -v share="$share_name" '$1 == share { found=1; exit }
+        END { exit !found }' <<< "$output"
+}
+
+set_direct_automount_availability() {
+    local share_name="$1" mount_path="$2" availability="$3"
+    local unit mount_unit load_state
+    [[ -n "$mount_path" ]] || return 0
+    command -v systemctl >/dev/null 2>&1 || return 0
+    unit=$(backend_automount_unit "$mount_path") || return 0
+    load_state=$(systemctl show "$unit" -p LoadState --value 2>/dev/null || true)
+    [[ "$load_state" == "loaded" ]] || return 0
+
+    case "$availability" in
+        offline)
+            if backend_mount_active "$mount_path"; then
+                if frontend_share_active "$share_name"; then
+                    log "share=${share_name} backend cleanup deferred: frontend session active"
+                    return 0
+                fi
+                mount_unit=$(backend_mount_unit "$mount_path") || return 0
+                if ! systemctl stop "$unit" "$mount_unit"; then
+                    log "share=${share_name} mount cleanup failed backend=offline"
+                    return 1
+                fi
+                if backend_mount_active "$mount_path"; then
+                    log "share=${share_name} mount remains active after cleanup"
+                    return 1
+                fi
+                systemctl reset-failed "$mount_unit" >/dev/null 2>&1 || true
+                log "share=${share_name} mount=${mount_unit} state=stopped backend=offline"
+                return 0
+            fi
+            if systemctl is-active --quiet "$unit" 2>/dev/null; then
+                if systemctl stop "$unit"; then
+                    log "share=${share_name} automount=${unit} state=stopped backend=offline"
+                else
+                    log "share=${share_name} automount=${unit} stop failed backend=offline"
+                    return 1
+                fi
+            fi
+            ;;
+        online)
+            if ! systemctl is-active --quiet "$unit" 2>/dev/null; then
+                if systemctl start "$unit"; then
+                    log "share=${share_name} automount=${unit} state=started backend=online"
+                else
+                    log "share=${share_name} automount=${unit} start failed backend=online"
+                    return 1
+                fi
+            fi
+            ;;
+    esac
 }
 
 load_health() {
@@ -300,32 +374,55 @@ sync_queued_share() {
 }
 
 render_direct_availability_unlocked() {
-    local offline_file="$1"
+    local direct_file="$1"
     [[ -f "$SMB_CONF" ]] || return 0
     local candidate="${SMB_CONF}.health.$$"
 
-    awk -v marker="$MANAGED_MARKER" -v setting="$MANAGED_AVAILABLE" '
-        FILENAME == ARGV[1] {
-            offline["[" $0 "]"] = 1
-            next
-        }
-        $0 == marker {
-            remove_setting = 1
-            next
-        }
-        remove_setting && $0 == setting {
-            remove_setting = 0
-            next
-        }
-        {
-            remove_setting = 0
-            print
-            if ($0 in offline) {
+    # Replace the configured path in place rather than appending an override.
+    # smbd validates a path while loading its line, so merely adding a later
+    # path directive still blocks in stat(2) on a disconnected CIFS mount.
+    # The per-share state file supplies the original path for recovery.
+    awk -F '\t' -v marker="$MANAGED_MARKER" \
+        -v setting="$MANAGED_AVAILABLE" -v offline_path="$OFFLINE_PATH" '
+        function emit_managed() {
+            if (current_offline) {
                 print marker
                 print setting
             }
+            current_offline = 0
         }
-    ' "$offline_file" "$SMB_CONF" > "$candidate"
+        FILENAME == ARGV[1] {
+            section = "[" $1 "]"
+            configured_path[section] = $2
+            offline[section] = ($3 == "offline")
+            next
+        }
+        $0 == marker {
+            remove_managed = 1
+            next
+        }
+        remove_managed && ($0 == setting \
+            || $0 ~ /^[[:space:]]*path[[:space:]]*=/) {
+            next
+        }
+        {
+            remove_managed = 0
+            if ($0 ~ /^\[[^]]+\][[:space:]]*$/) {
+                emit_managed()
+                current_section = $0
+                current_offline = offline[current_section]
+            }
+            if ((current_section in configured_path) \
+                && $0 ~ /^[[:space:]]*path[[:space:]]*=/) {
+                print "    path = " \
+                    (offline[current_section] ? offline_path \
+                                              : configured_path[current_section])
+                next
+            }
+            print
+        }
+        END { emit_managed() }
+    ' "$direct_file" "$SMB_CONF" > "$candidate"
 
     if cmp -s "$candidate" "$SMB_CONF"; then
         rm -f "$candidate"
@@ -348,28 +445,29 @@ render_direct_availability_unlocked() {
 }
 
 render_direct_availability() {
-    local offline_file="$1"
+    local direct_file="$1"
     if ! command -v flock >/dev/null 2>&1; then
-        render_direct_availability_unlocked "$offline_file"
+        render_direct_availability_unlocked "$direct_file"
         return
     fi
     local lock_fd rc
     install -d -m 0755 "$(dirname "$SMB_CONF_LOCK")"
     exec {lock_fd}>"$SMB_CONF_LOCK"
     flock -x "$lock_fd"
-    render_direct_availability_unlocked "$offline_file"
+    render_direct_availability_unlocked "$direct_file"
     rc=$?
     exec {lock_fd}>&-
     return "$rc"
 }
 
 worker_run() {
-    install -d -m 0755 "$HEALTH_DIR"
-    local offline_file="${HEALTH_DIR}/offline-direct.$$"
-    : > "$offline_file"
+    install -d -m 0755 "$HEALTH_DIR" "$OFFLINE_PATH" "$PROBE_HINT_DIR"
+    local direct_file="${HEALTH_DIR}/direct-shares.$$"
+    : > "$direct_file"
 
     shopt -s nullglob
     local share_file safe mode reachable failures last_success mode_error
+    local configured_frontend availability previous_failures was_offline hint
     for share_file in "$SHARES_DIR"/*.env; do
         SHARE_NAME="" PROFILE="" OFFLINE_MODE="" BACKEND_IP=""
         BACKEND_MOUNT="" FRONT_FORCE_USER=""
@@ -389,8 +487,18 @@ worker_run() {
             mode="direct"
         fi
         load_health "$safe"
-        failures="$HEALTH_FAILURES"
+        previous_failures="$HEALTH_FAILURES"
+        hint="${PROBE_HINT_DIR}/${safe}"
+        if [[ -e "$hint" ]]; then
+            if (( previous_failures < FAIL_THRESHOLD - 1 )); then
+                previous_failures=$((FAIL_THRESHOLD - 1))
+            fi
+            rm -f -- "$hint"
+        fi
+        failures="$previous_failures"
         last_success="$HEALTH_LAST_SUCCESS"
+        was_offline="no"
+        (( previous_failures >= FAIL_THRESHOLD )) && was_offline="yes"
 
         if backend_reachable "${BACKEND_IP:-}"; then
             reachable="yes"
@@ -413,8 +521,36 @@ worker_run() {
                 ;;
             *)
                 if (( failures >= FAIL_THRESHOLD )); then
-                    printf '%s\n' "$SHARE_NAME" >> "$offline_file"
+                    availability="offline"
+                else
+                    availability="online"
                 fi
+                if [[ "${PROFILE:-legacy}" == "legacy" ]]; then
+                    configured_frontend="$SESSION_ROOT"
+                else
+                    configured_frontend="$BACKEND_MOUNT"
+                    if [[ "$availability" == "online" ]]; then
+                        set_direct_automount_availability "$SHARE_NAME" \
+                            "$BACKEND_MOUNT" online || true
+                        if [[ "$was_offline" == "yes" ]] \
+                            && ! backend_mount_ready "$BACKEND_MOUNT"; then
+                            reachable="no"
+                            failures=$((previous_failures + 1))
+                            availability="offline"
+                            mode_error="backend SMB mount failed recovery probe"
+                            set_direct_automount_availability "$SHARE_NAME" \
+                                "$BACKEND_MOUNT" offline || true
+                        fi
+                    elif [[ "$was_offline" == "yes" ]]; then
+                        # The prior worker pass already withdrew and reloaded
+                        # this share. Cleanup is deferred until now so an
+                        # in-progress tree connect cannot race the unmount.
+                        set_direct_automount_availability "$SHARE_NAME" \
+                            "$BACKEND_MOUNT" offline || true
+                    fi
+                fi
+                printf '%s\t%s\t%s\n' "$SHARE_NAME" \
+                    "$configured_frontend" "$availability" >> "$direct_file"
                 [[ "$reachable" == "yes" ]] && last_success=$(date +%s)
                 write_health "$safe" "direct" "$reachable" "$failures" \
                     0 0 "$last_success" "$mode_error"
@@ -423,8 +559,8 @@ worker_run() {
     done
     shopt -u nullglob
 
-    render_direct_availability "$offline_file"
-    rm -f "$offline_file"
+    render_direct_availability "$direct_file"
+    rm -f "$direct_file"
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

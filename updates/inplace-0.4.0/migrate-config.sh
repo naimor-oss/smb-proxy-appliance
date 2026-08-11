@@ -47,7 +47,7 @@ migrate_section() {
             || die "share '$name' has multiple vfs objects directives; refusing to guess their order"
     fi
 
-    if [[ "$profile" == "modern" && "$mode" == "direct" ]]; then
+    if [[ "$mode" == "direct" ]]; then
         custom_preexec=$(grep -iE '^[[:space:]]*root preexec[[:space:]]*=' <<< "$section" \
             | grep -ivF '/usr/local/sbin/smbproxy-probe-backend' || true)
         [[ -z "$custom_preexec" ]] \
@@ -62,7 +62,7 @@ migrate_section() {
                 if (!saw_vfs) print "    vfs objects = smbproxy_session fileid"
                 if (!saw_fileid_algorithm) print "    fileid:algorithm = fsname"
             }
-            if (profile == "modern" && mode == "direct") {
+            if (mode == "direct") {
                 if (!saw_probe) print "    root preexec = /usr/local/sbin/smbproxy-probe-backend \"%S\""
                 if (!saw_probe_close) print "    root preexec close = yes"
             }
@@ -119,7 +119,7 @@ migrate_section() {
         }
         lower ~ /^[[:space:]]*root preexec[[:space:]]*=/ \
             && index(lower, "/usr/local/sbin/smbproxy-probe-backend") != 0 {
-            if (profile == "modern" && mode == "direct" && !saw_probe) {
+            if (mode == "direct" && !saw_probe) {
                 print "    root preexec = /usr/local/sbin/smbproxy-probe-backend \"%S\""
                 saw_probe=1
             } else {
@@ -128,7 +128,7 @@ migrate_section() {
             next
         }
         lower ~ /^[[:space:]]*root preexec close[[:space:]]*=/ {
-            if (profile == "modern" && mode == "direct" && !saw_probe_close) {
+            if (mode == "direct" && !saw_probe_close) {
                 print "    root preexec close = yes"
                 saw_probe_close=1
             } else if (!removed_probe) {

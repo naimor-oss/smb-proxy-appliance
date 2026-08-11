@@ -212,8 +212,9 @@ check_eq "modern/direct emits pre-connect probe" "yes" \
     "$(grep -qF 'root preexec = /usr/local/sbin/smbproxy-probe-backend' <<< "$DIRECT_PROBE" && echo yes || echo no)"
 check_eq "modern/queued emits no pre-connect probe" "" \
     "$(frontend_offline_probe_stanza modern queued)"
-check_eq "legacy/direct retains no-preexec behavior" "" \
-    "$(frontend_offline_probe_stanza legacy direct)"
+LEGACY_DIRECT_PROBE=$(frontend_offline_probe_stanza legacy direct)
+check_eq "legacy/direct emits the same bounded pre-connect probe" "yes" \
+    "$(grep -qF 'root preexec = /usr/local/sbin/smbproxy-probe-backend' <<< "$LEGACY_DIRECT_PROBE" && echo yes || echo no)"
 
 #-------------------------------------------------------------------------------
 # resolve_locking_kind — (profile, override) → effective kind.
