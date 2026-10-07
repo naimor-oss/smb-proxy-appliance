@@ -6,7 +6,8 @@
 # Pipeline:
 #   1. Hyper-V: Export-VMSnapshot of the host-agnostic 'deploy-master'
 #      checkpoint to a versioned directory under D:\ISO\Export\.
-#   2. Mac:     copy the merged .vhdx out, convert with qemu-img to .qcow2
+#   2. Mac:     copy the merged .vhdx out. With --hyperv-only, checksum
+#               that single artifact and stop. Otherwise convert to .qcow2
 #               and to streamOptimized .vmdk.
 #   3. Mac:     write a minimal .vmx, run ovftool to bundle the .vmdk as
 #               an .ova for VMware shops.
@@ -69,6 +70,7 @@ Flags:
   -V, --version V       version string for artifact names
                         (default: today's date Y.M.D, e.g. ${VERSION})
       --keep-export     don't remove the host-side export tree on exit
+      --hyperv-only     emit only the merged .vhdx + SHA256SUMS
   -h, --help            show this
 
 Environment overrides: HV_HOST, HV_USER, ISO_DIR_MAC, ISO_DIR_HOST,
@@ -77,6 +79,7 @@ USAGE
 }
 
 KEEP_HOST_EXPORT=0
+HYPERV_ONLY=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -84,6 +87,7 @@ while [[ $# -gt 0 ]]; do
         -s|--snapshot)   SNAPSHOT="$2"; shift 2 ;;
         -V|--version)    VERSION="$2"; recompute_paths; shift 2 ;;
         --keep-export)   KEEP_HOST_EXPORT=1; shift ;;
+        --hyperv-only)   HYPERV_ONLY=1; shift ;;
         -h|--help)       usage; exit 0 ;;
         *) echo "Unknown arg: $1" >&2; usage >&2; exit 2 ;;
     esac
@@ -98,10 +102,22 @@ step() { echo
 ssh_host() { ssh "${HV_USER}@${HV_HOST}" "$@"; }
 
 [[ -d "$ISO_DIR_MAC" ]] || { echo "ISO share not mounted: $ISO_DIR_MAC" >&2; exit 1; }
-[[ -x "$OVFTOOL"     ]] || { echo "ovftool not found at $OVFTOOL" >&2; exit 1; }
-command -v qemu-img >/dev/null || { echo "qemu-img missing (brew install qemu)" >&2; exit 1; }
+if [[ $HYPERV_ONLY -eq 0 ]]; then
+    [[ -x "$OVFTOOL" ]] || { echo "ovftool not found at $OVFTOOL" >&2; exit 1; }
+    command -v qemu-img >/dev/null || { echo "qemu-img missing (brew install qemu)" >&2; exit 1; }
+fi
 
 mkdir -p "$DIST_VER_DIR"
+VHDX_OUT="$DIST_VER_DIR/${ARTIFACT_BASE}.vhdx"
+QCOW2_OUT="$DIST_VER_DIR/${ARTIFACT_BASE}.qcow2"
+VMDK_OUT="$DIST_VER_DIR/${ARTIFACT_BASE}.vmdk"
+OVA_OUT="$DIST_VER_DIR/${ARTIFACT_BASE}.ova"
+VMX_TMP="$DIST_VER_DIR/${ARTIFACT_BASE}.vmx"
+
+if [[ -e "$VHDX_OUT" ]]; then
+    echo "Refusing to overwrite existing artifact: $VHDX_OUT" >&2
+    exit 1
+fi
 
 step "1. Hyper-V: Export-VMSnapshot $VM_NAME / $SNAPSHOT -> $HOST_EXPORT_DIR"
 # Wipe any prior export at the same path so re-runs don't fail with
@@ -135,15 +151,26 @@ EXPORTED_VHDX_MAC="${MAC_EXPORT_DIR}/${VM_NAME}/Virtual Hard Disks/merged.vhdx"
 say "merged vhdx at $EXPORTED_VHDX_MAC"
 [[ -f "$EXPORTED_VHDX_MAC" ]] || { say "merged.vhdx not visible via SMB"; exit 1; }
 
-VHDX_OUT="$DIST_VER_DIR/${ARTIFACT_BASE}.vhdx"
-QCOW2_OUT="$DIST_VER_DIR/${ARTIFACT_BASE}.qcow2"
-VMDK_OUT="$DIST_VER_DIR/${ARTIFACT_BASE}.vmdk"
-OVA_OUT="$DIST_VER_DIR/${ARTIFACT_BASE}.ova"
-VMX_TMP="$DIST_VER_DIR/${ARTIFACT_BASE}.vmx"
-
 step "2. copy merged.vhdx out of the host export into dist/"
 cp "$EXPORTED_VHDX_MAC" "$VHDX_OUT"
 say "wrote $VHDX_OUT ($(du -sh "$VHDX_OUT" | cut -f1))"
+
+if [[ $HYPERV_ONLY -eq 1 ]]; then
+    step "3. SHA256SUMS"
+    (cd "$DIST_VER_DIR" && shasum -a 256 \
+        "${ARTIFACT_BASE}.vhdx" > SHA256SUMS && cat SHA256SUMS)
+
+    step "4. cleanup"
+    if [[ $KEEP_HOST_EXPORT -eq 0 ]]; then
+        say "removing host-side export at $HOST_EXPORT_DIR"
+        ssh_host "Remove-Item -LiteralPath '$HOST_EXPORT_DIR' -Recurse -Force -ErrorAction SilentlyContinue"
+    fi
+
+    echo
+    echo "Done. Hyper-V test artifact in $DIST_VER_DIR/:"
+    ls -lh "$DIST_VER_DIR"
+    exit 0
+fi
 
 step "3. qemu-img convert vhdx -> qcow2"
 qemu-img convert -p -O qcow2 -o compat=1.1 "$VHDX_OUT" "$QCOW2_OUT"

@@ -182,6 +182,41 @@ check_eq "unknown profile falls through to legacy default" \
     "/mnt/legacy/X" "$(share_default_mount 'X' nonsense)"
 
 #-------------------------------------------------------------------------------
+# offline mode and frontend path — protocol/locking and availability
+# behavior are deliberately separate choices.
+#-------------------------------------------------------------------------------
+echo "== offline_mode_validate / share_frontend_path =="
+offline_mode_validate legacy direct
+check_rc "legacy + direct accepted" 0 $?
+offline_mode_validate modern direct
+check_rc "modern + direct accepted" 0 $?
+offline_mode_validate modern queued
+check_rc "modern + queued accepted" 0 $?
+offline_mode_validate legacy queued
+check_rc "legacy + queued rejected (locking safety)" 1 $?
+offline_mode_validate modern nonsense
+check_rc "unknown offline mode rejected" 2 $?
+
+check_eq "modern/direct frontend is live backend mount" \
+    "/mnt/backend/CNC" \
+    "$(share_frontend_path CNC direct /mnt/backend/CNC /fixture/data modern)"
+check_eq "legacy/direct frontend is VFS session root" \
+    "/run/smbproxy/sessions" \
+    "$(share_frontend_path Engineering direct /mnt/legacy/Engineering /fixture/data legacy)"
+check_eq "queued frontend is secondary data disk" \
+    "/fixture/data/shares/Engineering_" \
+    "$(share_frontend_path 'Engineering$' queued /mnt/backend/Engineering /fixture/data modern)"
+
+DIRECT_PROBE=$(frontend_offline_probe_stanza modern direct)
+check_eq "modern/direct emits pre-connect probe" "yes" \
+    "$(grep -qF 'root preexec = /usr/local/sbin/smbproxy-probe-backend' <<< "$DIRECT_PROBE" && echo yes || echo no)"
+check_eq "modern/queued emits no pre-connect probe" "" \
+    "$(frontend_offline_probe_stanza modern queued)"
+LEGACY_DIRECT_PROBE=$(frontend_offline_probe_stanza legacy direct)
+check_eq "legacy/direct emits the same bounded pre-connect probe" "yes" \
+    "$(grep -qF 'root preexec = /usr/local/sbin/smbproxy-probe-backend' <<< "$LEGACY_DIRECT_PROBE" && echo yes || echo no)"
+
+#-------------------------------------------------------------------------------
 # resolve_locking_kind — (profile, override) → effective kind.
 #-------------------------------------------------------------------------------
 echo "== resolve_locking_kind =="
@@ -216,9 +251,10 @@ CREDS="/etc/samba/.creds-X"
 FU_UID="1002"
 FU_GID="1002"
 COMMON="credentials=/etc/samba/.creds-X,nosharesock,serverino,uid=1002,gid=1002,file_mode=0660,dir_mode=0770,_netdev,x-systemd.automount,x-systemd.requires=network-online.target"
+LEGACY="credentials=/etc/samba/.creds-X,vers=1.0,cache=none,hard,nosharesock,serverino,uid=1002,gid=1002,file_mode=0660,dir_mode=0770"
 
-check_eq "legacy: vers=1.0 + cache=none + nobrl appended" \
-    "${COMMON},vers=1.0,cache=none,nobrl" \
+check_eq "legacy: exact dynamic-session options" \
+    "$LEGACY" \
     "$(backend_mount_opts legacy)"
 
 # nosharesock invariant — the prod 2026-05-05 multi-share creds-isolation
@@ -227,6 +263,18 @@ check_eq "legacy: vers=1.0 + cache=none + nobrl appended" \
 check_eq "legacy MUST contain nosharesock" \
     "yes" \
     "$(backend_mount_opts legacy | grep -qF nosharesock && echo yes || echo no)"
+check_eq "legacy MUST NOT contain unsupported nosharecache" \
+    "no" \
+    "$(backend_mount_opts legacy | grep -qF nosharecache && echo yes || echo no)"
+check_eq "legacy MUST NOT contain nobrl (backend lock forwarding)" \
+    "no" \
+    "$(backend_mount_opts legacy | grep -qE '(^|,)nobrl(,|$)' && echo yes || echo no)"
+check_eq "legacy MUST be explicitly hard-mounted (TPS write integrity)" \
+    "yes" \
+    "$(backend_mount_opts legacy | grep -qE '(^|,)hard(,|$)' && echo yes || echo no)"
+check_eq "legacy MUST NOT be a systemd automount" \
+    "no" \
+    "$(backend_mount_opts legacy | grep -qF 'x-systemd.automount' && echo yes || echo no)"
 
 # x-systemd.mount-timeout=4 invariant — the offline-device fail-fast
 # Layer 2 fix (added 2026-05-07): caps each automount attempt at 4s
@@ -299,7 +347,7 @@ done
 # would also be cheap. Today the helper just ignores BACKEND_VERS for
 # legacy. Pin that.
 check_eq "legacy ignores BACKEND_VERS (still vers=1.0)" \
-    "${COMMON},vers=1.0,cache=none,nobrl" \
+    "$LEGACY" \
     "$(BACKEND_VERS=2.1; backend_mount_opts legacy)"
 
 check_eq "modern MUST contain nosharesock" \
@@ -338,6 +386,16 @@ check_eq "legacy MUST have numeric uid=/gid= (not symbolic)" \
 check_eq "modern MUST have numeric uid=/gid= (not symbolic)" \
     "yes" \
     "$(backend_mount_opts modern | grep -qE 'uid=[0-9]+,gid=[0-9]+' && echo yes || echo no)"
+
+LEGACY_SESSION=$(frontend_session_stanza legacy direct)
+check_eq "legacy/direct enables exact session VFS" "yes" \
+    "$(grep -qxF '    vfs objects = smbproxy_session fileid' <<< "$LEGACY_SESSION" && echo yes || echo no)"
+check_eq "legacy/direct normalizes Samba file identity" "yes" \
+    "$(grep -qxF '    fileid:algorithm = fsname' <<< "$LEGACY_SESSION" && echo yes || echo no)"
+check_eq "modern/direct has no session VFS" "" \
+    "$(frontend_session_stanza modern direct)"
+check_eq "modern/queued has no session VFS" "" \
+    "$(frontend_session_stanza modern queued)"
 
 #-------------------------------------------------------------------------------
 # frontend_locking_stanza — smb.conf locking lines per kind.

@@ -3,15 +3,19 @@
 This repository builds a small **SMB1↔SMB3 proxy appliance** on Debian 13.
 The appliance fronts a hardened legacy SMB1 file server (over a dedicated
 point-to-point link) and re-publishes its share to a modern Windows Server
-2025 AD forest as an SMB3-only share, with byte-range locking and oplock
-behavior enforced at the proxy. The motivating use case was multi-user
-ISAM-style databases (e.g. Clarion `.TPS`) where the locking semantics
-need to be enforced at the proxy rather than across the WAN to the legacy
-backend, but the appliance is useful for any aging SMB1/SMB2 file server
-that needs to be re-published into a modern AD forest. A second profile
+2025 AD forest as an SMB3-only share. For legacy shares, every downstream
+authenticated tree gets a distinct upstream SMB1 session and CIFS filesystem
+identity; byte-range locks are forwarded so the legacy SMB1 server remains the
+cross-user lock authority. The motivating use case was multi-user ISAM-style
+databases (e.g. Clarion `.TPS`) whose SMB1 locking behavior must survive the
+protocol boundary. The appliance is also useful for any aging SMB1/SMB2 file
+server that needs to be re-published into a modern AD forest. A second profile
 (`modern`) covers standalone SMB2/3 devices like CNC HMIs, NAS units, and
 other shop-floor appliances that need to be consolidated into DFS-N — see
-[`AGENTS.md`](AGENTS.md) for the profile choices.
+[`AGENTS.md`](AGENTS.md) for the profile choices. Each share also chooses
+an offline policy: serve the live backend and fail fast, or remain
+available from a local data disk and deliver office-managed files
+one-way when the machine returns.
 
 ## Where do I start?
 
@@ -26,15 +30,18 @@ other shop-floor appliances that need to be consolidated into DFS-N — see
 
 The proxy appliance is exercised against the same Windows Server 2025
 forest that the [`samba-addc-appliance`](../samba-addc-appliance/) sibling
-joins. The lab is built from five sibling repositories living next to each
+joins. The lab is built from seven sibling repositories living next to each
 other on disk:
 
 - [`dev-commons`](../dev-commons/) — cross-cutting docs, templates, tooling
 - [`lab-kit`](../lab-kit/) — reusable appliance lab orchestration
 - [`lab-router`](../lab-router/) — simple reusable lab router VM
+- [`appliance-core`](../appliance-core/) — shared runtime libraries vendored during image preparation
 - [`samba-addc-appliance`](../samba-addc-appliance/) — Samba AD DC member
   test fixture (the proxy joins as a domain member of the WS2025 forest;
   the Samba sibling exists for separate testing)
+- [`smbproxy-session-vfs`](../smbproxy-session-vfs/) — separately versioned
+  private Samba VFS component, exact-version build, and compatibility ledger
 - `smb-proxy-appliance` — this proxy and its scenarios
 
 ## Repository Map
@@ -42,7 +49,11 @@ other on disk:
 | Path | Purpose |
 | --- | --- |
 | `prepare-image.sh` | One-time Debian image preparation. Installs Samba member-server, Winbind, Kerberos, cifs-utils, chrony, nftables, and appliance helper scripts. Vendor-, realm-, and credential-neutral. |
-| `smbproxy-sconfig.sh` | Main appliance configuration tool. Provides the whiptail TUI and a small headless CLI. Handles NIC role assignment, AD join, backend SMB1 mount, and frontend SMB3 share. |
+| `smbproxy-sconfig.sh` | Main appliance configuration tool. Provides the whiptail TUI and a small headless CLI. Handles NIC role assignment, AD join, per-share backend state, and frontend SMB3 shares. |
+| `components/smbproxy-session-vfs.env` | Exact version/source pin for the separately released [`smbproxy-session-vfs`](../smbproxy-session-vfs/) component. |
+| `smbproxy-session-mount` | Privileged lifecycle helper for per-tree CIFS mounts under `/run/smbproxy/sessions/`; lock forwarding is mandatory and `nobrl` is forbidden. |
+| `smbproxy-vfs-version-check` | Fails Samba startup closed for legacy shares if the private VFS module no longer matches the installed Debian Samba package revision. |
+| `smbproxy-share-worker` | Periodic backend health and one-way queued-file delivery worker. |
 | `lab/proxy.env` | Lab environment file consumed by the generic runner. |
 | `lab/run-scenario.sh` | Proxy-specific wrapper around `../lab-kit/bin/run-scenario.sh`. |
 | `lab/stage-proxy-base.sh` | Mac-side stager: produces the shared base VHDX and per-VM cloud-init seed ISO. |
@@ -56,6 +67,7 @@ other on disk:
 | `lab/scenarios/frontend-share.sh` | Composes bootstrap + join + full `--configure-share` (with `--group`) + `--apply-firewall`. Verifies SMB3 + Kerberos access. |
 | `lab/scenarios/multi-share.sh` | Configures TWO shares from the same backend with different creds + AD groups; verifies independence; exercises `--remove-share` while another share is configured. |
 | `lab/scenarios/end-to-end.sh` | Single-shot release-gate test. Optional backend read/write roundtrip via `SC_WRITE_ROUNDTRIP=1`. |
+| `lab/scenarios/tps-lock-isolation.sh` | Lock-integrity release gate: runs Samba's two-session overlap torture test and proves distinct live SMB1 mounts and CIFS filesystem identities. |
 | `lab/backend-creds.env.example` | Template for the gitignored `lab/backend-creds.env`. Single-share scenarios need `SC_BACKEND_PASS`; `multi-share` also needs `SC_BACKEND_PASS_B`. |
 | `lab/templates/cloud-init/` | NoCloud seed templates (meta-data, network-config matching by domain MAC, user-data with operator pubkeys). |
 | `lab/keys/` | Operator SSH pubkeys baked into the image at build time. See `lab/keys/README.md`. |
@@ -77,19 +89,32 @@ other on disk:
    host-agnostic master image.
 4. Boot the deployed appliance. The console TTY1 wizard
    (`smbproxy-init`) walks the operator through:
-   - identifying which NIC is the domain NIC and which is the legacy NIC
-     (operator picks by MAC; the wizard shows MAC + link-up state +
-     DHCP lease per interface);
+   - confirming which NIC is the domain NIC and which is the legacy NIC
+     (the default-route/DHCP NIC is preselected as Domain/LAN; the wizard
+     shows MAC + link-up state + DHCP lease per interface, then persists
+     both roles by MAC);
    - applying static IP on the legacy NIC;
    - confirming or pinning a static IP on the domain NIC;
    - hostname, password, SSH key paste, timezone.
+
+Only the persisted Domain/LAN NIC contributes the appliance IP, default
+gateway, DNS, DHCP domain, reverse DNS, hostname domain, and AD discovery.
+The LegacyZone NIC is static-only with DHCP, DNS, default routes, IPv6 RA,
+and link-local addressing disabled.
+
 5. Log in over SSH and run `sudo smbproxy-sconfig` to:
    - join the AD forest;
-   - configure backend SMB1 mount credentials (backend IP, share, user,
+   - configure backend SMB1 credentials (backend IP, share, user,
      password, NetBIOS domain);
-   - configure the frontend SMB3 share (share name, mount path, the AD
+   - configure the frontend SMB3 share (share name, the AD
      group allowed to access it, the local backend force-user);
-   - enable `smbd`, `winbind`, and the systemd-mounted cifs backend.
+   - enable `smbd` and `winbind`. Legacy CIFS mounts are then created and
+     released per authenticated tree; modern/direct backends remain
+     systemd-mounted.
+6. For shares that must remain available while a shop machine is off,
+   attach a separate thin-provisioned virtual disk, initialize it under
+   **System Configuration → Offline-share Data Disk**, and select the
+   share's `queued` offline mode. Direct shares need no data disk.
 
 ## Lab Topology
 

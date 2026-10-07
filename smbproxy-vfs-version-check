@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Fail closed if a legacy share would use a VFS module built against a
+# different Samba package version.  Patch-level ABI drift is uncommon, but a
+# locking-integrity guarantee cannot silently assume it is safe.
+
+set -euo pipefail
+
+SHARES_DIR="${SMBPROXY_STATE_DIR:-/var/lib/smbproxy/shares}"
+if [[ -n "${SMBPROXY_VFS_VERSION_FILE:-}" ]]; then
+    EXPECTED_FILE="$SMBPROXY_VFS_VERSION_FILE"
+elif [[ -r /usr/share/smbproxy-session-vfs/samba-package-version ]]; then
+    EXPECTED_FILE=/usr/share/smbproxy-session-vfs/samba-package-version
+else
+    # Transition path for the frozen 0.4.0-inplace7 updater. New images use
+    # the standalone component package and its /usr/share metadata.
+    EXPECTED_FILE=/usr/lib/smbproxy/samba-version
+fi
+DPKG_QUERY_BIN="${SMBPROXY_DPKG_QUERY_BIN:-dpkg-query}"
+SMBD_BIN="${SMBPROXY_SMBD_BIN:-smbd}"
+
+legacy_configured=0
+shopt -s nullglob
+for state in "$SHARES_DIR"/*.env; do
+    PROFILE=""
+    # shellcheck disable=SC1090
+    source "$state"
+    if [[ "${PROFILE:-legacy}" == "legacy" ]]; then
+        legacy_configured=1
+        break
+    fi
+done
+shopt -u nullglob
+
+[[ $legacy_configured -eq 1 ]] || exit 0
+[[ -r "$EXPECTED_FILE" ]] || { echo "legacy share configured but VFS build version is missing" >&2; exit 1; }
+
+expected=$(<"$EXPECTED_FILE")
+# shellcheck disable=SC2016 # dpkg-query expands the literal ${Version} field
+actual=$("$DPKG_QUERY_BIN" -W -f='${Version}' samba 2>/dev/null || true)
+if [[ "$actual" != "$expected" ]]; then
+    echo "legacy VFS module was built for Debian Samba package '$expected' but installed package is '${actual:-missing}'" >&2
+    echo "rebuild the appliance VFS module before starting SMB service" >&2
+    exit 1
+fi
+
+module_root=$($SMBD_BIN -b 2>/dev/null \
+    | awk -F': ' '/MODULESDIR/ {gsub(/^[[:space:]]+/, "", $2); print $2; exit}')
+[[ -n "$module_root" && -r "$module_root/vfs/fileid.so" ]] || {
+    echo "legacy share configured but Samba's fileid VFS module is missing" >&2
+    exit 1
+}

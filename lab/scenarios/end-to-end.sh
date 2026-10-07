@@ -67,32 +67,34 @@ verify() {
     grep -qE '^joined:[[:space:]]+yes'                 <<< "$out" || rc=1
     grep -qE '^smbd:[[:space:]]+(active|running)'      <<< "$out" || rc=1
     grep -qE '^winbind:[[:space:]]+(active|running)'   <<< "$out" || rc=1
-    # Per-share section in --status output: confirms our share is
-    # listed AND its mount is active AND its smb.conf section is present.
+    # Per-share section confirms the share is session-managed and published.
     grep -qF "  - ${SC_SHARE_NAME}"                    <<< "$out" || { say "--status missing share entry"; rc=1; }
-    grep -qE "active=yes"                              <<< "$out" || { say "--status missing active=yes"; rc=1; }
+    grep -qE "active=sessions=[0-9]+"                  <<< "$out" || { say "--status missing session count"; rc=1; }
     grep -qE "smb_section:[[:space:]]+yes"             <<< "$out" || { say "--status missing smb_section:yes"; rc=1; }
 
-    say "backend mount path is readable through the proxy's local view"
-    out=$(ssh_vm "sudo ls '$SC_BACKEND_MOUNT' 2>&1 | head -10" || true)
+    say "backend is readable through an SMB3 tree connect"
+    out=$(ssh_vm "sudo bash -c 'echo \"$SC_PASS\" | kinit \"$SC_ADMIN@$SC_REALM_UC\" && smbclient -k //$LAB_VM_IP/$SC_SHARE_NAME -m SMB3 -c ls'" 2>&1 || true)
     echo "$out"
-    if grep -qiE 'permission denied|i/o error|cannot access' <<< "$out"; then
-        say "backend mount is up but not readable"; rc=1
+    if grep -qiE 'permission denied|i/o error|NT_STATUS|tree connect failed' <<< "$out"; then
+        say "SMB3-to-SMB1 session path is not readable"; rc=1
     fi
 
     if [[ "${SC_WRITE_ROUNDTRIP:-0}" == "1" ]]; then
         say "legacy SMB1 backend write roundtrip (opt-in via SC_WRITE_ROUNDTRIP=1)"
         # Unique filename so concurrent runs don't collide and so it's
-        # obviously a test artifact if cleanup is interrupted. The proxy
-        # mount uses uid=$SC_FORCE_USER so writes go out as that user.
+        # obviously a test artifact if cleanup is interrupted.
         # shellcheck disable=SC2155  # date(1) cannot fail in any way we'd act on
         local probe=".smb-proxy-roundtrip-$(date -u +%Y%m%dT%H%M%SZ)-$$.tmp"
         out=$(ssh_vm "sudo bash -c '
             set -e
-            f=\"$SC_BACKEND_MOUNT/$probe\"
-            echo proxy-end-to-end-marker > \"\$f\"
-            cat \"\$f\"
-            rm -f \"\$f\"
+            src=/tmp/$probe
+            dst=/tmp/$probe.read
+            echo proxy-end-to-end-marker > \"\$src\"
+            echo \"$SC_PASS\" | kinit \"$SC_ADMIN@$SC_REALM_UC\"
+            smbclient -k //$LAB_VM_IP/$SC_SHARE_NAME -m SMB3 \\
+                -c \"put \$src $probe; get $probe \$dst; del $probe\"
+            grep -qx proxy-end-to-end-marker \"\$dst\"
+            rm -f \"\$src\" \"\$dst\"
             echo OK
         '" 2>&1 || true)
         echo "$out"

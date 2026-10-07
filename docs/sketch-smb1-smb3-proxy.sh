@@ -12,9 +12,12 @@
 #                                assignment, AD join, backend SMB1 mount,
 #                                frontend SMB3 share, diagnostics, services.
 #
-# The intent and the locking-strict frontend stanza in this sketch carried
-# directly into smbproxy-sconfig. The deployment-specific pieces here
-# (legacy SMB1 / modern AD IPs, share names, credentials) became sconfig prompts.
+# The deployment-specific pieces here (legacy SMB1 / modern AD IPs, share
+# names, credentials) became sconfig prompts. The sketch's static mount and
+# `nobrl` locking model did NOT carry forward: it cannot preserve independent
+# SMB1 lock ownership. Production legacy shares now use the session-aware VFS
+# and one lock-forwarding SMB1 mount per downstream authenticated tree. Treat
+# every locking or mount example below as superseded historical context.
 #
 # ------------------------------------------------------------------------------
 set -euo pipefail

@@ -17,30 +17,37 @@
 #   - Keep deployment-specific decisions out of prepare-image.sh. If a value
 #     depends on realm, DC, legacy backend, share name, or backend creds, set
 #     it here.
-#   - Read AGENTS.md before changing the locking semantics. The frontend
-#     share is deliberately strict-locking + oplocks-off and the backend
-#     cifs mount is deliberately nobrl + cache=none. Those two together
-#     concentrate all locking at the proxy, which is what makes multi-user
-#     .TPS files work over an SMB1 backend.
+#   - Read AGENTS.md before changing the locking semantics. Legacy shares use
+#     one distinct upstream SMB1 mount/session for every downstream Samba tree
+#     connection and normalize them into one Samba file identity. `nobrl` is
+#     forbidden: locks must also reach the SMB1 server.
 #===============================================================================
 set -uo pipefail
 
-readonly VERSION="0.1.0"
+readonly VERSION="0.4.0"
 readonly SCRIPT_NAME="smbproxy-sconfig"
 readonly WT_HEIGHT=22
 readonly WT_WIDTH=78
 readonly WT_MENU_HEIGHT=14
 
-readonly ROLES_FILE="/etc/smbproxy/nic-roles.env"
+readonly ROLES_FILE="${SMBPROXY_ROLES_FILE:-/etc/smbproxy/nic-roles.env}"
+readonly DETECT_FILE="${SMBPROXY_DETECT_FILE:-/var/lib/smbproxy-init-detected.env}"
 readonly STATE_DIR="/var/lib/smbproxy"
 readonly DEPLOY_FILE="${STATE_DIR}/deploy.env"
 readonly SHARES_DIR="${STATE_DIR}/shares"
 readonly CREDS_DIR="/etc/samba"
 readonly CREDS_PREFIX=".creds-"
 readonly SMB_CONF="/etc/samba/smb.conf"
+readonly SMB_CONF_LOCK="/run/lock/smbproxy-smb-conf.lock"
+readonly WORKER_LOCK="/run/lock/smbproxy-share-worker.lock"
 readonly KRB5_CONF="/etc/krb5.conf"
 readonly NFT_TEMPLATE="/etc/nftables-smbproxy.conf"
 readonly NFT_LIVE="/etc/nftables.conf"
+readonly DATA_ROOT="/srv/smbproxy-data"
+readonly SESSION_ROOT="/run/smbproxy/sessions"
+readonly SESSION_STATE="/run/smbproxy/session-state"
+readonly SESSION_HELPER="/usr/local/sbin/smbproxy-session-mount"
+readonly VFS_VERSION_HELPER="/usr/local/sbin/smbproxy-vfs-version-check"
 
 readonly JOIN_LOG="/var/log/smbproxy-join.log"
 readonly SHARE_LOG="/var/log/smbproxy-share.log"
@@ -52,6 +59,8 @@ readonly SHARE_LOG="/var/log/smbproxy-share.log"
 # resolve_locking_kind, share_default_mount, and any_legacy_profile_shares.
 readonly PROFILE_LEGACY="legacy"
 readonly PROFILE_MODERN="modern"
+readonly OFFLINE_DIRECT="direct"
+readonly OFFLINE_QUEUED="queued"
 
 #===============================================================================
 # UTILITIES
@@ -67,6 +76,7 @@ if [[ -d "$APPCORE_LIBS" ]]; then
     [[ -f "$APPCORE_LIBS/hostname.sh"   ]] && source "$APPCORE_LIBS/hostname.sh"
     [[ -f "$APPCORE_LIBS/detect-net.sh" ]] && source "$APPCORE_LIBS/detect-net.sh"
     [[ -f "$APPCORE_LIBS/netconfig.sh"  ]] && source "$APPCORE_LIBS/netconfig.sh"
+    [[ -f "$APPCORE_LIBS/timezone.sh"   ]] && source "$APPCORE_LIBS/timezone.sh"
 fi
 
 # info / yesno / die delegate to appliance-core's sized whiptail
@@ -158,6 +168,61 @@ load_deploy() {
     fi
 }
 
+_proxy_detect_cache_value() {
+    local key="$1"
+    [[ -r "$DETECT_FILE" ]] || return 0
+    awk -F= -v key="$key" '
+        $1 == key {
+            value=substr($0, index($0, "=") + 1)
+            sub(/^"/, "", value); sub(/"$/, "", value)
+            print value
+            exit
+        }
+    ' "$DETECT_FILE"
+}
+
+# Canonical deployment context. Only the persisted Domain/LAN NIC may
+# contribute the appliance IP, gateway, resolver, DHCP domain, or PTR.
+# Before roles are assigned, appliance-core safely falls back to the
+# default-route interface; the gateway-less legacy link cannot win.
+refresh_proxy_network_context() {
+    load_roles
+    APPCORE_DET_IFACE="" APPCORE_DET_IP="" APPCORE_DET_GATEWAY=""
+    APPCORE_DET_DHCP_DNS="" APPCORE_DET_DHCP_DOMAIN=""
+    APPCORE_DET_PTR_FQDN=""
+    APPCORE_DET_PTR_DOMAIN="" APPCORE_DET_EFFECTIVE_DOMAIN=""
+    APPCORE_DET_EFFECTIVE_DOMAIN_SOURCE=""
+    if command -v appcore_detect_net_init >/dev/null 2>&1; then
+        appcore_detect_net_init "$DETECT_FILE" "${DOMAIN_NIC_NAME:-}" \
+            >/dev/null 2>&1 || true
+        return
+    fi
+
+    # Compatibility path for an older image without the shared detector.
+    APPCORE_DET_IFACE=$(_proxy_detect_cache_value APPCORE_DET_IFACE)
+    APPCORE_DET_IP=$(_proxy_detect_cache_value APPCORE_DET_IP)
+    APPCORE_DET_GATEWAY=$(_proxy_detect_cache_value APPCORE_DET_GATEWAY)
+    APPCORE_DET_DHCP_DNS=$(_proxy_detect_cache_value APPCORE_DET_DHCP_DNS)
+    APPCORE_DET_DHCP_DOMAIN=$(_proxy_detect_cache_value APPCORE_DET_DHCP_DOMAIN)
+    APPCORE_DET_PTR_DOMAIN=$(_proxy_detect_cache_value APPCORE_DET_PTR_DOMAIN)
+    APPCORE_DET_EFFECTIVE_DOMAIN="${APPCORE_DET_DHCP_DOMAIN:-$APPCORE_DET_PTR_DOMAIN}"
+}
+
+refresh_proxy_domain_defaults() {
+    refresh_proxy_network_context
+    PROXY_DEFAULT_REALM=$(printf '%s' "${APPCORE_DET_EFFECTIVE_DOMAIN:-}" \
+        | tr '[:lower:]' '[:upper:]')
+    PROXY_DEFAULT_DOMAIN_SHORT="${PROXY_DEFAULT_REALM%%.*}"
+    PROXY_DEFAULT_DC=""
+    local domain="${APPCORE_DET_EFFECTIVE_DOMAIN:-}" dc
+    if [[ -n "$domain" ]]; then
+        dc=$(timeout 5 dig +short -t SRV "_ldap._tcp.${domain}" 2>/dev/null \
+            | awk 'NR==1 {sub(/\.$/,"",$4); print $4}') || dc=""
+        PROXY_DEFAULT_DC="$dc"
+    fi
+    export PROXY_DEFAULT_REALM PROXY_DEFAULT_DOMAIN_SHORT PROXY_DEFAULT_DC
+}
+
 #-------------------------------------------------------------------------------
 # Per-share state model.
 #
@@ -167,7 +232,9 @@ load_deploy() {
 #     BACKEND_DOMAIN, BACKEND_MOUNT, FRONT_GROUP, FRONT_FORCE_USER).
 #   - one credentials file at $CREDS_DIR/$CREDS_PREFIX<safe> mode 0600
 #     root:root, carrying username/password/domain for the cifs mount.
-#   - one cifs entry in /etc/fstab keyed by the per-share BACKEND_MOUNT.
+#   - modern shares: one cifs entry in /etc/fstab.
+#   - legacy shares: runtime CIFS mounts under $SESSION_ROOT, one per Samba
+#     session/tree, with lifecycle records under $SESSION_STATE.
 #   - one [SHARE_NAME] section in $SMB_CONF.
 #
 # By convention SHARE_NAME is used as both the legacy backend share name
@@ -277,6 +344,134 @@ share_creds_file() {
     echo "${CREDS_DIR}/${CREDS_PREFIX}$(share_safe_name "$1")"
 }
 
+# Offline behavior is orthogonal to the backend protocol/locking
+# profile. Legacy ISAM shares must stay direct because replaying
+# cached writes would violate their live locking contract.
+offline_mode_validate() {
+    local profile="$1" mode="$2"
+    case "$mode" in
+        "$OFFLINE_DIRECT") return 0 ;;
+        "$OFFLINE_QUEUED")
+            [[ "$profile" == "$PROFILE_MODERN" ]]
+            return
+            ;;
+        *) return 2 ;;
+    esac
+}
+
+data_mount_ready() {
+    local target
+    target=$(findmnt -rn -T "$DATA_ROOT" -o TARGET 2>/dev/null || true)
+    [[ "$target" == "$DATA_ROOT" ]]
+}
+
+# Print unmounted whole disks suitable for the appliance data volume.
+# Mounted disks (including the OS disk, which has mounted descendants)
+# are omitted from the interactive picker.
+data_disk_candidates() {
+    local device size model mountpoint
+    while read -r device size model; do
+        [[ -n "$device" ]] || continue
+        while IFS= read -r mountpoint; do
+            [[ -n "$mountpoint" ]] && continue 2
+        done < <(lsblk -nrpo MOUNTPOINT "$device" 2>/dev/null)
+        printf '%s\t%s %s\n' "$device" "$size" "${model:-unlabelled disk}"
+    done < <(lsblk -dnpo NAME,SIZE,MODEL -e 7,11 2>/dev/null)
+}
+
+# Destructive by design and called only after the CLI/TUI has required
+# an explicit erase confirmation. The whole secondary disk is ext4 so
+# resize2fs can grow it directly after the hypervisor expands it.
+initialize_data_disk() {
+    local device="$1"
+    [[ -b "$device" ]] || {
+        echo "not a block device: $device" >&2
+        return 2
+    }
+    [[ "$(lsblk -dnro TYPE "$device" 2>/dev/null)" == "disk" ]] || {
+        echo "data device must be a whole disk, not a partition: $device" >&2
+        return 2
+    }
+    if data_mount_ready; then
+        echo "$DATA_ROOT is already mounted; refusing to replace it" >&2
+        return 2
+    fi
+
+    local mountpoint
+    while IFS= read -r mountpoint; do
+        if [[ -n "$mountpoint" ]]; then
+            echo "$device or one of its children is mounted at $mountpoint" >&2
+            return 2
+        fi
+    done < <(lsblk -nrpo MOUNTPOINT "$device" 2>/dev/null)
+
+    local command_name
+    for command_name in wipefs mkfs.ext4 blkid findmnt mount; do
+        command -v "$command_name" >/dev/null 2>&1 || {
+            echo "required command not installed: $command_name" >&2
+            return 2
+        }
+    done
+
+    wipefs -a -- "$device" || return
+    mkfs.ext4 -F -L SMBPROXY_DATA "$device" || return
+    udevadm settle 2>/dev/null || true
+
+    local uuid
+    uuid=$(blkid -s UUID -o value "$device" 2>/dev/null)
+    [[ -n "$uuid" ]] || {
+        echo "formatted $device but could not read its UUID" >&2
+        return 3
+    }
+
+    install -d -o root -g root -m 0755 "$DATA_ROOT"
+    sed -i "\|[[:space:]]${DATA_ROOT}[[:space:]]|d" /etc/fstab
+    printf 'UUID=%s %s ext4 defaults,nofail,x-systemd.device-timeout=10s 0 2\n' \
+        "$uuid" "$DATA_ROOT" >> /etc/fstab
+    systemctl daemon-reload
+    mount "$DATA_ROOT" || return
+    data_mount_ready || {
+        echo "$device did not mount at $DATA_ROOT" >&2
+        return 3
+    }
+    install -d -o root -g root -m 0755 \
+        "${DATA_ROOT}/shares" "${DATA_ROOT}/state"
+}
+
+grow_data_disk() {
+    data_mount_ready || {
+        echo "no data filesystem mounted at $DATA_ROOT" >&2
+        return 2
+    }
+    local source fstype
+    source=$(findmnt -nro SOURCE -T "$DATA_ROOT" 2>/dev/null)
+    fstype=$(findmnt -nro FSTYPE -T "$DATA_ROOT" 2>/dev/null)
+    [[ "$fstype" == "ext4" ]] || {
+        echo "data filesystem must be ext4 to grow (found: ${fstype:-unknown})" >&2
+        return 2
+    }
+    resize2fs "$source"
+}
+
+# The frontend serves the live static cifs mount for modern/direct shares,
+# the data disk for queued shares, and a VFS-replaced placeholder for legacy
+# shares. Optional fourth arg is a test seam; fifth is profile.
+share_frontend_path() {
+    local name="$1" mode="$2" backend_mount="$3"
+    local data_root="${4:-$DATA_ROOT}"
+    local profile="${5:-$PROFILE_LEGACY}"
+    case "$mode" in
+        "$OFFLINE_QUEUED") echo "${data_root}/shares/$(share_safe_name "$name")" ;;
+        *)
+            if [[ "$profile" == "$PROFILE_LEGACY" ]]; then
+                echo "$SESSION_ROOT"
+            else
+                echo "$backend_mount"
+            fi
+            ;;
+    esac
+}
+
 # Profile-aware default mount path. The legacy profile keeps the
 # historical /mnt/legacy/<safe> path so prior installs don't move
 # around; the modern profile lives under /mnt/backend/<safe> to
@@ -375,22 +570,32 @@ backend_mount_opts() {
             echo "${common}${versopt}${sealopt},soft,echo_interval=10,x-systemd.mount-timeout=4"
             ;;
         *)
-            # Legacy (legacy SMB1 (e.g. Clarion .TPS)) profile. vers=1.0 + cache=none +
-            # nobrl is the locking-correct combination — see AGENTS.md
-            # for the full rationale.
-            #
-            # Stays HARD-mounted (no `soft`): under .TPS multi-writer
-            # workloads, a soft-mount I/O error mid-write would corrupt
-            # the database. The locking-correct path requires that
-            # writes either complete or block until the backend is
-            # back; failing-with-error is the worst of both worlds.
-            # The legacy backend is also expected to be always-on
-            # (the legacy zone is hard-wired and not turned off
-            # alongside the workstations), so the offline-hang
-            # problem doesn't apply.
-            echo "${common},vers=1.0,cache=none,nobrl"
+            # Legacy mounts are created dynamically by smbproxy_session,
+            # never by fstab. Each tree gets its own mount point, while
+            # nosharesock gives it a distinct SMB1 transport/session.
+            # `nobrl` is intentionally absent: POSIX byte-range locks from
+            # smbd must become SMB1 LOCKING_ANDX requests at the backend.
+            # `hard` is explicit because the deployed Debian CIFS client
+            # otherwise reports a soft mount; TPS writes must wait rather
+            # than turn a transient backend outage into an I/O error.
+            echo "credentials=${CREDS},vers=1.0,cache=none,hard,nosharesock,serverino,uid=${FU_UID},gid=${FU_GID},file_mode=0660,dir_mode=0770"
             ;;
     esac
+}
+
+# Emit the VFS stanza that replaces SESSION_ROOT with one exact mount keyed by
+# Samba's authenticated session id and tree id. Modern/queued shares do not use
+# the module.
+frontend_session_stanza() {
+    local profile="${1:-$PROFILE_LEGACY}" mode="${2:-$OFFLINE_DIRECT}"
+    if [[ "$profile" == "$PROFILE_LEGACY" && "$mode" == "$OFFLINE_DIRECT" ]]; then
+        cat <<'STANZA'
+    # Maps this downstream authenticated tree to its own SMB1 session, then
+    # normalizes the separate CIFS superblocks into one Samba lock identity.
+    vfs objects = smbproxy_session fileid
+    fileid:algorithm = fsname
+STANZA
+    fi
 }
 
 # Emits the smb.conf locking-stanza lines (already indented for the
@@ -424,24 +629,23 @@ STANZA
     esac
 }
 
-# Emits the share's `root preexec` probe stanza, or empty for profiles
-# that should not probe.
+# Emits the share's `root preexec` probe stanza for every direct share.
+# Queued shares serve the local data disk and therefore do not probe the
+# delivery backend when an office client connects.
 #
-# Modern profile only: a 1s TCP probe of the backend at tree-connect
-# time, with `close = yes` so an offline device aborts the tree connect
+# Direct mode: a 1s TCP probe of the backend at tree-connect time,
+# with `close = yes` so an offline device aborts the tree connect
 # immediately. Without this, an offline backend produces ~60s of
 # Windows retries — Samba returns NT_STATUS_ACCESS_DENIED on every
 # chdir (because the automount fails after our 4s mount-timeout cap),
 # Windows interprets that as "transient, retry," and loops ~12 times.
 # The probe short-circuits to ~1s.
 #
-# Legacy profile: the legacy backend is assumed always-on, so the
-# probe is unnecessary overhead and is omitted.
 frontend_offline_probe_stanza() {
-    local profile="$1"
-    case "$profile" in
-        modern)
-            cat <<'STANZA'
+    local profile="${1:-$PROFILE_LEGACY}"
+    local mode="${2:-$OFFLINE_DIRECT}"
+    if [[ "$mode" == "$OFFLINE_DIRECT" ]]; then
+        cat <<'STANZA'
     # Pre-connect backend probe (see smbproxy-probe-backend). Aborts
     # the tree connect in ~1s if the backend device is powered off,
     # so the client sees one fast error instead of cycling ~12 times
@@ -452,8 +656,7 @@ frontend_offline_probe_stanza() {
     root preexec = /usr/local/sbin/smbproxy-probe-backend "%S"
     root preexec close = yes
 STANZA
-            ;;
-    esac
+    fi
 }
 
 # Returns 0 if any configured share uses the legacy profile. Used by
@@ -497,7 +700,7 @@ load_share() {
     local name="$1"
     SHARE_NAME="" BACKEND_IP="" BACKEND_USER="" BACKEND_DOMAIN=""
     BACKEND_MOUNT="" FRONT_GROUP="" FRONT_FORCE_USER=""
-    PROFILE="" BACKEND_SEAL="" LOCKING_OVERRIDE="" BACKEND_VERS=""
+    PROFILE="" OFFLINE_MODE="" BACKEND_SEAL="" LOCKING_OVERRIDE="" BACKEND_VERS=""
     local f
     f=$(share_state_file "$name")
     [[ -f "$f" ]] || return 1
@@ -505,6 +708,8 @@ load_share() {
     source "$f"
     # Migration default: missing PROFILE = legacy.
     PROFILE="${PROFILE:-$PROFILE_LEGACY}"
+    # Migration default: existing shares continue serving the live backend.
+    OFFLINE_MODE="${OFFLINE_MODE:-$OFFLINE_DIRECT}"
 }
 
 # save_share persists a share's non-credential fields. Caller must have
@@ -520,6 +725,7 @@ save_share() {
 # Credentials live in $(share_creds_file "$SHARE_NAME") (mode 0600), not here.
 SHARE_NAME="${SHARE_NAME}"
 PROFILE="${PROFILE:-$PROFILE_LEGACY}"
+OFFLINE_MODE="${OFFLINE_MODE:-$OFFLINE_DIRECT}"
 BACKEND_IP="${BACKEND_IP:-}"
 BACKEND_USER="${BACKEND_USER:-}"
 BACKEND_DOMAIN="${BACKEND_DOMAIN:-}"
@@ -542,19 +748,57 @@ remove_share() {
 
     # Best-effort unmount before stripping the fstab line — otherwise
     # an active mount lingers without a way to be referenced.
-    local mount_path
+    local mount_path queued_state="" share_profile=""
     if load_share "$name" 2>/dev/null && [[ -n "$BACKEND_MOUNT" ]]; then
         mount_path="$BACKEND_MOUNT"
-        if backend_mount_active "$mount_path" 2>/dev/null; then
+        share_profile="${PROFILE:-$PROFILE_LEGACY}"
+        if [[ "${OFFLINE_MODE:-$OFFLINE_DIRECT}" == "$OFFLINE_QUEUED" ]]; then
+            if ! data_mount_ready; then
+                echo "cannot remove queued share '$name' while $DATA_ROOT is not mounted" >&2
+                return 3
+            fi
+            queued_state="${DATA_ROOT}/state/$(share_safe_name "$name")"
+        fi
+    fi
+
+    if [[ "$share_profile" == "$PROFILE_LEGACY" ]]; then
+        if [[ ! -x "$SESSION_HELPER" ]]; then
+            echo "cannot remove legacy share '$name': session helper is missing" >&2
+            return 4
+        fi
+        # Close active trees first so every open/FID and backend lock is
+        # released before the corresponding SMB1 session is unmounted.
+        smbcontrol smbd close-share "$name" 2>/dev/null || true
+        local _wait
+        for _wait in 1 2 3 4 5; do
+            [[ "$(legacy_session_count "$name")" == "0" ]] && break
+            sleep 1
+        done
+        if ! "$SESSION_HELPER" cleanup-share "$name"; then
+            echo "cannot remove legacy share '$name': upstream sessions are still active" >&2
+            return 4
+        fi
+    fi
+
+    local worker_lock_fd smb_lock_fd
+    install -d -m 0755 "$(dirname "$WORKER_LOCK")"
+    exec {worker_lock_fd}>"$WORKER_LOCK"
+    flock -x "$worker_lock_fd"
+
+    if [[ -n "${mount_path:-}" ]]; then
+        if [[ "$share_profile" != "$PROFILE_LEGACY" ]] \
+            && backend_mount_active "$mount_path" 2>/dev/null; then
             umount "$mount_path" 2>/dev/null || true
         fi
-        # Strip fstab line for this mount point.
+        # Also removes a pre-session-design legacy line during upgrade/removal.
         sed -i "\| ${mount_path} cifs |d" /etc/fstab 2>/dev/null || true
     fi
 
     # Strip the [SHARE_NAME] section from smb.conf, if present and
     # smb.conf exists.
     if [[ -f "$SMB_CONF" ]]; then
+        exec {smb_lock_fd}>"$SMB_CONF_LOCK"
+        flock -x "$smb_lock_fd"
         awk -v sname="[$name]" '
             BEGIN { in_share=0 }
             $0 == sname { in_share=1; next }
@@ -562,14 +806,21 @@ remove_share() {
             !in_share { print }
         ' "$SMB_CONF" > "${SMB_CONF}.new" && mv "${SMB_CONF}.new" "$SMB_CONF"
         chmod 0644 "$SMB_CONF" 2>/dev/null || true
+        exec {smb_lock_fd}>&-
     fi
 
     rm -f "$(share_state_file "$name")"
     rm -f "$(share_creds_file "$name")"
+    # Retain office files for recovery but discard delivery history so a
+    # later re-add cannot replay stale delete intent.
+    if [[ -n "$queued_state" ]]; then
+        rm -rf -- "$queued_state"
+    fi
     systemctl daemon-reload 2>/dev/null || true
     if systemctl is-active --quiet smbd 2>/dev/null; then
         systemctl reload smbd 2>/dev/null || systemctl restart smbd 2>/dev/null || true
     fi
+    exec {worker_lock_fd}>&-
     return 0
 }
 
@@ -636,6 +887,20 @@ backend_mount_active() {
     # when the underlying cifs mount has not been established. Check
     # /proc/mounts for an actual cifs entry at this path instead.
     grep -q " ${mp} cifs " /proc/mounts 2>/dev/null
+}
+
+# Count active dynamic SMB1 session mounts for one legacy share. State files
+# are root-owned runtime records written only after a CIFS mount succeeds.
+legacy_session_count() {
+    local name="$1" count=0 f recorded
+    [[ -d "$SESSION_STATE" ]] || { echo 0; return; }
+    shopt -s nullglob
+    for f in "$SESSION_STATE"/*.env; do
+        recorded=$(sed -n 's/^SHARE_NAME="\(.*\)"$/\1/p' "$f" 2>/dev/null | head -1)
+        [[ "$recorded" == "$name" ]] && count=$((count + 1))
+    done
+    shopt -u nullglob
+    echo "$count"
 }
 
 # True (rc=0) if smb.conf has a `[share_name]` section header. Uses
@@ -743,6 +1008,7 @@ menu_system_config() {
             "2" "Set Timezone" \
             "3" "Run apt update + upgrade" \
             "4" "Show System Info" \
+            "5" "Offline-share Data Disk" \
             "B" "Back to Main Menu" \
             3>&1 1>&2 2>&3) || return
         case "$choice" in
@@ -750,9 +1016,80 @@ menu_system_config() {
             2) config_timezone ;;
             3) run_updates_now ;;
             4) show_system_info ;;
+            5) menu_data_disk ;;
             B|b) return ;;
         esac
     done
+}
+
+menu_data_disk() {
+    while true; do
+        local status="not mounted"
+        if data_mount_ready; then
+            status=$(df -h "$DATA_ROOT" 2>/dev/null | awk 'NR==2 {print $2 " total, " $4 " free"}')
+        fi
+        local choice
+        choice=$(whiptail --title "Offline-share Data Disk" \
+            --menu "Mount: ${DATA_ROOT}\nStatus: ${status}\n\nQueued shares require this separate persistent disk." \
+            "$WT_HEIGHT" "$WT_WIDTH" 5 \
+            "1" "Initialize an attached disk (ERASES it)" \
+            "2" "Grow ext4 after expanding the virtual disk" \
+            "B" "Back" \
+            3>&1 1>&2 2>&3) || return
+        case "$choice" in
+            1) tui_initialize_data_disk ;;
+            2)
+                if ! data_mount_ready; then
+                    info "No data filesystem is mounted at ${DATA_ROOT}."
+                elif yesno "Grow the ext4 filesystem at ${DATA_ROOT} to fill its expanded virtual disk?"; then
+                    if grow_data_disk >/tmp/smbproxy-grow.$$ 2>&1; then
+                        info "Data filesystem grown successfully."
+                    else
+                        whiptail --title "Data disk grow failed" --textbox \
+                            /tmp/smbproxy-grow.$$ 18 "$WT_WIDTH"
+                    fi
+                    rm -f /tmp/smbproxy-grow.$$
+                fi
+                ;;
+            B|b) return ;;
+        esac
+    done
+}
+
+tui_initialize_data_disk() {
+    if data_mount_ready; then
+        info "A data filesystem is already mounted at ${DATA_ROOT}.\nIt must not be replaced while queued shares may contain data."
+        return
+    fi
+    local candidates menu_args=() device description
+    candidates=$(data_disk_candidates)
+    [[ -n "$candidates" ]] || {
+        info "No unmounted whole disks were found.\n\nAttach a secondary virtual disk in the hypervisor, then return here."
+        return
+    }
+    while IFS=$'\t' read -r device description; do
+        menu_args+=("$device" "$description")
+    done <<< "$candidates"
+    device=$(whiptail --title "Initialize offline-share data disk" \
+        --menu "Pick the secondary disk to ERASE and dedicate to queued shares." \
+        "$WT_HEIGHT" "$WT_WIDTH" "$WT_MENU_HEIGHT" \
+        "${menu_args[@]}" 3>&1 1>&2 2>&3) || return
+
+    local expected="ERASE ${device}" confirmation
+    confirmation=$(whiptail --title "CONFIRM DATA LOSS" \
+        --inputbox "ALL DATA on ${device} will be destroyed.\n\nType exactly:\n${expected}" \
+        14 72 "" 3>&1 1>&2 2>&3) || return
+    [[ "$confirmation" == "$expected" ]] || {
+        info "Confirmation did not match. Nothing was changed."
+        return
+    }
+    if initialize_data_disk "$device" >/tmp/smbproxy-data-init.$$ 2>&1; then
+        info "Data disk initialized and mounted at ${DATA_ROOT}.\nQueued shares can now be configured."
+    else
+        whiptail --title "Data disk initialization failed" --textbox \
+            /tmp/smbproxy-data-init.$$ 18 "$WT_WIDTH"
+    fi
+    rm -f /tmp/smbproxy-data-init.$$
 }
 
 config_hostname() {
@@ -765,7 +1102,7 @@ config_hostname() {
     fi
 
     # The actual rename flow lives in the appliance-core hostname.sh
-    # lib (live DHCP/PTR/dnsdomainname domain detection,
+    # lib (LAN-scoped DHCP/PTR domain detection,
     # NetBIOS-rules short-name validation, safe /etc/hosts rewrite,
     # .local rejection). The is_joined guard above is the only
     # product-specific bit; everything else is shared with samba-addc
@@ -775,17 +1112,35 @@ config_hostname() {
         return
     fi
 
-    if appcore_hostname_change_tui; then
+    refresh_proxy_network_context
+    if appcore_hostname_change_tui "" \
+            "${APPCORE_DET_EFFECTIVE_DOMAIN:-}" "${DOMAIN_NIC_NAME:-}"; then
         info "Hostname set to: ${APPCORE_HOSTNAME_NEW_FQDN}\n\nReboot recommended after the join is complete."
     fi
 }
 
 config_timezone() {
-    local cur new
+    local cur suggested="" failure="" new prompt
     cur=$(timedatectl show --property=Timezone --value 2>/dev/null || echo Etc/UTC)
+    cur="${cur:-Etc/UTC}"
+    if command -v appcore_timezone_suggest >/dev/null 2>&1; then
+        if appcore_timezone_suggest >/dev/null; then
+            suggested="$APPCORE_TIMEZONE_SUGGESTION"
+        else
+            failure="$APPCORE_TIMEZONE_ERROR"
+        fi
+    else
+        failure="Automatic suggestion unavailable on this image."
+    fi
+    prompt="Current timezone: ${cur}"
+    if [[ -n "$suggested" ]]; then
+        prompt+="\nDetected suggestion: ${suggested}"
+    else
+        prompt+="\n${failure}"
+    fi
+    prompt+="\n\nEnter Region/City. Examples:\n  America/Los_Angeles  Europe/London  Asia/Tokyo  Etc/UTC"
     new=$(whiptail --inputbox \
-        "Region/City. Examples:\n  America/Los_Angeles  Europe/London  Asia/Tokyo  Etc/UTC\n\nCurrent: $cur" \
-        14 64 "$cur" 3>&1 1>&2 2>&3) || return
+        "$prompt" 14 70 "${suggested:-$cur}" 3>&1 1>&2 2>&3) || return
     [[ -z "$new" ]] && return
     if timedatectl list-timezones 2>/dev/null | grep -qx "$new"; then
         timedatectl set-timezone "$new"
@@ -828,10 +1183,19 @@ run_updates_now() {
 }
 
 show_system_info() {
+    refresh_proxy_network_context
     {
         echo "=== Identity ==="
         echo "Host:    $(hostname -f)"
         echo "Realm:   $(get_realm_status)"
+        echo
+        echo "=== Domain/LAN environment ==="
+        echo "Interface: ${APPCORE_DET_IFACE:-(not detected)}"
+        echo "IPv4:     ${APPCORE_DET_IP:-(not detected)}"
+        echo "Gateway:  ${APPCORE_DET_GATEWAY:-(not detected)}"
+        echo "DNS:      ${APPCORE_DET_DHCP_DNS:-(not detected)}"
+        echo "Domain:   ${APPCORE_DET_EFFECTIVE_DOMAIN:-(not detected)} (${APPCORE_DET_EFFECTIVE_DOMAIN_SOURCE:-no source})"
+        echo "PTR:      ${APPCORE_DET_PTR_FQDN:-(not detected)}"
         echo
         echo "=== Network interfaces ==="
         ip -br addr show
@@ -979,9 +1343,12 @@ menu_domain_ops() {
 
 probe_dc_tui() {
     load_deploy
+    refresh_proxy_domain_defaults
     local realm dc
-    realm=$(whiptail --inputbox "AD realm (e.g. example.com):" 10 64 "${REALM:-}" 3>&1 1>&2 2>&3) || return
-    dc=$(whiptail --inputbox "DC hostname or IP (e.g. dc1.example.com or 10.0.0.10):" 10 70 "${DC_HOST:-}" 3>&1 1>&2 2>&3) || return
+    realm=$(whiptail --inputbox "AD realm (e.g. example.com):" 10 64 \
+        "${REALM:-$PROXY_DEFAULT_REALM}" 3>&1 1>&2 2>&3) || return
+    dc=$(whiptail --inputbox "DC hostname or IP (e.g. dc1.example.com or 10.0.0.10):" 10 70 \
+        "${DC_HOST:-$PROXY_DEFAULT_DC}" 3>&1 1>&2 2>&3) || return
     [[ -z "$realm" || -z "$dc" ]] && return
     local ip
     if ! ip=$(resolve_dc_ip "$dc"); then
@@ -1148,6 +1515,11 @@ EOF
     security = ads
     netbios name = $(hostname -s | tr '[:lower:]' '[:upper:]' | cut -c1-15)
 
+    # The legacy NIC is a private backend link. Restrict SMB service and AD
+    # DNS registration to the domain-facing interface.
+    interfaces = lo ${DOMAIN_NIC_NAME}
+    bind interfaces only = yes
+
     # Winbind identity (RID for single-domain forests).
     winbind use default domain = yes
     winbind enum users = yes
@@ -1162,6 +1534,9 @@ EOF
     # SMB3 only on the wire facing AD-joined clients.
     server min protocol = SMB3
     client min protocol = SMB3
+    # A legacy backend is single-channel and the session VFS serializes reads.
+    # Reject extra channels from client VPN/VM adapters that can stall I/O.
+    server multi channel support = no
     server signing = mandatory
     client signing = mandatory
     server smb encrypt = desired
@@ -1188,6 +1563,11 @@ EOF
     if ! net ads join -k 2>>"$logf"; then
         log_join "ERROR: 'net ads join -k' failed (see $logf)"
         return 6
+    fi
+
+    if command -v appcore_hostname_align_to_realm >/dev/null 2>&1; then
+        appcore_hostname_align_to_realm "${REALM,,}" 2>>"$logf" || \
+            log_join "WARN: failed to align hostname and /etc/hosts to ${REALM,,}"
     fi
 
     # 6b. Register cifs/ SPNs in AD and re-sync into the local keytab.
@@ -1240,15 +1620,19 @@ EOF
 
 join_domain_tui() {
     load_deploy
+    refresh_proxy_domain_defaults
     if is_joined; then
         if ! whiptail --yesno "This host appears to be joined already.\n\nRe-running the join will overwrite smb.conf, krb5.conf, chrony.conf, and resolv.conf. Continue?" 12 64; then
             return
         fi
     fi
-    REALM=$(whiptail --inputbox "AD realm (e.g. example.com):" 10 64 "${REALM:-}" 3>&1 1>&2 2>&3) || return
-    DOMAIN_SHORT=$(whiptail --inputbox "NetBIOS short domain name (pre-Win2000):" 10 64 "${DOMAIN_SHORT:-${REALM%%.*}}" 3>&1 1>&2 2>&3) || return
+    REALM=$(whiptail --inputbox "AD realm (e.g. example.com):" 10 64 \
+        "${REALM:-$PROXY_DEFAULT_REALM}" 3>&1 1>&2 2>&3) || return
+    DOMAIN_SHORT=$(whiptail --inputbox "NetBIOS short domain name (pre-Win2000):" 10 64 \
+        "${DOMAIN_SHORT:-${PROXY_DEFAULT_DOMAIN_SHORT:-${REALM%%.*}}}" 3>&1 1>&2 2>&3) || return
     DOMAIN_SHORT="${DOMAIN_SHORT^^}"
-    DC_HOST=$(whiptail --inputbox "DC hostname or IP:" 10 64 "${DC_HOST:-}" 3>&1 1>&2 2>&3) || return
+    DC_HOST=$(whiptail --inputbox "DC hostname or IP:" 10 64 \
+        "${DC_HOST:-$PROXY_DEFAULT_DC}" 3>&1 1>&2 2>&3) || return
     AD_USER=$(whiptail --inputbox "Domain admin username (e.g. Administrator):" 10 64 "Administrator" 3>&1 1>&2 2>&3) || return
     AD_PASS=$(whiptail --passwordbox "Password for ${AD_USER}@${REALM^^}:" 10 64 3>&1 1>&2 2>&3) || return
     [[ -z "$AD_PASS" ]] && { info "Password required."; return; }
@@ -1367,7 +1751,9 @@ pick_share() {
         # when they have many.
         load_share "$n" 2>/dev/null
         local mp_status="unmounted"
-        if [[ -n "$BACKEND_MOUNT" ]] && backend_mount_active "$BACKEND_MOUNT" 2>/dev/null; then
+        if [[ "${PROFILE:-$PROFILE_LEGACY}" == "$PROFILE_LEGACY" ]]; then
+            mp_status="sessions=$(legacy_session_count "$n")"
+        elif [[ -n "$BACKEND_MOUNT" ]] && backend_mount_active "$BACKEND_MOUNT" 2>/dev/null; then
             mp_status="mounted"
         fi
         menu_args+=("$n" "${BACKEND_IP:-?}/${n}  ${mp_status}")
@@ -1397,14 +1783,26 @@ shares_list_status() {
             while IFS= read -r n; do
                 load_share "$n" 2>/dev/null
                 printf '== %s ==\n' "$n"
+                printf '  offline mode:   %s\n' "${OFFLINE_MODE:-$OFFLINE_DIRECT}"
                 printf '  backend:        //%s/%s\n' "${BACKEND_IP:-?}" "$n"
                 printf '  backend user:   %s (domain: %s)\n' \
                     "${BACKEND_USER:-?}" "${BACKEND_DOMAIN:-?}"
                 printf '  mount point:    %s' "${BACKEND_MOUNT:-?}"
-                if backend_mount_active "${BACKEND_MOUNT:-/dev/null}" 2>/dev/null; then
+                if [[ "${PROFILE:-$PROFILE_LEGACY}" == "$PROFILE_LEGACY" ]]; then
+                    printf '  [dynamic sessions=%s]\n' "$(legacy_session_count "$n")"
+                elif backend_mount_active "${BACKEND_MOUNT:-/dev/null}" 2>/dev/null; then
                     printf '  [mounted]\n'
                 else
                     printf '  [unmounted]\n'
+                fi
+                printf '  frontend path:  %s\n' \
+                    "$(share_frontend_path "$n" "${OFFLINE_MODE:-$OFFLINE_DIRECT}" "${BACKEND_MOUNT:-}" "$DATA_ROOT" "${PROFILE:-$PROFILE_LEGACY}")"
+                if [[ "${OFFLINE_MODE:-$OFFLINE_DIRECT}" == "$OFFLINE_QUEUED" ]]; then
+                    if data_mount_ready; then
+                        printf '  data disk:      mounted\n'
+                    else
+                        printf '  data disk:      MISSING — queued share unavailable\n'
+                    fi
                 fi
                 printf '  AD access:      %s\n' "${FRONT_GROUP:-?}"
                 printf '  force user:     %s\n' "${FRONT_FORCE_USER:-?}"
@@ -1426,7 +1824,8 @@ shares_list_status() {
 # BACKEND_DOMAIN, BACKEND_MOUNT, BACKEND_PASS, FRONT_GROUP,
 # FRONT_FORCE_USER) and writes:
 #   - per-share creds file (mode 0600 root:root)
-#   - per-share fstab line (replacing any prior with same mount point)
+#   - modern/direct: per-share fstab line (replacing any prior mount point)
+#   - legacy/direct: no fstab line; the VFS owns transient session mounts
 #   - per-share smb.conf section (replacing any prior [SHARE_NAME])
 #   - per-share env file via save_share()
 # Frontend pieces are skipped if not domain-joined (the operator can
@@ -1445,6 +1844,9 @@ shares_list_status() {
 #   9  AD-name-collision REFUSAL — the chosen FRONT_FORCE_USER also
 #      exists in AD; the share is not configured. See AGENTS.md
 #      "force-user contract" and lab/scenarios/collision-refused.sh.
+#  10  invalid offline behavior, including queued mode on legacy
+#  11  queued mode requested without the secondary data filesystem
+#  12  legacy session VFS/helper is missing or built for another Samba version
 #
 # Pre-flight semantics (commit 2368853): all validations that can fail
 # (UID/GID lookup, AD group SID resolve, smb.conf candidate +
@@ -1465,6 +1867,17 @@ configure_share() {
         "$PROFILE_LEGACY"|"$PROFILE_MODERN") : ;;
         *) log_share "ERROR: unknown profile '${PROFILE}' (expected: $PROFILE_LEGACY|$PROFILE_MODERN)"; return 8 ;;
     esac
+    OFFLINE_MODE="${OFFLINE_MODE:-$OFFLINE_DIRECT}"
+    if ! offline_mode_validate "$PROFILE" "$OFFLINE_MODE"; then
+        log_share "ERROR: offline mode '${OFFLINE_MODE}' is invalid for profile '${PROFILE}'."
+        log_share "ERROR: queued mode is supported only for modern file-copy shares."
+        return 10
+    fi
+    if [[ "$OFFLINE_MODE" == "$OFFLINE_QUEUED" ]] && ! data_mount_ready; then
+        log_share "ERROR: queued mode requires a mounted secondary data filesystem at ${DATA_ROOT}."
+        log_share "ERROR: initialize it from System Configuration before configuring the share."
+        return 11
+    fi
 
     # Legacy profile assumes a dedicated backend NIC (the air-gapped
     # LegacyZone subnet). Refuse to configure a legacy share if that
@@ -1478,6 +1891,25 @@ configure_share() {
             log_share "ERROR: legacy-profile share requires a legacy NIC role assignment."
             log_share "ERROR: run 'smbproxy-sconfig' and assign the legacy NIC, or use --profile modern."
             return 7
+        fi
+        local module_root module_path fileid_module expected_version actual_version
+        module_root=$(smbd -b 2>/dev/null | awk -F': ' '/MODULESDIR/ {gsub(/^[[:space:]]+/, "", $2); print $2; exit}')
+        module_path="${module_root}/vfs/smbproxy_session.so"
+        fileid_module="${module_root}/vfs/fileid.so"
+        if [[ -r /usr/share/smbproxy-session-vfs/samba-package-version ]]; then
+            expected_version=$(cat /usr/share/smbproxy-session-vfs/samba-package-version)
+        else
+            # Compatibility with the frozen pre-component updater.
+            expected_version=$(cat /usr/lib/smbproxy/samba-version 2>/dev/null || true)
+        fi
+        actual_version=$(dpkg-query -W -f='${Version}' samba 2>/dev/null || true)
+        if [[ ! -x "$SESSION_HELPER" || ! -x "$VFS_VERSION_HELPER" \
+            || ! -r "$module_path" || ! -r "$fileid_module" \
+            || -z "$expected_version" || "$expected_version" != "$actual_version" ]]; then
+            log_share "ERROR: legacy session VFS is unavailable or does not match installed Samba."
+            log_share "ERROR: expected='${expected_version:-missing}' actual='${actual_version:-missing}' modules='${module_path} ${fileid_module}'."
+            log_share "ERROR: rebuild the appliance image/module; refusing a non-isolated SMB1 path."
+            return 12
         fi
     fi
 
@@ -1539,6 +1971,9 @@ configure_share() {
     install -d -o "$FRONT_FORCE_USER" -g "$FRONT_FORCE_USER" -m 0755 \
         "$BACKEND_MOUNT" 2>/dev/null \
         || install -d -m 0755 "$BACKEND_MOUNT"
+    install -d -o root -g root -m 0755 "$SESSION_ROOT" "$SESSION_STATE"
+    local frontend_path
+    frontend_path=$(share_frontend_path "$SHARE_NAME" "$OFFLINE_MODE" "$BACKEND_MOUNT" "$DATA_ROOT" "$PROFILE")
 
     # ---- PRE-FLIGHT VALIDATION (no persistent writes yet) ----
     # The previous shape wrote creds + fstab line BEFORE running the
@@ -1561,23 +1996,29 @@ configure_share() {
     # Aliases for downstream comments / smb.conf section.
     local fu_uid="$FU_UID" fu_gid="$FU_GID"
 
-    # fstab line is built but NOT written yet. The cifs option string is
-    # profile-driven (see backend_mount_opts):
-    #   legacy: vers=1.0 + cache=none + nobrl — the locking-correct
-    #           combo for ISAM-style (e.g. Clarion .TPS) where the proxy is the
-    #           sole writer and locks are arbitrated at the Samba layer.
+    # The cifs option string is profile-driven (see backend_mount_opts):
+    #   legacy: dynamic per-tree SMB1 mount with cache=none,
+    #           nosharesock, and lock forwarding enabled.
+    #           No fstab line is written for this profile.
     #   modern: vers=3 (auto-negotiate 3.0/3.1.1) + kernel default
     #           caching + optional SMB3 sealing. Suitable for routine
     #           file-copy backends (CNC, NAS) on the domain LAN.
-    # Common to both: nosharesock (per-mount session — the multi-share
-    # creds-isolation defense from 2026-05-05), serverino, automount.
+    # Common to both: numeric uid/gid and a per-share credentials file.
     local mount_opts; mount_opts=$(backend_mount_opts "$PROFILE")
     local fstab_line="//${BACKEND_IP}/${SHARE_NAME} ${BACKEND_MOUNT} cifs ${mount_opts} 0 0"
+
+    # Keep the periodic worker from observing a half-written transition
+    # between direct and queued state. Lock ordering is worker -> smb.conf,
+    # matching the worker itself and remove_share().
+    local worker_lock_fd
+    install -d -m 0755 "$(dirname "$WORKER_LOCK")"
+    exec {worker_lock_fd}>"$WORKER_LOCK"
+    flock -x "$worker_lock_fd"
 
     # Frontend smb.conf section — only validated/built if domain-joined
     # AND FRONT_GROUP is set. Operator can add a share's backend pre-join
     # and publish the frontend later.
-    local group_sid="" smb_conf_pending=""
+    local group_sid="" smb_conf_pending="" smb_lock_fd=""
     if is_joined && [[ -n "$FRONT_GROUP" ]]; then
         # Resolve the AD group to its SID at config time. SID-based
         # `valid users` is unambiguous, NSS-independent, and immune
@@ -1588,8 +2029,16 @@ configure_share() {
         if [[ -z "$group_sid" || ! "$group_sid" =~ ^S-1- ]]; then
             log_share "ERROR: cannot resolve AD group '${FRONT_GROUP}' to a SID via winbind."
             log_share "ERROR: is the group name correct? Is winbind reachable? (try 'wbinfo --name-to-sid=\"${FRONT_GROUP}\"')"
+            exec {worker_lock_fd}>&-
             return 6
         fi
+
+        # Serialize smb.conf read/validate/replace with the periodic
+        # health worker so neither process can overwrite the other's
+        # newly rendered share state.
+        install -d -m 0755 "$(dirname "$SMB_CONF_LOCK")"
+        exec {smb_lock_fd}>"$SMB_CONF_LOCK"
+        flock -x "$smb_lock_fd"
 
         # Build the candidate smb.conf in a temp file. Strip any prior
         # [SHARE_NAME] section, then append fresh.
@@ -1604,8 +2053,8 @@ configure_share() {
         cat >> "$smb_conf_pending" <<EOF
 
 [${SHARE_NAME}]
-    # profile=${PROFILE}; locking=${locking_kind}
-    path = ${BACKEND_MOUNT}
+    # profile=${PROFILE}; locking=${locking_kind}; offline=${OFFLINE_MODE}
+    path = ${frontend_path}
     read only = no
     guest ok = no
     # AD-side ACL: only members of '${FRONT_GROUP}' (resolved at
@@ -1623,17 +2072,27 @@ configure_share() {
     force user = ${FRONT_FORCE_USER}
     force group = ${FRONT_FORCE_USER}
 
-$(frontend_offline_probe_stanza "$PROFILE")
+$(frontend_offline_probe_stanza "$PROFILE" "$OFFLINE_MODE")
+$(frontend_session_stanza "$PROFILE" "$OFFLINE_MODE")
 $(frontend_locking_stanza "$locking_kind")
 EOF
 
         if ! testparm -s "$smb_conf_pending" >/dev/null 2>/tmp/smbproxy-tp.$$; then
             rm -f "$smb_conf_pending"
+            exec {smb_lock_fd}>&-
+            exec {worker_lock_fd}>&-
             return 4
         fi
     fi
 
     # ---- COMMIT (all validations passed; writes from here on) ----
+
+    if [[ "$OFFLINE_MODE" == "$OFFLINE_QUEUED" ]]; then
+        install -d -o "$FRONT_FORCE_USER" -g "$FRONT_FORCE_USER" -m 0770 \
+            "$frontend_path"
+        install -d -o root -g root -m 0755 \
+            "${DATA_ROOT}/state/$(share_safe_name "$SHARE_NAME")/manifest"
+    fi
 
     # Per-share creds file. NEVER log this file's contents.
     install -d -o root -g root -m 0755 "$CREDS_DIR"
@@ -1648,20 +2107,24 @@ EOF
     umask 022
 
     sed -i "\| ${BACKEND_MOUNT} cifs |d" /etc/fstab
-    echo "$fstab_line" >> /etc/fstab
+    if [[ "$PROFILE" == "$PROFILE_MODERN" ]]; then
+        echo "$fstab_line" >> /etc/fstab
+    fi
     systemctl daemon-reload
+
+    # Persist state before publishing/reloading the smb.conf section: the VFS
+    # connect hook intentionally fails closed if its share state is absent.
+    save_share
 
     if [[ -n "$smb_conf_pending" ]]; then
         mv "$smb_conf_pending" "$SMB_CONF"
         chmod 0644 "$SMB_CONF"
         systemctl reload smbd 2>/dev/null || systemctl restart smbd
+        exec {smb_lock_fd}>&-
     fi
 
-    # Persist non-credential fields (BACKEND_PASS is intentionally
-    # NOT in this list; save_share() doesn't touch creds).
-    save_share
-
     BACKEND_PASS=""; unset BACKEND_PASS
+    exec {worker_lock_fd}>&-
     return 0
 }
 
@@ -1706,9 +2169,31 @@ check_share() {
 
     printf '== share: %s\n' "$SHARE_NAME"
     printf '   profile:        %s\n' "$profile"
+    printf '   offline mode:   %s\n' "${OFFLINE_MODE:-$OFFLINE_DIRECT}"
     printf '   backend:        //%s/%s  user=%s domain=%s\n' \
         "${BACKEND_IP:-?}" "$SHARE_NAME" "${BACKEND_USER:-?}" "${BACKEND_DOMAIN:-?}"
     printf '   mount path:     %s\n' "${BACKEND_MOUNT:-?}"
+    printf '   frontend path:  %s\n' \
+        "$(share_frontend_path "$SHARE_NAME" "${OFFLINE_MODE:-$OFFLINE_DIRECT}" "${BACKEND_MOUNT:-}" "$DATA_ROOT" "$profile")"
+    if [[ "${OFFLINE_MODE:-$OFFLINE_DIRECT}" == "$OFFLINE_QUEUED" ]]; then
+        if data_mount_ready; then
+            printf '   data disk:      mounted at %s\n' "$DATA_ROOT"
+        else
+            printf '   data disk:      MISSING at %s\n' "$DATA_ROOT"
+            rc=1
+        fi
+        local health_file
+        health_file="${STATE_DIR}/health/$(share_safe_name "$SHARE_NAME").env"
+        if [[ -r "$health_file" ]]; then
+            local BACKEND_REACHABLE="" PENDING_UPLOADS="" PENDING_DELETES="" LAST_ERROR=""
+            # shellcheck disable=SC1090
+            source "$health_file"
+            printf '   queue:          uploads=%s deletes=%s backend=%s\n' \
+                "${PENDING_UPLOADS:-?}" "${PENDING_DELETES:-?}" \
+                "${BACKEND_REACHABLE:-?}"
+            [[ -z "${LAST_ERROR:-}" ]] || printf '   queue error:    %s\n' "$LAST_ERROR"
+        fi
+    fi
     printf '   force user:     %s\n' "${FRONT_FORCE_USER:-(unset)}"
     printf '   AD group:       %s\n' "${FRONT_GROUP:-(unset — backend-only share)}"
 
@@ -1727,29 +2212,12 @@ check_share() {
         rc=1
     fi
 
-    # --- fstab + expected options ------------------------------------
-    local fstab_line
+    # --- mount strategy + expected options ----------------------------
+    local fstab_line FU_UID FU_GID CREDS expected_opts=""
     fstab_line=$(grep -F " ${BACKEND_MOUNT} cifs " /etc/fstab 2>/dev/null | head -1 || true)
-    if [[ -z "$fstab_line" ]]; then
-        printf '   fstab:          (NO LINE for %s)\n' "$BACKEND_MOUNT"
-        rc=1
-    else
-        # Extract the comma-separated options field. Format:
-        # //ip/share /mnt/x cifs <opts> 0 0
-        local fstab_opts
-        fstab_opts=$(awk '{print $4}' <<< "$fstab_line")
-        printf '   fstab options:  %s\n' "$fstab_opts"
-    fi
-
-    # Compute what the profile would emit today (for drift detection
-    # against the actual /etc/fstab line). Need FU_UID/FU_GID/CREDS in
-    # scope for backend_mount_opts to render. Resolve them here from
-    # the same /etc/passwd path configure_share uses.
-    local FU_UID FU_GID CREDS
     FU_UID=$(awk -F: -v u="${FRONT_FORCE_USER:-}" '$1==u {print $3; exit}' /etc/passwd)
     FU_GID=$(awk -F: -v u="${FRONT_FORCE_USER:-}" '$1==u {print $4; exit}' /etc/passwd)
     CREDS="$creds"
-    local expected_opts=""
     if [[ -n "$FU_UID" && -n "$FU_GID" ]]; then
         expected_opts=$(backend_mount_opts "$profile")
         printf '   profile would:  %s\n' "$expected_opts"
@@ -1758,43 +2226,91 @@ check_share() {
         rc=1
     fi
 
-    # --- live mount --------------------------------------------------
     local live_line live_opts
-    # /proc/mounts is the kernel's source of truth, including the
-    # actual options the cifs driver accepted (which can differ from
-    # what fstab requested if the driver normalized them).
-    live_line=$(awk -v mp="$BACKEND_MOUNT" '$2==mp && $3=="cifs" {print; exit}' /proc/mounts 2>/dev/null || true)
-    if [[ -n "$live_line" ]]; then
-        live_opts=$(awk '{print $4}' <<< "$live_line")
-        printf '   live mount:     ACTIVE\n'
-        printf '   live options:   %s\n' "$live_opts"
+    if [[ "$profile" == "$PROFILE_LEGACY" ]]; then
+        if [[ -n "$fstab_line" ]]; then
+            printf '   DRIFT:          legacy share still has a static fstab mount\n'
+            rc=1
+        else
+            printf '   fstab:          none (correct: session-managed)\n'
+        fi
 
-        # Drift detection: every option the profile emits MUST appear
-        # in the live mount. We don't flag extras (kernel may add
-        # default options like `actimeo=1` that we never specify).
-        local missing=""
-        local opt
-        IFS=',' read -ra _expected_arr <<< "$expected_opts"
-        for opt in "${_expected_arr[@]}"; do
-            # Skip x-systemd.* — those live in fstab, not /proc/mounts.
-            [[ "$opt" == x-systemd.* ]] && continue
-            [[ "$opt" == _netdev ]]      && continue
-            # Skip credentials= — kernel doesn't echo it back.
-            [[ "$opt" == credentials=* ]] && continue
-            if ! grep -qE "(^|,)${opt//./\\.}(,|$)" <<< "$live_opts"; then
-                missing+="${opt} "
+        local session_count=0 session_record recorded_share recorded_mount opt
+        local session_devices="" distinct_devices=0
+        shopt -s nullglob
+        for session_record in "$SESSION_STATE"/*.env; do
+            recorded_share=$(sed -n 's/^SHARE_NAME="\(.*\)"$/\1/p' "$session_record" 2>/dev/null | head -1)
+            [[ "$recorded_share" == "$SHARE_NAME" ]] || continue
+            recorded_mount=$(sed -n 's/^MOUNTPOINT="\(.*\)"$/\1/p' "$session_record" 2>/dev/null | head -1)
+            live_line=$(awk -v mp="$recorded_mount" '$2==mp && $3=="cifs" {print; exit}' /proc/mounts 2>/dev/null || true)
+            if [[ -n "$live_line" ]]; then
+                live_opts=$(awk '{print $4}' <<< "$live_line")
+                session_count=$((session_count + 1))
+                session_devices+="$(stat -c '%d' "$recorded_mount" 2>/dev/null)"$'\n'
+                printf '   session mount:  %s\n' "$recorded_mount"
+                printf '   live options:   %s\n' "$live_opts"
+                if grep -qE '(^|,)nobrl(,|$)' <<< "$live_opts"; then
+                    printf '   DRIFT:          nobrl disables SMB1 lock forwarding\n'
+                    rc=1
+                fi
+                for opt in 'vers=1.0' 'cache=none' 'nosharesock'; do
+                    if ! grep -qE "(^|,)${opt//./\\.}(,|$)" <<< "$live_opts"; then
+                        printf '   DRIFT:          session mount missing %s\n' "$opt"
+                        rc=1
+                    fi
+                done
+            else
+                printf '   DRIFT:          state exists without CIFS mount: %s\n' "$recorded_mount"
+                rc=1
             fi
         done
-        if [[ -n "$missing" ]]; then
-            printf '   DRIFT:          live mount missing: %s\n' "$missing"
-            printf '                   (likely needs: sudo umount %s; sudo mount %s)\n' \
-                "$BACKEND_MOUNT" "$BACKEND_MOUNT"
+        shopt -u nullglob
+        printf '   active sessions: %s (zero is normal while idle)\n' "$session_count"
+        if (( session_count > 1 )); then
+            distinct_devices=$(sed '/^$/d' <<< "$session_devices" | sort -u | wc -l)
+            if [[ "$distinct_devices" -ne "$session_count" ]]; then
+                printf '   DRIFT:          %s sessions but only %s CIFS filesystem identities\n' \
+                    "$session_count" "$distinct_devices"
+                rc=1
+            else
+                printf '   filesystem IDs: %s distinct for %s sessions — OK\n' \
+                    "$distinct_devices" "$session_count"
+            fi
+        fi
+        if ! "$VFS_VERSION_HELPER" 2>/dev/null; then
+            printf '   VFS version:    MISMATCH — smbd will fail closed on restart\n'
             rc=1
+        else
+            printf '   VFS version:    matches installed Samba\n'
         fi
     else
-        # Not currently mounted — could be x-systemd.automount waiting,
-        # or a real failure. Distinguish by probing the backend port.
-        printf '   live mount:     not currently mounted (automount on first access)\n'
+        if [[ -z "$fstab_line" ]]; then
+            printf '   fstab:          (NO LINE for %s)\n' "$BACKEND_MOUNT"
+            rc=1
+        else
+            printf '   fstab options:  %s\n' "$(awk '{print $4}' <<< "$fstab_line")"
+        fi
+
+        live_line=$(awk -v mp="$BACKEND_MOUNT" '$2==mp && $3=="cifs" {print; exit}' /proc/mounts 2>/dev/null || true)
+        if [[ -n "$live_line" ]]; then
+            live_opts=$(awk '{print $4}' <<< "$live_line")
+            printf '   live mount:     ACTIVE\n'
+            printf '   live options:   %s\n' "$live_opts"
+            local missing="" opt
+            IFS=',' read -ra _expected_arr <<< "$expected_opts"
+            for opt in "${_expected_arr[@]}"; do
+                [[ "$opt" == x-systemd.* || "$opt" == _netdev || "$opt" == credentials=* ]] && continue
+                if ! grep -qE "(^|,)${opt//./\\.}(,|$)" <<< "$live_opts"; then
+                    missing+="${opt} "
+                fi
+            done
+            if [[ -n "$missing" ]]; then
+                printf '   DRIFT:          live mount missing: %s\n' "$missing"
+                rc=1
+            fi
+        else
+            printf '   live mount:     not currently mounted (automount on first access)\n'
+        fi
     fi
 
     # --- backend reachability ----------------------------------------
@@ -1813,12 +2329,20 @@ check_share() {
     # --- smb.conf section --------------------------------------------
     if share_section_present "$SHARE_NAME"; then
         printf '   smb.conf:       [%s] section present\n' "$SHARE_NAME"
+        local sec
+        sec=$(awk -v s="[$SHARE_NAME]" 'BEGIN{p=0} $0==s{p=1; next} /^\[/{p=0} p' "$SMB_CONF" 2>/dev/null)
+        if [[ "$profile" == "$PROFILE_LEGACY" ]]; then
+            if grep -qE '^[[:space:]]*vfs objects[[:space:]]*=[[:space:]]*smbproxy_session[[:space:]]+fileid([[:space:]]|$)' <<< "$sec" \
+                && grep -qEi '^[[:space:]]*fileid:algorithm[[:space:]]*=[[:space:]]*fsname[[:space:]]*$' <<< "$sec"; then
+                printf '   session VFS:    smbproxy_session + fileid(fsname) — OK\n'
+            else
+                printf '   session VFS:    MISSING/UNNORMALIZED — legacy locking integrity is not enforced\n'
+                rc=1
+            fi
+        fi
 
         # Identity resolution checks — only meaningful if joined.
         if is_joined && [[ -n "${FRONT_GROUP:-}" ]]; then
-            local sec
-            sec=$(awk -v s="[$SHARE_NAME]" 'BEGIN{p=0} $0==s{p=1; next} /^\[/{p=0} p' "$SMB_CONF" 2>/dev/null)
-
             # force user is now written as a username (not numeric UID)
             # because Samba resolves it via getpwnam(); numeric strings
             # don't resolve. The default-domain ambiguity defense lives
@@ -1942,7 +2466,7 @@ shares_add_wizard() {
     local body_ctx="Share: ${SHARE_NAME}"
     local BACKEND_IP="" BACKEND_USER="" BACKEND_DOMAIN="" BACKEND_MOUNT=""
     local BACKEND_PASS="" FRONT_GROUP="" FRONT_FORCE_USER=""
-    local PROFILE="" BACKEND_VERS="" BACKEND_SEAL="" LOCKING_OVERRIDE=""
+    local PROFILE="" OFFLINE_MODE="" BACKEND_VERS="" BACKEND_SEAL="" LOCKING_OVERRIDE=""
 
     # Profile picker. The CLI supports both legacy and modern shares
     # but the TUI used to silently default to legacy, blocking the
@@ -1957,6 +2481,17 @@ shares_add_wizard() {
         3>&1 1>&2 2>&3) || return
 
     if [[ "$PROFILE" == "modern" ]]; then
+        OFFLINE_MODE=$(whiptail --title "Add proxied share — offline behavior" \
+            --radiolist "${body_ctx}\n\nWhat should office users see when the machine is offline?\n\n  direct: serve the live machine share; fail quickly if unavailable.\n  queued: serve the appliance data disk at all times and deliver\n          office-managed changes when the machine returns." \
+            19 76 2 \
+            direct "Live backend; fail fast while machine is offline" ON \
+            queued "Always available; queue one-way office deployments" OFF \
+            3>&1 1>&2 2>&3) || return
+        if [[ "$OFFLINE_MODE" == "$OFFLINE_QUEUED" ]] && ! data_mount_ready; then
+            info "Queued mode requires a secondary data disk mounted at\n${DATA_ROOT}.\n\nAttach and initialize it under:\nSystem Configuration -> Offline-share Data Disk"
+            return
+        fi
+
         # Backend SMB version. `default` lets cifs negotiate (no vers=
         # token written). 3 is the appliance default.
         BACKEND_VERS=$(whiptail --title "Add proxied share — backend SMB version" \
@@ -2005,6 +2540,8 @@ shares_add_wizard() {
         # Translate 'profile-default' to empty for configure_share
         # (which interprets empty as "use the profile's default").
         [[ "$LOCKING_OVERRIDE" == "profile-default" ]] && LOCKING_OVERRIDE=""
+    else
+        OFFLINE_MODE="$OFFLINE_DIRECT"
     fi
 
     BACKEND_IP=$(whiptail --title "Add proxied share — backend IP" \
@@ -2098,14 +2635,20 @@ shares_add_wizard() {
         local _lock_disp="${LOCKING_OVERRIDE:-relaxed (profile default)}"
         _confirm_extra=$'\n'"  vers:        ${_vers_disp}"$'\n'"  sealing:     ${_seal_disp}"$'\n'"  locking:     ${_lock_disp}"
     fi
-    yesno "Apply share '${SHARE_NAME}' (${PROFILE})?\n\n  backend://${BACKEND_IP}/${SHARE_NAME} -> ${BACKEND_MOUNT}\n  backend user: ${BACKEND_DOMAIN}\\${BACKEND_USER}\n  AD access:   ${FRONT_GROUP:-(skipped — not joined)}\n  force user:  ${FRONT_FORCE_USER}${_confirm_extra}" \
+    yesno "Apply share '${SHARE_NAME}' (${PROFILE})?\n\n  backend://${BACKEND_IP}/${SHARE_NAME} -> ${BACKEND_MOUNT}\n  offline:     ${OFFLINE_MODE}\n  frontend:    $(share_frontend_path "$SHARE_NAME" "$OFFLINE_MODE" "$BACKEND_MOUNT" "$DATA_ROOT" "$PROFILE")\n  backend user: ${BACKEND_DOMAIN}\\${BACKEND_USER}\n  AD access:   ${FRONT_GROUP:-(skipped — not joined)}\n  force user:  ${FRONT_FORCE_USER}${_confirm_extra}" \
         || { BACKEND_PASS=""; return; }
 
     if configure_share; then
-        info "Share '${SHARE_NAME}' configured.\n\nUse 'Mount / unmount a share' to mount it, or just access\n${BACKEND_MOUNT} — automount triggers."
+        if [[ "$OFFLINE_MODE" == "$OFFLINE_QUEUED" ]]; then
+            info "Share '${SHARE_NAME}' configured in queued mode.\n\nOffice users now work from the appliance data disk. Files are\ndelivered one-way to the machine when its backend is reachable."
+        elif [[ "$PROFILE" == "$PROFILE_LEGACY" ]]; then
+            info "Share '${SHARE_NAME}' configured in legacy session mode.\n\nEach downstream SMB3 tree now creates a distinct upstream SMB1\nsession. Use 'Mount / unmount a share' to run a temporary\ncredential/readability probe."
+        else
+            info "Share '${SHARE_NAME}' configured in direct mode.\n\nUse 'Mount / unmount a share' to mount it, or just access\n${BACKEND_MOUNT} — automount triggers."
+        fi
     else
         local rc=$?
-        info "configure_share failed (rc=$rc).\n  rc=2: missing required field / bad --locking value\n  rc=4: testparm rejected the smb.conf — see /tmp/smbproxy-tp.*\n  rc=5: no /etc/passwd entry for the force-user\n  rc=6: AD group could not be resolved to a SID (winbind down? group missing?)\n  rc=7: legacy profile but no legacy NIC role assigned\n  rc=8: invalid profile value\n  rc=9: AD-name collision — '${FRONT_FORCE_USER}' also exists in AD; pick a different force-user."
+        info "configure_share failed (rc=$rc).\n  rc=2: missing required field / bad --locking value\n  rc=4: testparm rejected the smb.conf — see /tmp/smbproxy-tp.*\n  rc=5: no /etc/passwd entry for the force-user\n  rc=6: AD group could not be resolved to a SID (winbind down? group missing?)\n  rc=7: legacy profile but no legacy NIC role assigned\n  rc=8: invalid profile value\n  rc=9: AD-name collision — '${FRONT_FORCE_USER}' also exists in AD\n  rc=10: invalid offline mode (queued requires modern profile)\n  rc=11: queued mode requires the secondary data disk\n  rc=12: session VFS missing or built for another Samba version."
     fi
     BACKEND_PASS=""
 }
@@ -2128,8 +2671,8 @@ shares_edit_picker() {
         fi
         local choice
         choice=$(whiptail --title "Edit share: $name" \
-            --menu "${body_ctx} (${PROFILE:-legacy})\n\n  backend://${BACKEND_IP:-?}/${name} -> ${BACKEND_MOUNT:-?}\n  AD group: ${FRONT_GROUP:-(unset)}\n  force user: ${FRONT_FORCE_USER:-?}${_modern_summary}\n\nPick a field to update:" \
-            "$WT_HEIGHT" "$WT_WIDTH" 10 \
+            --menu "${body_ctx} (${PROFILE:-legacy})\n\n  backend://${BACKEND_IP:-?}/${name} -> ${BACKEND_MOUNT:-?}\n  offline: ${OFFLINE_MODE:-$OFFLINE_DIRECT}\n  AD group: ${FRONT_GROUP:-(unset)}\n  force user: ${FRONT_FORCE_USER:-?}${_modern_summary}\n\nPick a field to update:" \
+            "$WT_HEIGHT" "$WT_WIDTH" 11 \
             "1" "Backend password (most common edit)" \
             "2" "AD access group (FRONT_GROUP)" \
             "3" "Local force-user (FRONT_FORCE_USER)" \
@@ -2139,6 +2682,7 @@ shares_edit_picker() {
             "7" "Backend SMB version (modern only)" \
             "8" "Backend sealing (modern only)" \
             "9" "Locking override (modern only)" \
+            "10" "Offline behavior (direct / queued)" \
             "B" "Back" \
             3>&1 1>&2 2>&3) || return
 
@@ -2333,6 +2877,47 @@ shares_edit_picker() {
                     || info "configure_share failed (rc=$?)"
                 BACKEND_PASS=""
                 ;;
+            10)
+                if [[ "${PROFILE:-}" != "$PROFILE_MODERN" ]]; then
+                    info "Legacy ISAM shares must use direct mode.\nQueued replay would violate their live locking contract."
+                    continue
+                fi
+                local cur_mode="${OFFLINE_MODE:-$OFFLINE_DIRECT}"
+                local m_direct m_queued
+                [[ "$cur_mode" == "$OFFLINE_DIRECT" ]] && m_direct=ON || m_direct=OFF
+                [[ "$cur_mode" == "$OFFLINE_QUEUED" ]] && m_queued=ON || m_queued=OFF
+                local newmode
+                newmode=$(whiptail --title "Edit share: $name — offline behavior" \
+                    --radiolist "${body_ctx}\n\nDirect serves the live machine share and fails fast offline.\nQueued serves the local data disk and deploys office changes\none-way whenever the machine returns." \
+                    17 76 2 \
+                    direct "Live backend; fail fast while offline" "$m_direct" \
+                    queued "Always available; queue office deployments" "$m_queued" \
+                    3>&1 1>&2 2>&3) || continue
+                [[ "$newmode" != "$cur_mode" ]] || continue
+                if [[ "$newmode" == "$OFFLINE_QUEUED" ]] && ! data_mount_ready; then
+                    info "Queued mode requires the secondary data disk at\n${DATA_ROOT}.\nInitialize it under System Configuration first."
+                    continue
+                fi
+                if [[ "$newmode" == "$OFFLINE_QUEUED" ]]; then
+                    yesno "Switch '${name}' to queued mode?\n\nThe queued office-side folder starts empty; no files are pulled\nfrom the machine. Copy the office-authoritative program set to\nthe published share after switching." || continue
+                else
+                    yesno "Switch '${name}' to direct mode?\n\nThe published share will point at the live machine again.\nAny local queued data is retained on the data disk, but pending\nchanges will stop being delivered." || continue
+                fi
+                OFFLINE_MODE="$newmode"
+                local p
+                p=$(whiptail --title "Edit share: $name — confirm with password" \
+                    --passwordbox "${body_ctx}\n\nRe-enter backend password to apply:" 12 64 \
+                    3>&1 1>&2 2>&3) || { OFFLINE_MODE="$cur_mode"; continue; }
+                BACKEND_PASS="$p"
+                if configure_share; then
+                    info "Offline behavior updated for '$name' (${OFFLINE_MODE})."
+                else
+                    local rc=$?
+                    OFFLINE_MODE="$cur_mode"
+                    info "configure_share failed (rc=$rc)"
+                fi
+                BACKEND_PASS=""
+                ;;
             B|b) return ;;
         esac
     done
@@ -2342,7 +2927,7 @@ shares_remove_picker() {
     local name
     name=$(pick_share "Pick a share to REMOVE:") || return
     [[ -n "$name" ]] || return
-    yesno "Remove share '${name}'?\n\nThis will:\n  - umount it (best-effort)\n  - strip its fstab line\n  - strip its [${name}] section from smb.conf\n  - delete its state file and creds file\n  - reload smbd\n\nThe operator-side data on the legacy backend is NOT touched." \
+    yesno "Remove share '${name}'?\n\nThis will:\n  - umount it (best-effort)\n  - strip its fstab line\n  - strip its [${name}] section from smb.conf\n  - delete its state, creds, and queued delivery manifest\n  - reload smbd\n\nBackend files are NOT touched. Any queued office-side files on\nthe appliance data disk are retained for manual recovery." \
         || return
     if remove_share "$name"; then
         info "Share '${name}' removed."
@@ -2357,6 +2942,21 @@ shares_mount_picker() {
     [[ -n "$name" ]] || return
     load_share "$name" || { info "Share '$name' state file missing."; return; }
     [[ -n "$BACKEND_MOUNT" ]] || { info "Share '$name' has no mount point set."; return; }
+
+    if [[ "${PROFILE:-$PROFILE_LEGACY}" == "$PROFILE_LEGACY" ]]; then
+        local session_count
+        session_count=$(legacy_session_count "$name")
+        if yesno "Share: ${name}\n\nLegacy mounts are session-managed and cannot be mounted persistently.\nActive upstream SMB1 sessions: ${session_count}\n\nRun a temporary credential/readability probe now?"; then
+            local out=/tmp/smbproxy-session-probe.$$
+            if "$SESSION_HELPER" probe "$name" >"$out" 2>&1; then
+                info "Share '${name}' SMB1 credential probe succeeded."
+            else
+                whiptail --title "SMB1 probe failed: $name" --textbox "$out" 18 "$WT_WIDTH"
+            fi
+            rm -f "$out"
+        fi
+        return
+    fi
 
     local body_ctx="Share: ${name}    mount: ${BACKEND_MOUNT}"
     local active="no"
@@ -2629,7 +3229,12 @@ diag_backend() {
         smbclient -L "//${BACKEND_IP}" -A "${creds}" -m SMB1 2>&1 | head -40 || true
         echo
         echo "=== mount status ==="
-        if backend_mount_active "${BACKEND_MOUNT:-/dev/null}"; then
+        if [[ "${PROFILE:-$PROFILE_LEGACY}" == "$PROFILE_LEGACY" ]]; then
+            echo "SESSION-MANAGED: $(legacy_session_count "$name") active upstream SMB1 session(s)"
+            awk -v root="$SESSION_ROOT/" '$2 ~ "^"root && $3=="cifs" {print}' /proc/mounts 2>/dev/null
+            echo
+            echo "Run: sudo smbproxy-session-mount probe '$name'"
+        elif backend_mount_active "${BACKEND_MOUNT:-/dev/null}"; then
             echo "MOUNTED at $BACKEND_MOUNT"
             ls "$BACKEND_MOUNT" 2>&1 | head -5
         else
@@ -2671,8 +3276,17 @@ diag_time() {
 
 diag_locks() {
     local out=/tmp/smbproxy-locks.$$
-    smbstatus -L > "$out" 2>&1
-    whiptail --title "smbstatus -L" --scrolltext --textbox "$out" "$WT_HEIGHT" "$WT_WIDTH"
+    {
+        echo "=== frontend Samba lock table ==="
+        smbstatus -L 2>&1
+        echo
+        echo "=== active upstream SMB1 session mounts ==="
+        awk -v root="$SESSION_ROOT/" '$2 ~ "^"root && $3=="cifs" {print}' /proc/mounts 2>/dev/null
+        echo
+        echo "=== session lifecycle (tail) ==="
+        tail -80 /var/log/smbproxy-session-mount.log 2>/dev/null || echo "(no sessions recorded yet)"
+    } > "$out"
+    whiptail --title "Lock and SMB1 session state" --scrolltext --textbox "$out" "$WT_HEIGHT" "$WT_WIDTH"
     rm -f "$out"
 }
 
@@ -2774,6 +3388,7 @@ Usage:
   sudo smbproxy-sconfig --configure-share \\
         --name SHARE_NAME \\
         [--profile legacy|modern] \\
+        [--offline-mode direct|queued] \\
         --backend-ip IP --backend-user USER --backend-domain NETBIOS \\
         [--mount /mnt/.../X] \\
         [--group "DOM\\Group"] [--force-user engineering_user] \\
@@ -2786,8 +3401,9 @@ Usage:
         Reads the backend user password from stdin.
 
         --profile picks the cifs / smb.conf preset:
-          legacy (default) — vers=1.0 + nobrl + cache=none, TPS-strict
-            locking. Requires the legacy NIC role to be assigned (the
+          legacy (default) — one vers=1.0 session mount per downstream
+            authenticated tree, cache=none, lock forwarding enabled,
+            TPS-strict locking. Requires the legacy NIC role (the
             backend is assumed to live on the air-gapped LegacyZone
             subnet). Use this for the ISAM-style (e.g. Clarion .TPS) workload.
           modern — vers=3 (auto-negotiate 3.0/3.1.1) + relaxed locking
@@ -2795,6 +3411,14 @@ Usage:
             default on). No legacy NIC required; backend is reached via
             the domain LAN. Use this for standalone modern devices
             (CNC, NAS, IoT) consolidated under DFS-N.
+
+        --offline-mode is independent from the protocol profile:
+          direct (default) — publish the live backend mount and fail
+            new connections quickly while the backend is offline.
+          queued — publish the local data-disk copy at all times and
+            deliver office-managed changes one-way when the backend
+            returns. Modern profile only. Machine-only files are never
+            imported or deleted.
 
         --locking overrides the profile's locking stanza. profile-default
         (the default) picks tps-strict for legacy and relaxed for modern.
@@ -2806,21 +3430,30 @@ Usage:
         Legacy profile is fixed at vers=1.0 — override is rejected.
 
         --mount defaults to /mnt/legacy/<safe-name> for legacy and
-        /mnt/backend/<safe-name> for modern; --force-user defaults to
-        --backend-user. --group is REQUIRED to publish the smb.conf
-        section; without it (or if not yet domain-joined) only the
-        backend cifs mount is configured.
+        /mnt/backend/<safe-name> for modern. Legacy uses that value only
+        as an administrative label; client I/O uses session mounts under
+        $SESSION_ROOT. --force-user defaults to --backend-user. --group is
+        REQUIRED to publish the smb.conf section.
+
+  sudo smbproxy-sconfig --init-data-disk \\
+        --device /dev/sdX --yes-really-erase
+        ERASE and format one attached whole disk as the queued-share
+        ext4 data filesystem at $DATA_ROOT.
+
+  sudo smbproxy-sconfig --grow-data-disk
+        Grow the mounted ext4 filesystem after expanding its virtual disk.
 
   sudo smbproxy-sconfig --remove-share --name SHARE_NAME
-        Tear down one share: umount, strip fstab line, strip
+        Tear down one share: close/unmount active sessions, strip fstab line, strip
         smb.conf section, delete state + creds files, reload smbd.
-        Idempotent against partial state.
+        For a queued share, the delivery manifest is removed while
+        office-side files are retained for recovery. Idempotent
+        against partial state.
 
   sudo smbproxy-sconfig --check-share --name SHARE_NAME
         Read-only diagnostic for one share. Reports state file fields,
-        creds file perms, fstab options, the option list the current
-        profile would emit, the live /proc/mounts options, drift
-        between fstab and live (with the umount/mount fix-up command),
+        creds file perms, static or session-mount strategy, the option
+        list the current profile would emit, live /proc/mounts options,
         backend TCP/445 reachability, and identity resolution
         (force_user / force_group are non-numeric usernames matching
         FRONT_FORCE_USER's local /etc/passwd entry; valid_users SID
@@ -2850,6 +3483,7 @@ realm:           $(get_realm_status)
 joined:          $(is_joined && echo yes || echo no)
 smbd:            $(get_smbd_status)
 winbind:         $(get_winbind_status)
+data_disk:       $(data_mount_ready && df -h "$DATA_ROOT" 2>/dev/null | awk 'NR==2 {print "mounted (" $2 " total, " $4 " free)"}' || echo "not mounted")
 EOF
     local names; names=$(list_shares 2>/dev/null)
     if [[ -z "$names" ]]; then
@@ -2860,14 +3494,21 @@ EOF
         while IFS= read -r n; do
             load_share "$n" 2>/dev/null
             local active="no"
-            backend_mount_active "${BACKEND_MOUNT:-/dev/null}" 2>/dev/null && active="yes"
+            if [[ "${PROFILE:-$PROFILE_LEGACY}" == "$PROFILE_LEGACY" ]]; then
+                active="sessions=$(legacy_session_count "$n")"
+            else
+                backend_mount_active "${BACKEND_MOUNT:-/dev/null}" 2>/dev/null && active="yes"
+            fi
             local has_section="no"
             share_section_present "$n" && has_section="yes"
             printf '  - %s\n' "$n"
             printf '      profile:        %s%s\n' "${PROFILE:-$PROFILE_LEGACY}" \
                 "$([[ -n "${BACKEND_VERS:-}" ]] && printf ' (vers=%s)' "$BACKEND_VERS")"
+            printf '      offline_mode:   %s\n' "${OFFLINE_MODE:-$OFFLINE_DIRECT}"
             printf '      backend:        //%s/%s\n' "${BACKEND_IP:-?}" "$n"
             printf '      mount:          %s  (active=%s)\n' "${BACKEND_MOUNT:-?}" "$active"
+            printf '      frontend_path:  %s\n' \
+                "$(share_frontend_path "$n" "${OFFLINE_MODE:-$OFFLINE_DIRECT}" "${BACKEND_MOUNT:-}" "$DATA_ROOT" "${PROFILE:-$PROFILE_LEGACY}")"
             printf '      ad_group:       %s\n' "${FRONT_GROUP:-(unset)}"
             printf '      force_user:     %s\n' "${FRONT_FORCE_USER:-?}"
             printf '      smb_section:    %s\n' "$has_section"
@@ -2910,12 +3551,13 @@ cli_configure_share() {
     SHARE_NAME=""
     BACKEND_IP="" BACKEND_USER="" BACKEND_DOMAIN="" BACKEND_MOUNT=""
     FRONT_GROUP="" FRONT_FORCE_USER=""
-    PROFILE="" BACKEND_SEAL="" LOCKING_OVERRIDE="" BACKEND_VERS=""
+    PROFILE="" OFFLINE_MODE="" BACKEND_SEAL="" LOCKING_OVERRIDE="" BACKEND_VERS=""
     local PASS_STDIN=0
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --name)             SHARE_NAME="$2"; shift 2 ;;
             --profile)          PROFILE="$2"; shift 2 ;;
+            --offline-mode)     OFFLINE_MODE="$2"; shift 2 ;;
             --backend-ip)       BACKEND_IP="$2"; shift 2 ;;
             --backend-user)     BACKEND_USER="$2"; shift 2 ;;
             --backend-domain)   BACKEND_DOMAIN="$2"; shift 2 ;;
@@ -2952,6 +3594,11 @@ cli_configure_share() {
         "$PROFILE_LEGACY"|"$PROFILE_MODERN") : ;;
         *) echo "invalid --profile '$PROFILE' (expected: $PROFILE_LEGACY|$PROFILE_MODERN)" >&2; return 2 ;;
     esac
+    OFFLINE_MODE="${OFFLINE_MODE:-$OFFLINE_DIRECT}"
+    if ! offline_mode_validate "$PROFILE" "$OFFLINE_MODE"; then
+        echo "invalid --offline-mode '$OFFLINE_MODE'; queued is supported only with --profile modern" >&2
+        return 2
+    fi
     if [[ -n "$BACKEND_SEAL" && "$PROFILE" != "$PROFILE_MODERN" ]]; then
         echo "--backend-seal/--no-backend-seal only applies to --profile modern" >&2
         return 2
@@ -2981,6 +3628,23 @@ cli_configure_share() {
     local rc=$?
     BACKEND_PASS=""; unset BACKEND_PASS
     return $rc
+}
+
+cli_init_data_disk() {
+    local device="" confirmed=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --device)           device="$2"; shift 2 ;;
+            --yes-really-erase) confirmed=1; shift ;;
+            *) echo "unknown flag: $1" >&2; return 2 ;;
+        esac
+    done
+    [[ -n "$device" ]] || { echo "missing --device" >&2; return 2; }
+    [[ "$confirmed" -eq 1 ]] || {
+        echo "refusing to erase $device without --yes-really-erase" >&2
+        return 2
+    }
+    initialize_data_disk "$device"
 }
 
 cli_remove_share() {
@@ -3032,6 +3696,8 @@ main_cli() {
         --join-domain)         shift; cli_join_domain "$@" ;;
         --list-shares)         cli_list_shares ;;
         --configure-share)     shift; cli_configure_share "$@" ;;
+        --init-data-disk)      shift; cli_init_data_disk "$@" ;;
+        --grow-data-disk)      shift; [[ $# -eq 0 ]] || { echo "unexpected arguments" >&2; return 2; }; grow_data_disk ;;
         --remove-share)        shift; cli_remove_share "$@" ;;
         --check-share)         shift; cli_check_share "$@" ;;
         --apply-firewall)      cli_apply_firewall ;;

@@ -1,150 +1,136 @@
-# Modern-profile offline-device fail-fast
+# Offline backend behavior
 
-## What this is about
+Offline behavior is selected per share and is separate from the backend
+protocol/locking profile:
 
-A modern-profile proxied share fronts a backend device that is
-expected to be powered off some of the time (CNC, NAS unit, HMI). The
-goal is that when the backend is off, a Windows client opening
-`\\smb-proxy\<share>` sees a fast, clean error — ideally a greyed-out
-share in Explorer — instead of the ~60–75 second hang that direct
-SMB to the device produces.
+| Mode | Frontend path | Backend offline |
+| --- | --- | --- |
+| `direct` | Live cifs backend mount | New connections fail fast |
+| `queued` | Local secondary data disk | Share remains available; office changes wait |
 
-This document records the layered defenses we ship today, the
-**residual ~30-second wait** that we have not yet eliminated, and the
-deferred design that would close it.
+Existing share state without `OFFLINE_MODE` migrates to `direct`.
+`queued` is allowed only with the `modern` profile. Legacy ISAM shares
+must remain direct because replaying cached writes would bypass their
+live locking contract.
 
-## Layered defenses currently shipped
+## Direct mode
 
-1. **`soft,echo_interval=10` cifs mount options.** When the device
-   goes offline *while* the kernel cifs mount is established, the
-   echo heartbeat detects the dead connection and `soft` makes
-   pending I/O return errors instead of blocking. Tuned for the
-   transition from connected→disconnected.
+Direct mode layers four bounded failure controls:
 
-2. **`x-systemd.mount-timeout=4` in fstab.** Caps each automount
-   attempt at 4 seconds. Without this, an offline backend on the
-   same /24 takes ~6 seconds (ARP probe cycle) to fail. Tuned for
-   the per-attempt cost when the device was off all along.
+1. `soft,echo_interval=10` on modern cifs mounts returns an I/O error
+   when an established connection dies. Legacy mounts remain hard for
+   ISAM write integrity.
+2. `x-systemd.mount-timeout=4` caps modern automount attempts.
+3. Every direct share, including legacy per-tree shares, uses
+   `root preexec = smbproxy-probe-backend` for a one-second TCP/445 check at
+   tree-connect time. A failed client probe wakes the health worker, which
+   performs an independent confirmation immediately instead of waiting for
+   the next timer tick.
+4. After withdrawal, the next worker pass stops the modern backend's mount and
+   automount only when that share has no active frontend session. Cleanup is
+   deferred and retried while a session exists.
 
-3. **`root preexec = smbproxy-probe-backend %S`** (modern profile
-   only) with `root preexec close = yes`. A 1-second TCP probe of
-   `BACKEND_IP:445` runs at tree-connect time. If it fails, Samba
-   aborts the tree connect immediately rather than letting the
-   client fall through to the chdir-on-automount path. Reduces
-   per-attempt cost from ~4 s to ~1 s.
+The `smbproxy-share-worker.timer` runs every 15 seconds. Normally two
+consecutive failed TCP/445 probes withdraw a direct share. A failed
+tree-connect probe supplies the first failure hint and wakes the worker, so an
+immediate independent failure can withdraw it without waiting 15 seconds. The
+worker inserts this managed setting and reloads Samba:
 
-4. **`backend_mount_active` checks `/proc/mounts` for an actual cifs
-   entry**, not `mountpoint -q` (which always returns true for the
-   automount filesystem itself). So `smbproxy-sconfig --status`
-   honestly reports `active=no` when the cifs mount is not
-   established.
+```ini
+path = /run/smbproxy/offline
+# smbproxy-health: backend unavailable
+available = no
+```
 
-## Measured behaviour (proxy CLI)
+New tree connects then receive the normal unavailable-share response
+instead of Windows repeatedly retrying a failed preexec. The worker replaces
+the configured backend path in place because `smbd` validates the path as it
+loads that line; a later duplicate `path` directive would still block against
+the disconnected CIFS mount. For a modern/direct share, recovery also requires
+a bounded successful mount/list probe; TCP/445 alone is insufficient. The
+worker then restores the configured path from per-share state, removes the
+managed availability lines, and reloads the configuration.
 
-Probe 192.168.0.105 from the proxy with the device off (same /24,
-ARP probe cycle):
+The worker does not force-close existing Samba sessions. This is
+intentional: for a legacy hard-mounted ISAM share, an in-flight write
+must either finish when the backend returns or remain blocked. Health
+state first controls new tree connects. A soft modern mount may be stopped on a
+later pass only after `smbstatus` confirms that its own share has no session.
 
-| Layer applied | `ls /mnt/device/<share>` |
-|---|---|
-| baseline (no `x-systemd.mount-timeout`) | 6.2 s per attempt |
-| `+ x-systemd.mount-timeout=4`           | 4.1 s per attempt |
-| `+ root preexec` short-circuit          | 1.0 s per attempt |
+Runtime status is written to:
 
-These are server-side per-attempt costs and are concretely measurable
-with `time ls /mnt/device/<share>` and the `smbproxy-probe`
-journal log (`journalctl -t smbproxy-probe`).
+```text
+/var/lib/smbproxy/health/<safe-share-name>.env
+```
 
-## What's left: the residual ~30 s wait
+## Queued mode
 
-A Windows client hitting an offline backend currently waits ~30 s in
-the Explorer dialog before the error is shown. That is roughly half
-the original ~60 s hang and ~3× the per-attempt cost. The reason it
-isn't ~1 s:
+Queued mode does not switch a Samba share between live and cached
+paths. Samba always serves:
 
-**`root preexec` failure with `close = yes` returns
-`NT_STATUS_ACCESS_DENIED` from Samba.** The error code is hardcoded
-in `source3/smbd/smb2_service.c` (`make_connection_snum`) — the
-probe's exit code does not influence it. Windows treats
-`NT_STATUS_ACCESS_DENIED` as a *transient* condition ("permissions
-might come back, retry"), so it loops the tree connect in bursts:
-~6 attempts back-to-back, ~20 s pause, another burst, until Windows
-itself gives up. The probe makes each individual attempt fast, but
-it does not change the burst count or the inter-burst wait.
+```text
+/srv/smbproxy-data/shares/<safe-share-name>
+```
 
-To get Windows to give up immediately we need it to receive a
-*non-retry* error code such as `NT_STATUS_BAD_NETWORK_NAME` ("share
-doesn't exist"). Samba does not expose that as a configurable
-mapping for preexec failures.
+The worker treats this local copy as the office-authoritative program
+set and delivers changes one-way to the machine backend:
 
-## Deferred design: dynamic `available = no` via systemd timer
+- New and changed office files upload when the machine is reachable.
+- A file must have the same checksum on two worker passes before
+  deployment, so an in-progress office copy is not exposed as a
+  partial CNC program.
+- Uploads use a temporary file in the destination directory followed
+  by an atomic rename.
+- The manifest records the local checksum only after a successful
+  deployment.
+- An unchanged office file is not re-applied. A same-name manual edit
+  on the machine therefore survives until the office changes and
+  redeploys that source file.
+- An office update intentionally overwrites a same-name machine edit.
+- An office deletion removes only a backend path previously recorded
+  in the manifest.
+- A rename uploads the new path before deleting the old managed path.
+- Machine-only files, operator nest files, and operator-renamed copies
+  are never imported or deleted.
 
-The path to "share genuinely doesn't exist while device is off" is to
-toggle the Samba `available` parameter based on a periodic
-reachability probe.
+The appliance does not pull an initial copy from the machine. Populate
+the published queued share from the office-authoritative source.
 
-**Sketch:**
+Queued data and manifests live on a separately attached ext4 disk:
 
-- `smbproxy-share-availability.timer` runs `smbproxy-share-availability.service`
-  every ~30 s.
-- The service script enumerates `/var/lib/smbproxy/shares/*.env`,
-  filters to `PROFILE=modern`, TCP-probes each share's
-  `BACKEND_IP:445` with the same 1-second timeout used by
-  `smbproxy-probe-backend`.
-- For each share:
-  - Reachable + `available = no` currently in `smb.conf` → remove the
-    line, mark dirty.
-  - Unreachable + no `available = no` line currently → insert it,
-    mark dirty.
-- If dirty, run `smbcontrol smbd reload-config`.
-- Optionally also a separate `smbcontrol smbd close-share <name>`
-  on transition-to-unavailable so any lingering tree connect on a
-  now-unreachable share is dropped (cifs `soft` will already have
-  surfaced EIO to clients in practice, so this is belt-and-braces).
+```text
+/srv/smbproxy-data/shares/<safe>/...
+/srv/smbproxy-data/state/<safe>/manifest/...
+```
 
-**What `reload-config` does and does not do** (this was the question
-that made us pause):
-
-- It is *non-disruptive* to active tree connects. Samba evaluates
-  `valid users`, `force user`, `available`, etc. only at
-  tree-connect time, not on every operation. Existing sessions keep
-  working with their tree-connect-time state.
-- New tree connects after the reload see the new config — i.e. an
-  unavailable share returns `NT_STATUS_BAD_NETWORK_NAME` to the
-  client, and Explorer greys it out promptly.
-- Legacy shares are untouched; the timer only flips state on shares
-  whose `.env` file says `PROFILE=modern`.
-
-**Race window:** with a 30 s probe interval, a client that hits the
-share within the 30 s after the device goes off (but before the
-timer catches up) gets the current ~30 s preexec/retry experience.
-After the timer runs, subsequent attempts are fast. Tightening the
-interval (10 s, 5 s) trades probe load for race-window size.
-
-## Why it was deferred
-
-- The improvements already shipped (status bug fix, broken
-  `force user`, `x-systemd.mount-timeout=4`, preexec) are the
-  high-value, low-complexity bugs and they're durable.
-- The dynamic-availability work is a state machine: a new systemd
-  unit pair, edits to `smb.conf` from a periodic script, and a
-  reload protocol. It is straightforward but it is *new
-  infrastructure*, and infrastructure should not be added on the
-  day a single share's hang behaviour is being debugged.
-- The current 30 s wait is a 50% improvement over the original 60 s
-  and is acceptable for the operator's day-to-day flow until the
-  full design is built and tested in the lab.
-
-## Where to verify behaviour
+Configure it in the TUI under **System Configuration → Offline-share
+Data Disk**, or headlessly:
 
 ```bash
-# Per-attempt server cost (offline)
-ssh debadmin@smb-proxy 'time ls /mnt/device/<share> 2>/dev/null; true'
+sudo smbproxy-sconfig --init-data-disk \
+  --device /dev/sdX --yes-really-erase
+```
 
-# Probe traces from real Windows tree connects
-ssh debadmin@smb-proxy 'sudo journalctl -t smbproxy-probe --since "5 min ago"'
+The command erases the selected whole disk, formats it as ext4, and
+mounts it by UUID. After enlarging the virtual disk in the hypervisor:
 
-# Tree-connect path through Samba (look for "root preexec gave 124"
-# when device is off, or normal "signed connect" when device is on)
-ssh debadmin@smb-proxy 'sudo tail -200 /var/log/samba/log.smbd | \
-  grep -E "make_connection_snum|root preexec|NT_STATUS"'
+```bash
+sudo smbproxy-sconfig --grow-data-disk
+```
+
+Removing a queued share leaves its local data on the data disk for
+manual recovery but deletes its delivery manifest, preventing stale
+delete intent from being replayed if the name is later reused.
+
+## Verification
+
+```bash
+sudo smbproxy-sconfig --status
+sudo smbproxy-sconfig --check-share --name CNC
+sudo systemctl status smbproxy-share-worker.timer
+sudo journalctl -u smbproxy-share-worker.service
+
+bash tests/unit-helpers.sh
+bash tests/share-worker.sh
+bash tests/probe-backend.sh
 ```

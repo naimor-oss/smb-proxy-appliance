@@ -1,9 +1,8 @@
 # shellcheck shell=bash
 # lab/scenarios/backend-mount.sh — configure ONE proxied share's
 # backend half via `smbproxy-sconfig --configure-share` (without
-# --group, so smb.conf is not touched), and verify the cifs mount
-# comes up with the locking-correct options (vers=1.0, nobrl,
-# cache=none, serverino).
+# --group, so smb.conf is not touched), and verify a temporary
+# session-managed CIFS mount comes up with lock forwarding enabled.
 #
 # Sourced by lab/run-scenario.sh. Has access to ssh_host / ssh_vm /
 # scp_to_vm / say / step helpers and the LAB_HV_* / LAB_VM_* variables.
@@ -78,11 +77,14 @@ do_configure_backend() {
         $extra \
         --pass-stdin"
 
-    say "trigger automount by accessing the mount point"
-    # The fstab entry uses x-systemd.automount; touching the mount path
-    # fires the automount unit and brings the cifs mount up. Tolerate
-    # the first access taking a moment.
-    ssh_vm "sudo bash -c 'ls $SC_BACKEND_MOUNT >/dev/null 2>&1 || sleep 2; ls $SC_BACKEND_MOUNT'" || true
+    if [[ -z "${SC_GROUP:-}" ]]; then
+        say "create a held diagnostic SMB1 session mount"
+        ssh_vm "sudo smbproxy-session-mount connect '$SC_SHARE_NAME' 900001 900002 900003"
+    fi
+}
+
+post_hook() {
+    ssh_vm "sudo smbproxy-session-mount disconnect '$SC_SHARE_NAME' 900001 900002 900003" >/dev/null 2>&1 || true
 }
 
 pre_hook() {
@@ -111,43 +113,30 @@ verify() {
     grep -qF "username=${SC_BACKEND_USER}" <<< "$out" || { say "creds username wrong"; rc=1; }
     grep -qF "domain=${SC_BACKEND_DOMAIN}"  <<< "$out" || { say "creds domain wrong"; rc=1; }
 
-    say "fstab line was written with the locking-correct options"
+    say "legacy share has no static fstab line"
     out=$(ssh_vm "sudo grep -F ' ${SC_BACKEND_MOUNT} cifs ' /etc/fstab" 2>&1 || true)
     echo "$out"
-    grep -qF "vers=1.0"     <<< "$out" || { say "fstab missing vers=1.0";    rc=1; }
-    grep -qF "nobrl"        <<< "$out" || { say "fstab missing nobrl";       rc=1; }
-    grep -qF "cache=none"   <<< "$out" || { say "fstab missing cache=none";  rc=1; }
-    grep -qF "serverino"    <<< "$out" || { say "fstab missing serverino";   rc=1; }
-    # nosharesock forces a separate TCP/SMB session per cifs mount so
-    # multi-share configs against the same backend don't multiplex onto
-    # one session and reuse the first share's creds. Hit on production
-    # 2026-05-05 — non-optional.
-    grep -qF "nosharesock"  <<< "$out" || { say "fstab missing nosharesock"; rc=1; }
-    grep -qF "x-systemd.automount" <<< "$out" || { say "fstab missing automount"; rc=1; }
-    grep -qF "credentials=${creds}" <<< "$out" || { say "fstab points at the wrong creds file"; rc=1; }
-    # Numeric uid=/gid= in the fstab line — the configure_share rewrite
-    # resolves to the LOCAL /etc/passwd UID at config time so the
-    # "winbind use default domain = yes" NSS-name ambiguity can't
-    # silently steer the mount at an AD account by the same name.
-    grep -qE 'uid=[0-9]+,gid=[0-9]+' <<< "$out" || { say "fstab uid=/gid= not numeric"; rc=1; }
+    [[ -z "$out" ]] || { say "legacy share still has a static fstab mount"; rc=1; }
 
     say "force-user account exists with nologin shell"
     out=$(ssh_vm "getent passwd '$SC_FORCE_USER'" 2>&1 || true)
     echo "$out"
     grep -qE ':/usr/sbin/nologin$' <<< "$out" || { say "$SC_FORCE_USER missing or has a login shell"; rc=1; }
 
-    say "cifs mount is live with vers=1.0, nobrl, cache=none, serverino, nosharesock"
+    say "diagnostic session is live with SMB1 lock-forwarding isolation"
     out=$(ssh_vm 'mount | grep "type cifs "' 2>&1 || true)
     echo "$out"
-    grep -qF " on ${SC_BACKEND_MOUNT} " <<< "$out" || { say "no cifs mount at ${SC_BACKEND_MOUNT}"; rc=1; }
+    grep -qF ' on /run/smbproxy/sessions/900001-900002-900003 ' <<< "$out" || { say "dynamic session mount missing"; rc=1; }
     grep -qE 'vers=1\.0' <<< "$out" || { say "live mount not vers=1.0"; rc=1; }
-    grep -qF "nobrl"     <<< "$out" || { say "live mount missing nobrl"; rc=1; }
     grep -qF "cache=none" <<< "$out" || { say "live mount missing cache=none"; rc=1; }
-    # The kernel tends to print this as `nosharesock` in /proc/mounts.
+    grep -qF "hard" <<< "$out" || { say "live legacy mount is not hard"; rc=1; }
     grep -qF "nosharesock" <<< "$out" || { say "live mount missing nosharesock"; rc=1; }
+    # Each tree has its own mount and nosharesock forces a new connection;
+    # tps-lock-isolation proves distinct live st_dev identities.
+    grep -qF "nobrl" <<< "$out" && { say "live mount has nobrl; backend locks are disabled"; rc=1; }
 
-    say "mount point is readable and contains at least one entry"
-    out=$(ssh_vm "sudo ls '$SC_BACKEND_MOUNT' 2>&1 | head -10" || true)
+    say "session mount is readable"
+    out=$(ssh_vm "sudo ls '/run/smbproxy/sessions/900001-900002-900003' 2>&1 | head -10" || true)
     echo "$out"
     if grep -qiE 'permission denied|i/o error|cannot access|no such file' <<< "$out"; then
         say "ls reported an error — mount is up but not readable"; rc=1

@@ -30,6 +30,13 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+VFS_REPO="${VFS_REPO:-$REPO_DIR/../smbproxy-session-vfs}"
+VFS_PAYLOAD_ROOT=""
+
+cleanup() {
+    [[ -z "$VFS_PAYLOAD_ROOT" ]] || rm -rf "$VFS_PAYLOAD_ROOT"
+}
+trap cleanup EXIT
 
 # Defaults intentionally match lab/proxy.env so a flagless invocation
 # produces smbproxy-1 ready for the existing scenarios.
@@ -80,7 +87,7 @@ Flags:
   -h, --help             Show this
 
 Environment overrides: HV_HOST, HV_USER, ISO_DIR_MAC, GOLDEN_CHECKPOINT,
-LAB_STAGE_DIR, LAB_HOST_STAGE_DIR.
+LAB_STAGE_DIR, LAB_HOST_STAGE_DIR, VFS_REPO.
 USAGE
 }
 
@@ -108,6 +115,7 @@ step() { echo
 
 ssh_host() { ssh "${HV_USER}@${HV_HOST}" "$@"; }
 ssh_vm()   { ssh -J "${HV_USER}@${HV_HOST}" \
+                 -o IdentitiesOnly=yes -o IdentityAgent=none \
                  -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
                  "${VM_USER}@${VM_IP}" "$@"; }
 
@@ -142,9 +150,16 @@ else
 fi
 
 step "1. stage base VHDX + seed ISO"
-"$SCRIPT_DIR/stage-proxy-base.sh" \
-    -n "$VM_NAME" -d "$DOMAIN" -u "$VM_USER" "${STAGER_KEY_ARGS[@]}" \
-    -m "$DOMAIN_STATIC_MAC" -i "$VM_IP" -s "$ISO_DIR_MAC"
+if [[ ${#STAGER_KEY_ARGS[@]} -gt 0 ]]; then
+    "$SCRIPT_DIR/stage-proxy-base.sh" \
+        -n "$VM_NAME" -d "$DOMAIN" -u "$VM_USER" \
+        "${STAGER_KEY_ARGS[@]}" \
+        -m "$DOMAIN_STATIC_MAC" -i "$VM_IP" -s "$ISO_DIR_MAC"
+else
+    "$SCRIPT_DIR/stage-proxy-base.sh" \
+        -n "$VM_NAME" -d "$DOMAIN" -u "$VM_USER" \
+        -m "$DOMAIN_STATIC_MAC" -i "$VM_IP" -s "$ISO_DIR_MAC"
+fi
 
 step "2. push host-side helper scripts to $STAGE_DIR_HOST"
 mkdir -p "$STAGE_DIR_MAC"
@@ -165,6 +180,7 @@ step "4. wait for cloud-init + SSH on $VM_IP (up to 180s)"
 ssh_up=0
 for _ in $(seq 1 90); do
     if ssh -o ConnectTimeout=3 -o BatchMode=yes \
+           -o IdentitiesOnly=yes -o IdentityAgent=none \
            -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
            -J "${HV_USER}@${HV_HOST}" "${VM_USER}@${VM_IP}" true 2>/dev/null; then
         ssh_up=1
@@ -176,10 +192,42 @@ done
 ssh_vm 'hostname; ip -4 addr show | grep -E "inet " | head -3; \
         test -f /var/log/smbproxy-base-ready.marker && cat /var/log/smbproxy-base-ready.marker'
 
-step "5. push appliance scripts and appliance-core lib/ to the VM"
+step "5. push appliance scripts, pinned VFS component, and appliance-core lib/ to the VM"
 scp -J "${HV_USER}@${HV_HOST}" \
+    -o IdentitiesOnly=yes -o IdentityAgent=none \
     -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
     "$REPO_DIR/prepare-image.sh" "$REPO_DIR/smbproxy-sconfig.sh" \
+    "$REPO_DIR/smbproxy-probe-backend" "$REPO_DIR/smbproxy-share-worker" \
+    "$REPO_DIR/smbproxy-session-mount" \
+    "$REPO_DIR/smbproxy-vfs-version-check" "$REPO_DIR/smbproxy-domain-dns" \
+    "${VM_USER}@${VM_IP}:/tmp/"
+[[ -x "$VFS_REPO/scripts/export-appliance-payload.sh" ]] || {
+    say "smbproxy-session-vfs sibling not found at $VFS_REPO"
+    say "set \$VFS_REPO if the sibling lives elsewhere"
+    exit 1
+}
+# shellcheck disable=SC1091
+source "$REPO_DIR/components/smbproxy-session-vfs.env"
+actual_vfs_version=$(tr -d '[:space:]' < "$VFS_REPO/VERSION")
+actual_vfs_hash=$(shasum -a 256 "$VFS_REPO/src/vfs_smbproxy_session.c" \
+    | awk '{ print $1 }')
+# shellcheck disable=SC1091
+source "$VFS_REPO/compatibility/trixie.env"
+if [[ "$actual_vfs_version" != "$SMBPROXY_VFS_COMPONENT_VERSION" \
+   || "$actual_vfs_hash" != "$SMBPROXY_VFS_SOURCE_SHA256" \
+   || "$SAMBA_DEB_VERSION" != "$SMBPROXY_VFS_ACCEPTED_SAMBA_VERSION" ]]; then
+    say "smbproxy-session-vfs does not match components/smbproxy-session-vfs.env"
+    say "expected version/hash/Samba: $SMBPROXY_VFS_COMPONENT_VERSION $SMBPROXY_VFS_SOURCE_SHA256 $SMBPROXY_VFS_ACCEPTED_SAMBA_VERSION"
+    say "actual version/hash/Samba:   $actual_vfs_version $actual_vfs_hash $SAMBA_DEB_VERSION"
+    exit 1
+fi
+VFS_PAYLOAD_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/smbproxy-vfs-payload.XXXXXX")
+"$VFS_REPO/scripts/export-appliance-payload.sh" \
+    "$VFS_PAYLOAD_ROOT/smbproxy-session-vfs" >/dev/null
+scp -J "${HV_USER}@${HV_HOST}" -r \
+    -o IdentitiesOnly=yes -o IdentityAgent=none \
+    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    "$VFS_PAYLOAD_ROOT/smbproxy-session-vfs" \
     "${VM_USER}@${VM_IP}:/tmp/"
 
 # Cross-repo: vendor the shared libs from the sibling appliance-core
@@ -193,6 +241,7 @@ if [[ ! -d "$APPCORE_REPO/lib" ]]; then
     exit 1
 fi
 scp -J "${HV_USER}@${HV_HOST}" -r \
+    -o IdentitiesOnly=yes -o IdentityAgent=none \
     -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
     "$APPCORE_REPO/lib" \
     "${VM_USER}@${VM_IP}:/tmp/"
@@ -209,7 +258,7 @@ if ! ssh_vm "sudo APPCORE_BUILD_COMMIT='$APPCORE_BUILD_COMMIT' bash /tmp/prepare
     ssh_vm 'sudo tail -30 /var/log/smbproxy-prepare.log 2>/dev/null || journalctl -n 30 --no-pager'
     exit 1
 fi
-ssh_vm 'sudo install -m 0755 /tmp/smbproxy-sconfig.sh /usr/local/sbin/smbproxy-sconfig'
+ssh_vm 'sudo install -m 0755 /tmp/smbproxy-sconfig.sh /usr/local/sbin/smbproxy-sconfig; sudo install -m 0755 /tmp/smbproxy-probe-backend /usr/local/sbin/smbproxy-probe-backend; sudo install -m 0755 /tmp/smbproxy-share-worker /usr/local/sbin/smbproxy-share-worker; sudo install -m 0755 /tmp/smbproxy-session-mount /usr/local/sbin/smbproxy-session-mount; sudo install -m 0755 /tmp/smbproxy-vfs-version-check /usr/local/sbin/smbproxy-vfs-version-check; sudo install -m 0755 /tmp/smbproxy-domain-dns /usr/local/sbin/smbproxy-domain-dns'
 
 step "7. shutdown for deploy-master snapshot"
 # This is the host-agnostic master: prepare-image.sh has finished, but
@@ -254,6 +303,7 @@ say "wait for smbproxy-firstboot.done marker (up to 120s)"
 done_marker=0
 for _ in $(seq 1 60); do
     if ssh -o ConnectTimeout=3 -o BatchMode=yes \
+           -o IdentitiesOnly=yes -o IdentityAgent=none \
            -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
            -J "${HV_USER}@${HV_HOST}" "${VM_USER}@${VM_IP}" \
            'test -f /var/lib/smbproxy-firstboot.done' 2>/dev/null; then

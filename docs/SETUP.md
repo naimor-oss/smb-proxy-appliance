@@ -180,11 +180,13 @@ places you need to touch for host-specific settings.
 ## Verify Your Setup
 
 Run these from the `smb-proxy-appliance/` directory after cloning all
-four repos. Every line should succeed.
+seven repositories. Every line should succeed.
 
 ```bash
 # 1. The siblings exist at the expected paths.
-ls -d ../lab-kit ../lab-router ../samba-addc-appliance >/dev/null && echo "siblings OK"
+ls -d ../appliance-core ../dev-commons ../lab-kit ../lab-router \
+    ../samba-addc-appliance ../smbproxy-session-vfs >/dev/null \
+    && echo "siblings OK"
 
 # 2. Mac tools.
 for t in qemu-img hdiutil curl ssh scp git; do
@@ -204,9 +206,10 @@ touch /Volumes/ISO/.write-test && rm /Volumes/ISO/.write-test && echo "ISO share
 ssh nmadmin@server 'Test-NetConnection -ComputerName 172.29.137.1 -Port 445 -InformationLevel Quiet'
 
 # 7. Syntax check the proxy scripts.
-bash -n prepare-image.sh smbproxy-sconfig.sh \
+bash -n prepare-image.sh smbproxy-sconfig.sh smbproxy-session-mount \
+    smbproxy-vfs-version-check ../smbproxy-session-vfs/scripts/*.sh \
     lab/run-scenario.sh lab/stage-proxy-base.sh lab/build-fresh-base.sh \
-    lab/export-deploy-master.sh lab/scenarios/*.sh
+    lab/export-deploy-master.sh lab/scenarios/*.sh tests/*.sh
 echo "syntax checks OK"
 ```
 
@@ -232,6 +235,29 @@ lab/run-scenario.sh smoke-prepared-image
 
 See [LAB-TESTING.md](LAB-TESTING.md) for scenario authoring and the
 full test plan.
+
+## Optional queued-share data disk
+
+The release image contains only the appliance OS disk. If a shop-machine
+share must stay available while its backend is powered off, attach a
+separate thin-provisioned virtual disk to the deployed VM. Size it for
+the office-authoritative CNC program set plus normal growth.
+
+Initialize it from `sudo smbproxy-sconfig` under **System Configuration
+→ Offline-share Data Disk**. The operation erases the selected disk,
+formats the whole device as ext4, and mounts it by UUID at
+`/srv/smbproxy-data`. Then configure a modern share with offline mode
+`queued`.
+
+Do not put legacy ISAM shares in queued mode. They require live
+end-to-end locking and are restricted to `direct`.
+
+If the volume later needs more room, expand that virtual disk in the
+hypervisor and select **Grow ext4** in the same menu, or run:
+
+```bash
+sudo smbproxy-sconfig --grow-data-disk
+```
 
 ## Release export
 

@@ -16,8 +16,8 @@
 #
 # Verification confirms BOTH shares are independent in every
 # observable place: per-share env files, per-share creds files at
-# their own paths and modes, two distinct fstab entries with
-# distinct credentials= paths, two distinct [SHARE] sections in
+# their own paths and modes, no static legacy fstab entries, two
+# distinct [SHARE] sections using the session VFS,
 # smb.conf with their own valid users / force user, both visible
 # in --list-shares and --status, and both reachable via
 # smbclient -k from the proxy itself.
@@ -155,14 +155,10 @@ verify() {
     out=$(ssh_vm "sudo grep ^username= /etc/samba/.creds-${safe_b}" 2>&1 || true)
     grep -qF "username=${SC_BACKEND_USER_B}" <<< "$out" || { say "share B creds username wrong"; rc=1; }
 
-    say "fstab has TWO cifs entries with distinct credentials= paths"
-    out=$(ssh_vm 'sudo grep "type cifs\|cifs " /etc/fstab' 2>&1 || true)
+    say "neither legacy share has a static fstab entry"
+    out=$(ssh_vm "sudo grep -E ' /mnt/legacy/(${safe_a}|${safe_b}) cifs ' /etc/fstab" 2>&1 || true)
     echo "$out"
-    grep -qF "credentials=/etc/samba/.creds-${safe_a}" <<< "$out" || { say "fstab missing share A creds path"; rc=1; }
-    grep -qF "credentials=/etc/samba/.creds-${safe_b}" <<< "$out" || { say "fstab missing share B creds path"; rc=1; }
-    local fstab_lines
-    fstab_lines=$(grep -c 'cifs ' <<< "$out" 2>/dev/null || echo 0)
-    [[ "${fstab_lines:-0}" -ge 2 ]] || { say "expected ≥2 cifs lines in fstab, got $fstab_lines"; rc=1; }
+    [[ -z "$out" ]] || { say "legacy static mounts remain in fstab"; rc=1; }
 
     say "smb.conf has BOTH share sections with their own (username) force user + (SID) valid users"
     for s in "$SC_SHARE_A" "$SC_SHARE_B"; do
@@ -180,6 +176,14 @@ verify() {
     local sec_a sec_b user_a user_b sid_a sid_b uid_a uid_b
     sec_a=$(ssh_vm "sudo awk -v s='[$SC_SHARE_A]' 'BEGIN{p=0} \$0==s{p=1; print; next} /^\\[/{p=0} p' /etc/samba/smb.conf" 2>&1 || true)
     sec_b=$(ssh_vm "sudo awk -v s='[$SC_SHARE_B]' 'BEGIN{p=0} \$0==s{p=1; print; next} /^\\[/{p=0} p' /etc/samba/smb.conf" 2>&1 || true)
+    grep -qE 'vfs objects[[:space:]]*=[[:space:]]*smbproxy_session[[:space:]]+fileid' <<< "$sec_a" \
+        || { say "[$SC_SHARE_A] missing session/fileid VFS stack"; rc=1; }
+    grep -qE 'vfs objects[[:space:]]*=[[:space:]]*smbproxy_session[[:space:]]+fileid' <<< "$sec_b" \
+        || { say "[$SC_SHARE_B] missing session/fileid VFS stack"; rc=1; }
+    grep -qE 'fileid:algorithm[[:space:]]*=[[:space:]]*fsname' <<< "$sec_a" \
+        || { say "[$SC_SHARE_A] missing file identity normalization"; rc=1; }
+    grep -qE 'fileid:algorithm[[:space:]]*=[[:space:]]*fsname' <<< "$sec_b" \
+        || { say "[$SC_SHARE_B] missing file identity normalization"; rc=1; }
     grep -qE '^[[:space:]]*force user[[:space:]]*=[[:space:]]*[A-Za-z_][A-Za-z0-9_-]*[[:space:]]*$' <<< "$sec_a" \
         || { say "[$SC_SHARE_A] force user not a username"; rc=1; }
     grep -qE '^[[:space:]]*force user[[:space:]]*=[[:space:]]*[A-Za-z_][A-Za-z0-9_-]*[[:space:]]*$' <<< "$sec_b" \
@@ -249,6 +253,14 @@ verify() {
     echo "$out"
     grep -qF "$SC_SHARE_A" <<< "$out" || { say "smbclient -L missing $SC_SHARE_A"; rc=1; }
     grep -qF "$SC_SHARE_B" <<< "$out" || { say "smbclient -L missing $SC_SHARE_B"; rc=1; }
+
+    say "each share creates its own upstream SMB1 session on tree connect"
+    for s in "$SC_SHARE_A" "$SC_SHARE_B"; do
+        out=$(ssh_vm "sudo bash -c 'echo \"$SC_PASS\" | kinit \"$SC_ADMIN@$SC_REALM_UC\" && smbclient -k //$LAB_VM_IP/$s -m SMB3 -c ls'" 2>&1 || true)
+        grep -qiE 'NT_STATUS|tree connect failed' <<< "$out" && { say "tree connect failed for $s"; rc=1; }
+        out=$(ssh_vm "sudo grep -F 'action=CONNECT share=$s ' /var/log/smbproxy-session-mount.log | tail -1" 2>&1 || true)
+        grep -qF "share=$s" <<< "$out" || { say "no SMB1 session recorded for $s"; rc=1; }
+    done
 
     # AD-name collision is now a REFUSAL (rc=9) at configure time, not
     # a warn-and-allow. The historical "multi-share collision check"

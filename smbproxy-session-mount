@@ -1,0 +1,212 @@
+#!/usr/bin/env bash
+# Create and release one upstream SMB1 CIFS mount for a Samba tree connection.
+# Invoked as root by vfs_smbproxy_session; may also be used with `probe SHARE`
+# for credential/reachability diagnostics.
+
+set -euo pipefail
+
+STATE_DIR="${SMBPROXY_STATE_DIR:-/var/lib/smbproxy/shares}"
+CREDS_DIR="${SMBPROXY_CREDS_DIR:-/etc/samba}"
+SESSION_ROOT="${SMBPROXY_SESSION_ROOT:-/run/smbproxy/sessions}"
+SESSION_STATE="${SMBPROXY_SESSION_STATE:-/run/smbproxy/session-state}"
+PROC_MOUNTS="${SMBPROXY_PROC_MOUNTS:-/proc/mounts}"
+MOUNT_BIN="${SMBPROXY_MOUNT_BIN:-mount}"
+UMOUNT_BIN="${SMBPROXY_UMOUNT_BIN:-umount}"
+AUDIT_LOG="${SMBPROXY_SESSION_LOG:-/var/log/smbproxy-session-mount.log}"
+ALLOW_NON_ROOT_TEST="${SMBPROXY_ALLOW_NON_ROOT_TEST:-0}"
+
+die() { echo "smbproxy-session-mount: $*" >&2; exit 2; }
+safe_name() { printf '%s' "${1//[^A-Za-z0-9_]/_}"; }
+numeric() { [[ "$1" =~ ^[0-9]+$ ]]; }
+install_root_dir() {
+    if [[ "$ALLOW_NON_ROOT_TEST" == "1" ]]; then
+        install -d -m 0755 "$@"
+    else
+        install -d -o root -g root -m 0755 "$@"
+    fi
+}
+
+load_share() {
+    local requested="$1" safe state
+    safe=$(safe_name "$requested")
+    state="${STATE_DIR}/${safe}.env"
+    [[ -r "$state" ]] || die "share state not found: $state"
+
+    SHARE_NAME="" PROFILE="" BACKEND_IP="" FRONT_FORCE_USER=""
+    # shellcheck disable=SC1090
+    source "$state"
+    [[ "$SHARE_NAME" == "$requested" ]] || die "share state/name mismatch"
+    [[ "${PROFILE:-legacy}" == "legacy" ]] || die "share '$requested' is not legacy profile"
+    [[ -n "$BACKEND_IP" && -n "$FRONT_FORCE_USER" ]] || die "share state is incomplete"
+
+    SHARE_SAFE="$safe"
+    CREDS="${CREDS_DIR}/.creds-${safe}"
+    [[ -r "$CREDS" ]] || die "credentials file not found: $CREDS"
+    FU_UID=$(awk -F: -v u="$FRONT_FORCE_USER" '$1==u {print $3; exit}' /etc/passwd)
+    FU_GID=$(awk -F: -v u="$FRONT_FORCE_USER" '$1==u {print $4; exit}' /etc/passwd)
+    [[ -n "$FU_UID" && -n "$FU_GID" ]] || die "force-user has no local uid/gid"
+}
+
+mount_active() {
+    local mountpoint="$1"
+    awk -v mp="$mountpoint" '$2 == mp && $3 == "cifs" { found=1 } END { exit !found }' "$PROC_MOUNTS"
+}
+
+session_key() {
+    printf '%s-%s-%s' "$1" "$2" "$3"
+}
+
+session_mountpoint() {
+    printf '%s/%s' "$SESSION_ROOT" "$(session_key "$1" "$2" "$3")"
+}
+
+session_state_file() {
+    printf '%s/%s.env' "$SESSION_STATE" "$(session_key "$1" "$2" "$3")"
+}
+
+record_value() {
+    local key="$1" record="$2"
+    sed -n "s/^${key}=\"\(.*\)\"$/\1/p" "$record" | head -1
+}
+
+audit() {
+    install_root_dir "$(dirname "$AUDIT_LOG")"
+    printf '%s action=%s share=%s pid=%s vuid=%s cnum=%s mount=%s\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$SHARE_NAME" \
+        "$PID" "$VUID" "$CNUM" "$MOUNTPOINT" >> "$AUDIT_LOG"
+    chmod 0600 "$AUDIT_LOG"
+}
+
+connect_session() {
+    load_share "$SHARE_ARG"
+    MOUNTPOINT=$(session_mountpoint "$PID" "$VUID" "$CNUM")
+    local record; record=$(session_state_file "$PID" "$VUID" "$CNUM")
+    install_root_dir "$SESSION_ROOT" "$SESSION_STATE" "$MOUNTPOINT"
+
+    if mount_active "$MOUNTPOINT"; then
+        die "session mount already active: $MOUNTPOINT"
+    fi
+
+    local options
+    options="credentials=${CREDS},vers=1.0,cache=none,hard,nosharesock,serverino,uid=${FU_UID},gid=${FU_GID},file_mode=0660,dir_mode=0770"
+    if ! "$MOUNT_BIN" -t cifs "//${BACKEND_IP}/${SHARE_NAME}" "$MOUNTPOINT" -o "$options"; then
+        rmdir "$MOUNTPOINT" 2>/dev/null || true
+        die "CIFS session mount failed: $MOUNTPOINT"
+    fi
+    if ! mount_active "$MOUNTPOINT"; then
+        rmdir "$MOUNTPOINT" 2>/dev/null || true
+        die "mount command returned success but no CIFS mount is active"
+    fi
+
+    umask 077
+    {
+        printf 'SHARE_NAME="%s"\n' "$SHARE_NAME"
+        printf 'SHARE_SAFE="%s"\n' "$SHARE_SAFE"
+        printf 'PID="%s"\n' "$PID"
+        printf 'VUID="%s"\n' "$VUID"
+        printf 'CNUM="%s"\n' "$CNUM"
+        printf 'MOUNTPOINT="%s"\n' "$MOUNTPOINT"
+    } > "$record"
+    audit CONNECT
+}
+
+disconnect_session() {
+    MOUNTPOINT=$(session_mountpoint "$PID" "$VUID" "$CNUM")
+    local record; record=$(session_state_file "$PID" "$VUID" "$CNUM")
+    SHARE_NAME="$SHARE_ARG"
+    if mount_active "$MOUNTPOINT"; then
+        "$UMOUNT_BIN" "$MOUNTPOINT"
+    fi
+    if mount_active "$MOUNTPOINT"; then
+        die "CIFS session remains mounted: $MOUNTPOINT"
+    fi
+    rm -f "$record"
+    rmdir "$MOUNTPOINT" 2>/dev/null || true
+    audit DISCONNECT
+}
+
+cleanup_share() {
+    load_share "$SHARE_ARG"
+    install_root_dir "$SESSION_STATE"
+    local record rec_share rec_mount
+    shopt -s nullglob
+    for record in "$SESSION_STATE"/*.env; do
+        rec_share="" rec_mount=""
+        rec_share=$(record_value SHARE_NAME "$record")
+        [[ "$rec_share" == "$SHARE_NAME" ]] || continue
+        rec_mount=$(record_value MOUNTPOINT "$record")
+        case "$rec_mount" in "$SESSION_ROOT"/*) : ;; *) die "unsafe recorded mountpoint: $rec_mount" ;; esac
+        if mount_active "$rec_mount"; then "$UMOUNT_BIN" "$rec_mount"; fi
+        mount_active "$rec_mount" && die "session remains mounted: $rec_mount"
+        rm -f "$record"
+        rmdir "$rec_mount" 2>/dev/null || true
+    done
+    shopt -u nullglob
+}
+
+cleanup_all() {
+    install_root_dir "$SESSION_ROOT" "$SESSION_STATE"
+    local record rec_mount mountpoint
+
+    # Release recorded sessions first. A normal VFS disconnect already does
+    # this; this path is for an smbd crash, forced stop, or interrupted hook.
+    shopt -s nullglob
+    for record in "$SESSION_STATE"/*.env; do
+        rec_mount=$(record_value MOUNTPOINT "$record")
+        case "$rec_mount" in "$SESSION_ROOT"/*) : ;; *) die "unsafe recorded mountpoint: $rec_mount" ;; esac
+        if mount_active "$rec_mount"; then "$UMOUNT_BIN" "$rec_mount"; fi
+        mount_active "$rec_mount" && die "session remains mounted: $rec_mount"
+        rm -f "$record"
+        rmdir "$rec_mount" 2>/dev/null || true
+    done
+    shopt -u nullglob
+
+    # A crash can happen after mount(8) succeeds but before the state record is
+    # durable. Sweep only exact CIFS mountpoints below the dedicated runtime
+    # root so those orphan sessions also fail closed on the next service start.
+    while IFS= read -r mountpoint; do
+        case "$mountpoint" in "$SESSION_ROOT"/*) : ;; *) die "unsafe live mountpoint: $mountpoint" ;; esac
+        "$UMOUNT_BIN" "$mountpoint"
+        mount_active "$mountpoint" && die "orphan session remains mounted: $mountpoint"
+        rmdir "$mountpoint" 2>/dev/null || true
+    done < <(awk -v root="$SESSION_ROOT/" '$2 ~ "^"root && $3=="cifs" {print $2}' "$PROC_MOUNTS")
+}
+
+probe_share() {
+    PID="$$" VUID="0" CNUM="0"
+    connect_session
+    local rc=0
+    ls -la "$MOUNTPOINT" >/dev/null || rc=$?
+    disconnect_session
+    return "$rc"
+}
+
+[[ ${EUID:-$(id -u)} -eq 0 || "$ALLOW_NON_ROOT_TEST" == "1" ]] || die "must run as root"
+ACTION="${1:-}"
+case "$ACTION" in
+    connect|disconnect)
+        [[ $# -eq 5 ]] || die "usage: $0 $ACTION SHARE PID VUID CNUM"
+        SHARE_ARG="$2" PID="$3" VUID="$4" CNUM="$5"
+        if ! numeric "$PID" || ! numeric "$VUID" || ! numeric "$CNUM"; then
+            die "session identifiers must be numeric"
+        fi
+        if [[ "$ACTION" == connect ]]; then connect_session; else disconnect_session; fi
+        ;;
+    cleanup-share)
+        [[ $# -eq 2 ]] || die "usage: $0 cleanup-share SHARE"
+        SHARE_ARG="$2"
+        cleanup_share
+        ;;
+    cleanup-all)
+        [[ $# -eq 1 ]] || die "usage: $0 cleanup-all"
+        cleanup_all
+        ;;
+    probe)
+        [[ $# -eq 2 ]] || die "usage: $0 probe SHARE"
+        SHARE_ARG="$2"
+        probe_share
+        ;;
+    *)
+        die "usage: $0 {connect|disconnect} SHARE PID VUID CNUM | cleanup-share SHARE | cleanup-all | probe SHARE"
+        ;;
+esac
