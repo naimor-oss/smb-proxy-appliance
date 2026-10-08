@@ -1660,6 +1660,29 @@ join_domain_tui() {
     fi
 }
 
+# run_with_auth_file USER SECRET COMMAND ARGS...
+#   Runs COMMAND ARGS... -A <file> so the password never reaches a process
+#   argument vector (/proc/<pid>/cmdline is world-readable; code-review
+#   session plan 01). The file lives in a root-only directory and is removed
+#   when the command returns. Samba trims whitespace around authentication
+#   file values, so secrets with leading/trailing blanks are refused.
+run_with_auth_file() {
+    local user="$1" secret="$2"
+    shift 2
+    if [[ "$secret" =~ ^[[:space:]]|[[:space:]]$ ]]; then
+        echo "passwords with leading or trailing spaces are not supported here" >&2
+        return 2
+    fi
+    local dir rc=0
+    dir=$(mktemp -d "${SCONFIG_AUTH_DIR:-/run}/smbproxy-auth.XXXXXX") || return 1
+    chmod 0700 "$dir"
+    # Redirect inside the subshell so the file is created under umask 077.
+    ( umask 077; printf 'username = %s\npassword = %s\n' "$user" "$secret" > "$dir/auth" )
+    "$@" -A "$dir/auth" || rc=$?
+    rm -rf "$dir"
+    return "$rc"
+}
+
 leave_domain_tui() {
     if ! is_joined; then
         info "Not joined."; return
@@ -1672,7 +1695,7 @@ leave_domain_tui() {
     pass=$(whiptail --passwordbox "Password:" 10 64 3>&1 1>&2 2>&3) || return
     clear
     systemctl stop smbd winbind 2>/dev/null || true
-    if ! net ads leave -U "${user}%${pass}" 2>&1 | tee /tmp/smbproxy-leave.log; then
+    if ! run_with_auth_file "$user" "$pass" net ads leave 2>&1 | tee /tmp/smbproxy-leave.log; then
         info "leave failed (machine may still be in AD).\nSee /tmp/smbproxy-leave.log"
     fi
     rm -f "$SMB_CONF"
