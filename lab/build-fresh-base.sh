@@ -200,7 +200,7 @@ scp -J "${HV_USER}@${HV_HOST}" \
     "$REPO_DIR/smbproxy-probe-backend" "$REPO_DIR/smbproxy-share-worker" \
     "$REPO_DIR/smbproxy-session-mount" \
     "$REPO_DIR/smbproxy-vfs-version-check" "$REPO_DIR/smbproxy-domain-dns" \
-    "$REPO_DIR/smbproxy-samba-hold" \
+    "$REPO_DIR/smbproxy-samba-hold" "$REPO_DIR/smbproxy-update" \
     "${VM_USER}@${VM_IP}:/tmp/"
 [[ -x "$VFS_REPO/scripts/export-appliance-payload.sh" ]] || {
     say "smbproxy-session-vfs sibling not found at $VFS_REPO"
@@ -254,7 +254,10 @@ step "6. run prepare-image.sh on $VM_NAME"
 # decisions/0002-appliance-core.md §"Versioning + identity".
 APPCORE_BUILD_COMMIT="$(git -C "$APPCORE_REPO" rev-parse HEAD 2>/dev/null || echo unknown)"
 say "  appliance-core source commit: $APPCORE_BUILD_COMMIT"
-if ! ssh_vm "sudo APPCORE_BUILD_COMMIT='$APPCORE_BUILD_COMMIT' bash /tmp/prepare-image.sh"; then
+SMBPROXY_VERSION="$(head -1 "$REPO_DIR/VERSION")"
+SMBPROXY_BUILD_COMMIT="$(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"
+say "  smbproxy version $SMBPROXY_VERSION, commit $SMBPROXY_BUILD_COMMIT"
+if ! ssh_vm "sudo APPCORE_BUILD_COMMIT='$APPCORE_BUILD_COMMIT' SMBPROXY_VERSION='$SMBPROXY_VERSION' SMBPROXY_BUILD_COMMIT='$SMBPROXY_BUILD_COMMIT' bash /tmp/prepare-image.sh"; then
     say "prepare-image.sh failed"
     ssh_vm 'sudo tail -30 /var/log/smbproxy-prepare.log 2>/dev/null || journalctl -n 30 --no-pager'
     exit 1

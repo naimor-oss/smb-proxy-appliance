@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# smbproxy-update — the appliance's built-in updater (appliance-core update
+# framework, docs/lib-update.md in appliance-core).
+#
+#   smbproxy-update status | history
+#   smbproxy-update apply smbproxy-update-X.Y.Z.tar.gz [--reinstall]
+#   smbproxy-update rollback [BACKUP_DIR]
+set -u
+LIB=/usr/local/lib/appliance-core
+# shellcheck disable=SC1091
+source "$LIB/kvstate.sh" 2>/dev/null && source "$LIB/update.sh" 2>/dev/null \
+    || { echo "smbproxy-update: appliance-core update library missing in $LIB" >&2; exit 2; }
+appcore_update_cli smbproxy "$@"
