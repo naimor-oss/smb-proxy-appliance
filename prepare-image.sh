@@ -395,7 +395,7 @@ done
 # downstream Samba tree connection.  The version check makes Samba fail closed
 # after a package upgrade until the private-ABI module is rebuilt.
 for helper in smbproxy-session-mount smbproxy-vfs-version-check \
-              smbproxy-domain-dns; do
+              smbproxy-domain-dns smbproxy-samba-hold; do
     src="/tmp/${helper}"
     if [[ -f "$src" ]]; then
         install -m 0755 "$src" "/usr/local/sbin/${helper}"
@@ -404,6 +404,12 @@ for helper in smbproxy-session-mount smbproxy-vfs-version-check \
         exit 1
     fi
 done
+
+# The VFS module above is built for this exact Samba revision. Hold every
+# package from the samba source so routine updates (menu, MOTD advice,
+# unattended-upgrades) cannot move Samba past it or remove the module.
+# A qualified update bundle releases and re-applies the hold.
+/usr/local/sbin/smbproxy-samba-hold apply
 
 install -d -o root -g root -m 0755 \
     /run/smbproxy/sessions /run/smbproxy/session-state \
@@ -1658,6 +1664,13 @@ action_update() {
     echo "Refreshing apt indexes and applying upgrades (full-upgrade)..."
     echo "Note: full-upgrade can install new dependencies (kernels, etc.)."
     echo "      Plain 'apt-get upgrade' would silently keep them back."
+    echo "      Samba stays at its current version; it is updated separately."
+    echo
+    if ! sudo /usr/local/sbin/smbproxy-samba-hold apply; then
+        echo "Samba packages could not be held; update cancelled."
+        echo "Press Enter to continue."; read -r _
+        return
+    fi
     echo
     if command -v appcore_apt_run_full_upgrade >/dev/null 2>&1; then
         sudo DEBIAN_FRONTEND=noninteractive bash -c \
@@ -1890,6 +1903,15 @@ fi
 printf '\n'
 MOTDEOF
 chmod +x /etc/update-motd.d/15-smbproxy-net-status
+
+# Samba version line, kept as its own snippet so the field update bundle
+# (updates/samba-hold-1.0) installs a byte-identical file.
+cat > /etc/update-motd.d/17-smbproxy-samba <<'MOTDEOF'
+#!/bin/sh
+[ -x /usr/local/sbin/smbproxy-samba-hold ] || exit 0
+printf '  %s\n\n' "$(/usr/local/sbin/smbproxy-samba-hold status 2>/dev/null)"
+MOTDEOF
+chmod +x /etc/update-motd.d/17-smbproxy-samba
 
 #===============================================================================
 # 21B. SR-IOV VF KERNEL-PANIC WORKAROUND (ixgbevf)

@@ -200,6 +200,7 @@ scp -J "${HV_USER}@${HV_HOST}" \
     "$REPO_DIR/smbproxy-probe-backend" "$REPO_DIR/smbproxy-share-worker" \
     "$REPO_DIR/smbproxy-session-mount" \
     "$REPO_DIR/smbproxy-vfs-version-check" "$REPO_DIR/smbproxy-domain-dns" \
+    "$REPO_DIR/smbproxy-samba-hold" \
     "${VM_USER}@${VM_IP}:/tmp/"
 [[ -x "$VFS_REPO/scripts/export-appliance-payload.sh" ]] || {
     say "smbproxy-session-vfs sibling not found at $VFS_REPO"
@@ -258,7 +259,7 @@ if ! ssh_vm "sudo APPCORE_BUILD_COMMIT='$APPCORE_BUILD_COMMIT' bash /tmp/prepare
     ssh_vm 'sudo tail -30 /var/log/smbproxy-prepare.log 2>/dev/null || journalctl -n 30 --no-pager'
     exit 1
 fi
-ssh_vm 'sudo install -m 0755 /tmp/smbproxy-sconfig.sh /usr/local/sbin/smbproxy-sconfig; sudo install -m 0755 /tmp/smbproxy-probe-backend /usr/local/sbin/smbproxy-probe-backend; sudo install -m 0755 /tmp/smbproxy-share-worker /usr/local/sbin/smbproxy-share-worker; sudo install -m 0755 /tmp/smbproxy-session-mount /usr/local/sbin/smbproxy-session-mount; sudo install -m 0755 /tmp/smbproxy-vfs-version-check /usr/local/sbin/smbproxy-vfs-version-check; sudo install -m 0755 /tmp/smbproxy-domain-dns /usr/local/sbin/smbproxy-domain-dns'
+ssh_vm 'sudo install -m 0755 /tmp/smbproxy-sconfig.sh /usr/local/sbin/smbproxy-sconfig; sudo install -m 0755 /tmp/smbproxy-probe-backend /usr/local/sbin/smbproxy-probe-backend; sudo install -m 0755 /tmp/smbproxy-share-worker /usr/local/sbin/smbproxy-share-worker; sudo install -m 0755 /tmp/smbproxy-session-mount /usr/local/sbin/smbproxy-session-mount; sudo install -m 0755 /tmp/smbproxy-vfs-version-check /usr/local/sbin/smbproxy-vfs-version-check; sudo install -m 0755 /tmp/smbproxy-domain-dns /usr/local/sbin/smbproxy-domain-dns; sudo install -m 0755 /tmp/smbproxy-samba-hold /usr/local/sbin/smbproxy-samba-hold'
 
 step "7. shutdown for deploy-master snapshot"
 # This is the host-agnostic master: prepare-image.sh has finished, but

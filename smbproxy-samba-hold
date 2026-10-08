@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# Keep every installed binary package built from Debian's `samba` source at
+# its current version. The session VFS module uses Samba-private ABI and is
+# built for one exact Samba revision; an ordinary `apt full-upgrade` would
+# either move Samba past it (smbd then fails closed in
+# smbproxy-vfs-version-check) or remove the module package to satisfy the
+# upgrade. Samba moves only through a qualified update bundle, which calls
+# `release`, installs the matching Samba + module pair, then calls `apply`.
+#
+# Usage: smbproxy-samba-hold apply|release|check|status
+
+set -euo pipefail
+
+if [[ "${SMBPROXY_ALLOW_NON_ROOT_TEST:-0}" == "1" ]]; then
+    DPKG_QUERY_BIN="${SMBPROXY_DPKG_QUERY_BIN:-dpkg-query}"
+    APT_MARK_BIN="${SMBPROXY_APT_MARK_BIN:-apt-mark}"
+else
+    DPKG_QUERY_BIN=dpkg-query
+    APT_MARK_BIN=apt-mark
+fi
+
+die() { echo "smbproxy-samba-hold: $*" >&2; exit 2; }
+
+# Installed binary packages whose Debian source package is `samba`. This
+# follows Debian's packaging (samba, samba-libs, winbind, libwbclient0,
+# python3-samba, libldb2, ...) without a hand-kept list that would go stale.
+# Names are printed without the :arch qualifier, as apt-mark reports them.
+samba_packages() {
+    # shellcheck disable=SC2016 # dpkg-query expands the ${...} fields
+    "$DPKG_QUERY_BIN" -W -f='${binary:Package}\t${source:Package}\t${db:Status-Abbrev}\n' 2>/dev/null \
+        | awk -F'\t' '$2 == "samba" && $3 ~ /^.i/ { sub(/:.*/, "", $1); print $1 }' \
+        | sort -u
+}
+
+held_packages() {
+    # apt-mark prints bare names; strip any :arch so both lists compare.
+    "$APT_MARK_BIN" showhold 2>/dev/null | sed 's/:.*//' | sort -u
+}
+
+samba_version() {
+    # shellcheck disable=SC2016
+    "$DPKG_QUERY_BIN" -W -f='${Version}' samba 2>/dev/null || true
+}
+
+unheld_samba_packages() {
+    comm -23 <(samba_packages) <(held_packages)
+}
+
+require_root() {
+    [[ ${EUID:-$(id -u)} -eq 0 || "${SMBPROXY_ALLOW_NON_ROOT_TEST:-0}" == "1" ]] \
+        || die "must run as root"
+}
+
+case "${1:-}" in
+    apply)
+        require_root
+        mapfile -t packages < <(samba_packages)
+        [[ ${#packages[@]} -gt 0 ]] || die "no installed packages from the samba source"
+        "$APT_MARK_BIN" hold "${packages[@]}" >/dev/null
+        [[ -z "$(unheld_samba_packages)" ]] || die "hold did not apply to: $(unheld_samba_packages | tr '\n' ' ')"
+        echo "Samba packages held at $(samba_version)"
+        ;;
+    release)
+        require_root
+        mapfile -t packages < <(samba_packages)
+        [[ ${#packages[@]} -eq 0 ]] || "$APT_MARK_BIN" unhold "${packages[@]}" >/dev/null
+        echo "Samba package hold released"
+        ;;
+    check)
+        missing=$(unheld_samba_packages)
+        [[ -n "$(samba_packages)" && -z "$missing" ]] && exit 0
+        [[ -n "$missing" ]] && echo "not held: $(tr '\n' ' ' <<< "$missing")" >&2
+        exit 1
+        ;;
+    status)
+        if [[ -z "$(samba_packages)" ]]; then
+            echo "Samba: not installed"
+        elif [[ -z "$(unheld_samba_packages)" ]]; then
+            echo "Samba: $(samba_version) (held to match the session module)"
+        else
+            echo "Samba: $(samba_version) (NOT held: run 'sudo smbproxy-samba-hold apply')"
+        fi
+        ;;
+    *)
+        die "usage: $0 apply|release|check|status"
+        ;;
+esac

@@ -48,6 +48,7 @@ readonly SESSION_ROOT="/run/smbproxy/sessions"
 readonly SESSION_STATE="/run/smbproxy/session-state"
 readonly SESSION_HELPER="/usr/local/sbin/smbproxy-session-mount"
 readonly VFS_VERSION_HELPER="/usr/local/sbin/smbproxy-vfs-version-check"
+readonly SAMBA_HOLD_HELPER="/usr/local/sbin/smbproxy-samba-hold"
 
 readonly JOIN_LOG="/var/log/smbproxy-join.log"
 readonly SHARE_LOG="/var/log/smbproxy-share.log"
@@ -1156,7 +1157,15 @@ run_updates_now() {
     echo "[sconfig]   note: full-upgrade can install new dependencies"
     echo "[sconfig]   (e.g. new kernel packages). Plain 'apt-get upgrade'"
     echo "[sconfig]   would silently keep them back."
+    echo "[sconfig]   Samba stays at its current version; it is updated"
+    echo "[sconfig]   separately, together with its session module."
     echo
+    if [[ -x "$SAMBA_HOLD_HELPER" ]] && ! "$SAMBA_HOLD_HELPER" apply; then
+        echo "[sconfig] Samba packages could not be held; update cancelled."
+        echo "  Press Enter to continue."
+        read -r _
+        return
+    fi
     if command -v appcore_apt_run_full_upgrade >/dev/null 2>&1; then
         DEBIAN_FRONTEND=noninteractive appcore_apt_run_full_upgrade
     else
