@@ -158,8 +158,10 @@ done
 share_vars Files modern 192.0.2.20 $'two\nlines'
 rc=0; configure_share || rc=$?
 [[ $rc -eq 2 ]] || fail "multi-line password accepted (rc=$rc)"
-grep -q '^FRONT_GROUP="LAB\\Accounting"$' /var/lib/smbproxy/shares/Files.env \
-    || fail "DOMAIN\\Group value not stored literally"
+stored=$(appcore_kv_get /var/lib/smbproxy/shares/Files.env FRONT_GROUP "${SHARE_STATE_KEYS[@]}")
+[[ "$stored" == 'LAB\Accounting' ]] || fail "DOMAIN\\Group value not stored exactly"
+[[ "$(bash -c 'source "$1"; printf %s "$FRONT_GROUP"' _ /var/lib/smbproxy/shares/Files.env)" == 'LAB\Accounting' ]] \
+    || fail "a rolled-back reader that sources the state would see a different group"
 pass "hostile field values are refused before any write; DOMAIN\\Group is kept"
 
 echo "config transaction tests passed"

@@ -52,6 +52,7 @@ readonly SAMBA_HOLD_HELPER="/usr/local/sbin/smbproxy-samba-hold"
 
 # Keys each persisted state file may contain (code-review session plan 05).
 readonly -a SHARE_STATE_KEYS=(SHARE_NAME PROFILE OFFLINE_MODE BACKEND_IP BACKEND_USER BACKEND_DOMAIN BACKEND_MOUNT BACKEND_VERS BACKEND_SEAL FRONT_GROUP FRONT_FORCE_USER LOCKING_OVERRIDE)
+readonly FRONT_GROUP_RE='^([A-Za-z0-9][A-Za-z0-9.-]*\\)?[^]"/\\:;|=,+*?<>[]{1,256}$'
 readonly -a ROLES_KEYS=(DOMAIN_NIC_NAME DOMAIN_NIC_MAC LEGACY_NIC_NAME LEGACY_NIC_MAC)
 readonly -a DEPLOY_KEYS=(REALM DOMAIN_SHORT DC_HOST DC_IP)
 readonly -a HEALTH_KEYS=(MODE BACKEND_REACHABLE CONSECUTIVE_FAILURES PENDING_UPLOADS
@@ -2048,7 +2049,11 @@ share_fields_validate() {
     [[ "$FRONT_FORCE_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || bad+=" FRONT_FORCE_USER"
     [[ "$BACKEND_MOUNT" =~ ^(/[A-Za-z0-9_][A-Za-z0-9._-]*)+$ && "$BACKEND_MOUNT" != */..* ]] \
         || bad+=" BACKEND_MOUNT"
-    [[ -z "${FRONT_GROUP:-}" ]] || appcore_kv_value_ok "$FRONT_GROUP" || bad+=" FRONT_GROUP"
+    # AD group names exclude " / [ ] : ; | = , + * ? < >; one DOMAIN\ prefix is allowed.
+    [[ -z "${FRONT_GROUP:-}" ]] || {
+        [[ "$FRONT_GROUP" =~ $FRONT_GROUP_RE && "$FRONT_GROUP" =~ ^[[:print:]]+$ ]] \
+            || bad+=" FRONT_GROUP"
+    }
     [[ -z "${BACKEND_VERS:-}" || "$BACKEND_VERS" =~ ^(1\.0|2\.0|2\.1|3|3\.0|3\.0\.2|3\.1\.1)$ ]] \
         || bad+=" BACKEND_VERS"
     [[ -z "${BACKEND_SEAL:-}" || "$BACKEND_SEAL" =~ ^(yes|no)$ ]] || bad+=" BACKEND_SEAL"
