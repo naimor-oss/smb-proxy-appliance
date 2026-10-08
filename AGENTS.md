@@ -314,6 +314,28 @@ Domain-level state (`REALM`, `DOMAIN_SHORT`, `DC_HOST`, `DC_IP`)
 lives in `/var/lib/smbproxy/deploy.env`; nothing share-specific is
 kept there.
 
+### Ownership marker and fail-closed inventory
+
+Every frontend section `smbproxy-sconfig` writes starts with
+`    # smbproxy-managed: frontend section owned by smbproxy-sconfig`
+(`SMB_OWNER_MARKER`; the worker's `OWNER_MARKER` must match). The health
+worker builds its inventory from those sections plus the state records:
+
+- valid record → normal health handling (direct online/offline, queued);
+- owned section with a missing, unreadable, malformed or mismatched record →
+  withdrawn (`path` = the inert offline directory, `available = no`,
+  `# smbproxy-health: share state missing or invalid`) with the reason in the
+  share's health record. It is republished only through the normal offline
+  recovery (valid record, reachable backend, mount probe);
+- valid record with no section (orphan) → recorded, never published;
+- sections without the marker are operator-owned and copied byte for byte.
+  Pre-marker sections that carry the configurator's `# profile=…; locking=`
+  comment, or have a valid record, are adopted (the marker is added).
+
+A section the worker no longer lists keeps whatever withdrawal it has, so a
+rollback to an older worker leaves withdrawn sections withdrawn.
+`tests/worker-inventory.sh` covers these cases (code-review session plan 07).
+
 ### Persisted state is data, never code
 
 Every state file above, plus `/etc/smbproxy/nic-roles.env`, the worker
@@ -340,6 +362,7 @@ bash -n prepare-image.sh smbproxy-sconfig.sh smbproxy-share-worker \
   lab/run-scenario.sh lab/scenarios/*.sh tests/*.sh
 bash tests/unit-helpers.sh
 bash tests/share-worker.sh
+bash tests/worker-inventory.sh
 bash tests/domain-dns.sh
 bash tests/session-mount.sh
 bash tests/vfs-contract.sh

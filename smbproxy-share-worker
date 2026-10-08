@@ -44,7 +44,14 @@ else
 fi
 
 MANAGED_MARKER="    # smbproxy-health: backend unavailable"
+STATE_MARKER="    # smbproxy-health: share state missing or invalid"
 MANAGED_AVAILABLE="    available = no"
+# Persistent ownership marker written by smbproxy-sconfig as the first line of
+# every frontend section it creates (code-review session plan 07). Sections
+# without it are operator-authored and never touched, except pre-marker
+# sections that carry the configurator's profile comment or a valid state
+# record: those are adopted (the marker is added).
+OWNER_MARKER="    # smbproxy-managed: frontend section owned by smbproxy-sconfig"
 
 log() {
     printf '%s\n' "$*"
@@ -387,50 +394,62 @@ render_direct_availability_unlocked() {
     [[ -f "$SMB_CONF" ]] || return 0
     local candidate="${SMB_CONF}.health.$$"
 
+    # Rows: NAME<TAB>PATH<TAB>online|offline|withdrawn, one per managed
+    # section. Only listed sections are rewritten; every other section,
+    # including one that still carries a withdrawal this worker no longer
+    # understands, is copied byte for byte.
+    #
     # Replace the configured path in place rather than appending an override.
     # smbd validates a path while loading its line, so merely adding a later
     # path directive still blocks in stat(2) on a disconnected CIFS mount.
     # The per-share state file supplies the original path for recovery.
-    awk -F '\t' -v marker="$MANAGED_MARKER" \
+    awk -F '\t' -v offline_marker="$MANAGED_MARKER" \
+        -v state_marker="$STATE_MARKER" -v owner="$OWNER_MARKER" \
         -v setting="$MANAGED_AVAILABLE" -v offline_path="$OFFLINE_PATH" '
-        function emit_managed() {
-            if (current_offline) {
-                print marker
+        function emit_withdrawal() {
+            if (listed && state[current_section] == "offline") {
+                print offline_marker
+                print setting
+            } else if (listed && state[current_section] == "withdrawn") {
+                print state_marker
                 print setting
             }
-            current_offline = 0
+            listed = 0
         }
         FILENAME == ARGV[1] {
             section = "[" $1 "]"
             configured_path[section] = $2
-            offline[section] = ($3 == "offline")
+            state[section] = $3
             next
         }
-        $0 == marker {
-            remove_managed = 1
-            next
-        }
-        remove_managed && ($0 == setting \
-            || $0 ~ /^[[:space:]]*path[[:space:]]*=/) {
-            next
-        }
-        {
-            remove_managed = 0
-            if ($0 ~ /^\[[^]]+\][[:space:]]*$/) {
-                emit_managed()
-                current_section = $0
-                current_offline = offline[current_section]
-            }
-            if ((current_section in configured_path) \
-                && $0 ~ /^[[:space:]]*path[[:space:]]*=/) {
-                print "    path = " \
-                    (offline[current_section] ? offline_path \
-                                              : configured_path[current_section])
-                next
-            }
+        /^\[[^]]+\][[:space:]]*$/ {
+            emit_withdrawal()
+            current_section = $0
+            sub(/[[:space:]]+$/, "", current_section)
+            listed = (current_section in state)
             print
+            if (listed) print owner
+            drop_setting = 0
+            next
         }
-        END { emit_managed() }
+        listed && $0 == owner { next }
+        listed && index($0, "    # smbproxy-health:") == 1 {
+            drop_setting = 1
+            next
+        }
+        listed && drop_setting && $0 == setting {
+            drop_setting = 0
+            next
+        }
+        listed && /^[[:space:]]*path[[:space:]]*=/ {
+            drop_setting = 0
+            print "    path = " \
+                (state[current_section] == "online" \
+                    ? configured_path[current_section] : offline_path)
+            next
+        }
+        { drop_setting = 0; print }
+        END { emit_withdrawal() }
     ' "$direct_file" "$SMB_CONF" > "$candidate"
 
     if cmp -s "$candidate" "$SMB_CONF"; then
@@ -453,6 +472,28 @@ render_direct_availability_unlocked() {
     fi
 }
 
+# Print the names of frontend sections in smb.conf, one per line, each
+# followed by a tab and "owned" (ownership marker or the configurator's
+# profile comment) or "plain".
+smb_conf_sections() {
+    [[ -f "$SMB_CONF" ]] || return 0
+    awk -v owner="$OWNER_MARKER" '
+        function flush() { if (name != "") print name "\t" (owned ? "owned" : "plain") }
+        /^\[[^]]+\][[:space:]]*$/ {
+            flush()
+            name = $0
+            sub(/[[:space:]]+$/, "", name)
+            name = substr(name, 2, length(name) - 2)
+            owned = 0
+            if (tolower(name) == "global") name = ""
+            next
+        }
+        $0 == owner { owned = 1 }
+        /^[[:space:]]*# profile=[a-z]+; locking=/ { owned = 1 }
+        END { flush() }
+    ' "$SMB_CONF"
+}
+
 render_direct_availability() {
     local direct_file="$1"
     if ! command -v flock >/dev/null 2>&1; then
@@ -469,10 +510,34 @@ render_direct_availability() {
     return "$rc"
 }
 
+# Withdraw a managed section whose state record is missing or invalid, and
+# record why. The failure count is held at the threshold so recovery takes
+# the full offline-recovery path (valid state, reachable backend, mount
+# probe) before the section is published again.
+withdraw_section() {
+    local name="$1" reason="$2" direct_file="$3" safe failures
+    safe=$(share_safe_name "$name")
+    load_health "$safe"
+    failures="$HEALTH_FAILURES"
+    (( failures >= FAIL_THRESHOLD )) || failures="$FAIL_THRESHOLD"
+    log "share=${name} withdrawn: ${reason}"
+    printf '%s\t%s\t%s\n' "$name" "$OFFLINE_PATH" withdrawn >> "$direct_file"
+    write_health "$safe" direct no "$failures" 0 0 "$HEALTH_LAST_SUCCESS" \
+        "share withdrawn: ${reason}" || true
+}
+
 worker_run() {
     install -d -m 0755 "$HEALTH_DIR" "$OFFLINE_PATH" "$PROBE_HINT_DIR"
     local direct_file="${HEALTH_DIR}/direct-shares.$$"
     : > "$direct_file"
+
+    # Inventory (code-review session plan 07): every frontend section in
+    # smb.conf, and whether the configurator owns it.
+    local -A section_owned=() handled=() bad_state=()
+    local sec_name sec_kind
+    while IFS=$'\t' read -r sec_name sec_kind; do
+        [[ -n "$sec_name" ]] && section_owned["$sec_name"]="$sec_kind"
+    done < <(smb_conf_sections)
 
     shopt -s nullglob
     local share_file safe mode reachable failures last_success mode_error
@@ -480,13 +545,27 @@ worker_run() {
     for share_file in "$SHARES_DIR"/*.env; do
         SHARE_NAME="" PROFILE="" OFFLINE_MODE="" BACKEND_IP=""
         BACKEND_MOUNT="" FRONT_FORCE_USER=""
-        if ! appcore_kv_load "$share_file" "${SHARE_STATE_KEYS[@]}"; then
-            # Session plan 07 decides what a malformed record does to its
-            # frontend; it is never executed and never trusted here.
-            log "skipping malformed share state ${share_file}"
+        if ! appcore_kv_load "$share_file" "${SHARE_STATE_KEYS[@]}" 2>/dev/null; then
+            bad_state["$(basename "$share_file" .env)"]="state record is malformed"
+            log "malformed share state ${share_file}"
             continue
         fi
-        [[ -n "$SHARE_NAME" ]] || continue
+        if [[ -z "$SHARE_NAME" \
+            || "$(share_safe_name "$SHARE_NAME").env" != "$(basename "$share_file")" ]]; then
+            bad_state["$(basename "$share_file" .env)"]="state record names a different share"
+            log "share state ${share_file} does not match its file name"
+            continue
+        fi
+        if [[ -z "${section_owned[$SHARE_NAME]+x}" ]]; then
+            # Orphan state: never create a frontend implicitly.
+            safe=$(share_safe_name "$SHARE_NAME")
+            load_health "$safe"
+            log "share=${SHARE_NAME} has state but no smb.conf section; not published"
+            write_health "$safe" "${OFFLINE_MODE:-direct}" no "$HEALTH_FAILURES" 0 0 \
+                "$HEALTH_LAST_SUCCESS" "state has no frontend section; not published" || true
+            continue
+        fi
+        handled["$SHARE_NAME"]=1
         safe=$(share_safe_name "$SHARE_NAME")
         mode="${OFFLINE_MODE:-direct}"
         mode_error=""
@@ -528,6 +607,10 @@ worker_run() {
                     && "$SYNC_PENDING_DELETES" -eq 0 && -z "$SYNC_LAST_ERROR" ]]; then
                     last_success=$(date +%s)
                 fi
+                # The office copy is always served; listing it lifts any
+                # earlier state withdrawal now that the record is valid.
+                printf '%s\t%s\t%s\n' "$SHARE_NAME" \
+                    "${DATA_ROOT}/shares/${safe}" online >> "$direct_file"
                 write_health "$safe" "$mode" "$reachable" "$failures" \
                     "$SYNC_PENDING_UPLOADS" "$SYNC_PENDING_DELETES" \
                     "$last_success" "$SYNC_LAST_ERROR"
@@ -571,6 +654,22 @@ worker_run() {
         esac
     done
     shopt -u nullglob
+
+    # Every owned section without a valid record is withdrawn. A missing
+    # record never re-enables a section.
+    local reason
+    for sec_name in "${!section_owned[@]}"; do
+        [[ "${section_owned[$sec_name]}" == owned && -z "${handled[$sec_name]+x}" ]] || continue
+        safe=$(share_safe_name "$sec_name")
+        if [[ -n "${bad_state[$safe]+x}" ]]; then
+            reason="${bad_state[$safe]}"
+        elif [[ -e "${SHARES_DIR}/${safe}.env" ]]; then
+            reason="state record is unreadable"
+        else
+            reason="state record is missing"
+        fi
+        withdraw_section "$sec_name" "$reason" "$direct_file"
+    done
 
     render_direct_availability "$direct_file"
     rm -f "$direct_file"

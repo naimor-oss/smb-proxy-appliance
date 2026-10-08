@@ -72,7 +72,7 @@ printf '%s\n' \
     "BACKEND_MOUNT=\"${TEST_ROOT}/backend\"" \
     'FRONT_FORCE_USER=""' \
     > "$SHARES_DIR/CNC.env"
-printf '[global]\n' > "$SMB_CONF"
+printf '[global]\n\n[CNC]\n    path = %s\n' "$DATA_ROOT/shares/CNC" > "$SMB_CONF"
 
 echo "== queued one-way delivery =="
 printf 'v1\n' > "$DATA_ROOT/shares/CNC/program.nc"
@@ -156,6 +156,7 @@ printf '%s\n' \
     "BACKEND_MOUNT=\"${TEST_ROOT}/backend-legacy\"" \
     'FRONT_FORCE_USER=""' \
     > "$SHARES_DIR/LegacyQueued.env"
+printf '\n[LegacyQueued]\n    path = %s\n' "$TEST_ROOT/sessions" >> "$SMB_CONF"
 worker_run
 check_path "worker refuses queued replay for legacy profile" no \
     "$TEST_ROOT/backend-legacy/unsafe.tps"
