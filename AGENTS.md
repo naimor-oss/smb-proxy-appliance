@@ -314,6 +314,20 @@ Domain-level state (`REALM`, `DOMAIN_SHORT`, `DC_HOST`, `DC_IP`)
 lives in `/var/lib/smbproxy/deploy.env`; nothing share-specific is
 kept there.
 
+### Release identity and updates
+
+`/etc/smbproxy.release` (written by `prepare-image.sh`, rewritten by every
+update) records the version (`VERSION`), repo commit, appliance-core,
+Samba and VFS versions, applied migrations and history. Every change after
+imaging ships as a bundle built by `updates/build-bundle.sh` and applied by
+`smbproxy-update` (appliance-core update framework; proxy hooks in
+`updates/bundle/`). Do not write new one-off updaters; bump `VERSION`, add
+the previous version to `updates/bundle/ACCEPTS`, and add a migration in
+`updates/bundle/migrations/` when state must change. The old
+`updates/inplace-0.4.0`, `vfs-read-hotfix-0.2.0` and `samba-hold-1.0` are
+frozen history. `tests/root/update-bundle.sh` applies the real bundle to a
+simulated field unit.
+
 ### Ownership marker and fail-closed inventory
 
 Every frontend section `smbproxy-sconfig` writes starts with
@@ -374,6 +388,8 @@ docker run --rm -v "$PWD/..":/ws:ro -e DISPOSABLE_ROOT_TEST=1 \
     debian:trixie bash /ws/smb-proxy-appliance/tests/root/share-lifecycle.sh
 docker run --rm -v "$PWD/..":/ws:ro -e DISPOSABLE_ROOT_TEST=1 \
     debian:trixie bash /ws/smb-proxy-appliance/tests/root/config-transaction.sh
+docker run --rm -v "$PWD/..":/ws:ro -e DISPOSABLE_ROOT_TEST=1 \
+    debian:trixie bash /ws/smb-proxy-appliance/tests/root/update-bundle.sh
 ```
 
 ## Development Rules

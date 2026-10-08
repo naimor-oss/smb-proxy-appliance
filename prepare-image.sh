@@ -534,8 +534,8 @@ if [[ -n "$LIB_SRC" ]]; then
     done
     # Every state reader on the appliance depends on kvstate.sh (code-review
     # session plan 05); an image without it would fail closed everywhere.
-    [[ -f "$LIB_TARGET/kvstate.sh" ]] || {
-        err "appliance-core lib has no kvstate.sh; build from appliance-core >= 0.12.0"
+    [[ -f "$LIB_TARGET/kvstate.sh" && -f "$LIB_TARGET/update.sh" ]] || {
+        err "appliance-core lib lacks kvstate.sh/update.sh; build from appliance-core >= 0.13.0"
         exit 1
     }
     log "  vendored $dst_count appliance-core lib(s) into $LIB_TARGET"
@@ -2098,6 +2098,40 @@ printf '%s======================================================================
 printf '\n'
 MOTDEOF
 chmod +x /etc/update-motd.d/16-smbproxy-vf-warning
+
+#===============================================================================
+# 21c. RELEASE IDENTITY AND BUILT-IN UPDATER (audit M1/M2)
+#===============================================================================
+# /etc/smbproxy.release says exactly what this image runs; every later change
+# arrives as a bundle applied by smbproxy-update, which rewrites it.
+log "Installing smbproxy-update and writing /etc/smbproxy.release..."
+for src in /tmp/smbproxy-update /root/smbproxy-update; do
+    if [[ -f "$src" ]]; then
+        install -m 0755 "$src" /usr/local/sbin/smbproxy-update
+        break
+    fi
+done
+[[ -x /usr/local/sbin/smbproxy-update ]] || { err "smbproxy-update not found in /tmp"; exit 1; }
+[[ "${SMBPROXY_VERSION:-}" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]] \
+    || { err "SMBPROXY_VERSION is not set (lab/build-fresh-base.sh passes it from VERSION)"; exit 1; }
+(
+    # shellcheck disable=SC1091
+    source "$LIB_TARGET/kvstate.sh" && source "$LIB_TARGET/update.sh" || exit 1
+    built=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    REL_APPLIANCE=smbproxy
+    REL_VERSION="$SMBPROXY_VERSION"
+    REL_REPO_COMMIT="${SMBPROXY_BUILD_COMMIT:-unknown}"
+    REL_APPCORE_VERSION=$(head -1 "$LIB_TARGET/VERSION" 2>/dev/null || echo unknown)
+    REL_APPCORE_COMMIT="${APPCORE_BUILD_COMMIT:-unknown}"
+    REL_SAMBA_VERSION=$(dpkg-query -W -f='${Version}' samba 2>/dev/null || true)
+    REL_VFS_VERSION=$(dpkg-query -W -f='${Version}' smbproxy-session-vfs 2>/dev/null || true)
+    REL_IMAGE_BUILT_AT="$built"
+    REL_LAST_UPDATE_AT=""
+    REL_MIGRATIONS=""
+    REL_HISTORY="${SMBPROXY_VERSION}@${built}"
+    appcore_release_write /etc/smbproxy.release
+) || { err "could not write /etc/smbproxy.release"; exit 1; }
+log "  $(grep -E '^(VERSION|SAMBA_VERSION|VFS_VERSION)=' /etc/smbproxy.release | tr '\n' ' ')"
 
 #===============================================================================
 # 22. FINAL CLEANUP
