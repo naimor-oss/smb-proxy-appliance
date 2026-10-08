@@ -201,6 +201,17 @@ underneath live SMB1 sessions:
 Lock order everywhere: per-share lifecycle → share worker → smb.conf.
 Nothing holds a lock while waiting for clients to disconnect.
 
+Applying a change is transactional (code-review session plan 06).
+`configure_share` snapshots the share's credentials, state file,
+`/etc/fstab`, and `smb.conf` into a root-only directory under `/run`
+before writing anything, then checks `daemon-reload`, the state write,
+and the `smbd` reload. Any failure restores the snapshot byte for byte
+and reloads (rc 14: the previous configuration is active). If even that
+fails, a legacy share is withdrawn, the snapshot is kept and named in
+`/var/log/smbproxy-share.log`, and rc 15 is returned. The backend
+password variable is cleared on every return path.
+`tests/root/config-transaction.sh` covers each case.
+
 Failure behavior: a removal that cannot drain returns non-zero, keeps
 state and credentials, and leaves the share **withdrawn** (connections
 refused) with the exact re-run command. A reconfigure that cannot drain
@@ -318,6 +329,8 @@ bash tests/samba-hold.sh
 # root-only, in a throwaway container (CI runs it):
 docker run --rm -v "$PWD":/src:ro -e DISPOSABLE_ROOT_TEST=1 \
     debian:trixie bash /src/tests/root/share-lifecycle.sh
+docker run --rm -v "$PWD":/src:ro -e DISPOSABLE_ROOT_TEST=1 \
+    debian:trixie bash /src/tests/root/config-transaction.sh
 ```
 
 ## Development Rules
