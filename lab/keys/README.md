@@ -53,6 +53,16 @@ stager.
 
 After running the stager, mount the seed ISO and inspect `user-data`:
 
+On WSL2 (needs `sudo apt-get install xorriso`):
+
+```bash
+xorriso -osirrox on -indev /mnt/d/ISO/<hostname>-seed.iso \
+    -extract /user-data /tmp/seed-user-data 2>/dev/null
+grep -A20 ssh_authorized_keys /tmp/seed-user-data
+```
+
+On macOS:
+
 ```bash
 hdiutil attach -nobrowse /Volumes/ISO/<hostname>-seed.iso
 grep -A20 ssh_authorized_keys /Volumes/CIDATA/user-data

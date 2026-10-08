@@ -35,16 +35,22 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Workstation portability (WSL2 on Windows 11, or macOS): ISO share path,
+# seed ISO builder, checksums. lab-kit is a sibling checkout.
+LAB_KIT_DIR="${LAB_KIT_DIR:-$SCRIPT_DIR/../../lab-kit}"
+# shellcheck disable=SC1091
+source "$LAB_KIT_DIR/lib/lab-host.sh" 2>/dev/null \
+    || { echo "error: lab-kit not found at $LAB_KIT_DIR (clone it next to this repo)" >&2; exit 1; }
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 VM_NAME="${VM_NAME:-smbproxy-1}"
 SNAPSHOT="${SNAPSHOT:-deploy-master}"
 HV_HOST="${HV_HOST:-server}"
 HV_USER="${HV_USER:-nmadmin}"
-ISO_DIR_MAC="${ISO_DIR_MAC:-/Volumes/ISO}"
+ISO_DIR_MAC="${ISO_DIR_MAC:-$(lab_iso_dir)}"
 ISO_DIR_HOST="${ISO_DIR_HOST:-D:\\ISO}"
 DIST_DIR="${DIST_DIR:-$REPO_DIR/dist}"
-OVFTOOL="${OVFTOOL:-/Volumes/Data/Developer/Debian-SAMBA/ovftool/ovftool}"
+OVFTOOL="${OVFTOOL:-$(command -v ovftool || echo ovftool)}"
 VERSION="${VERSION:-$(date +%Y.%m.%d)}"
 
 # Recompute paths after VERSION is fixed so --version flag works.
@@ -104,7 +110,7 @@ ssh_host() { ssh "${HV_USER}@${HV_HOST}" "$@"; }
 [[ -d "$ISO_DIR_MAC" ]] || { echo "ISO share not mounted: $ISO_DIR_MAC" >&2; exit 1; }
 if [[ $HYPERV_ONLY -eq 0 ]]; then
     [[ -x "$OVFTOOL" ]] || { echo "ovftool not found at $OVFTOOL" >&2; exit 1; }
-    command -v qemu-img >/dev/null || { echo "qemu-img missing (brew install qemu)" >&2; exit 1; }
+    lab_need_tool qemu-img qemu-utils qemu
 fi
 
 mkdir -p "$DIST_VER_DIR"
@@ -157,7 +163,7 @@ say "wrote $VHDX_OUT ($(du -sh "$VHDX_OUT" | cut -f1))"
 
 if [[ $HYPERV_ONLY -eq 1 ]]; then
     step "3. SHA256SUMS"
-    (cd "$DIST_VER_DIR" && shasum -a 256 \
+    (cd "$DIST_VER_DIR" && lab_sha256 \
         "${ARTIFACT_BASE}.vhdx" > SHA256SUMS && cat SHA256SUMS)
 
     step "4. cleanup"
@@ -217,7 +223,7 @@ step "6. ovftool .vmx -> .ova"
 say "wrote $OVA_OUT ($(du -sh "$OVA_OUT" | cut -f1))"
 
 step "7. SHA256SUMS"
-(cd "$DIST_VER_DIR" && shasum -a 256 \
+(cd "$DIST_VER_DIR" && lab_sha256 \
     "${ARTIFACT_BASE}.vhdx" \
     "${ARTIFACT_BASE}.qcow2" \
     "${ARTIFACT_BASE}.vmdk" \
