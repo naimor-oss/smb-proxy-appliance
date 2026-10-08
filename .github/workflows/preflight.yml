@@ -1,0 +1,15 @@
+# Runs the shared sibling preflight (dev-commons/.github/workflows/preflight.yml).
+name: preflight
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    uses: naimor-oss/dev-commons/.github/workflows/preflight.yml@main

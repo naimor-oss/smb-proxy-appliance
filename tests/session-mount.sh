@@ -85,4 +85,10 @@ records=("$TEST_ROOT/session-state"/*.env)
 shopt -u nullglob
 [[ ${#records[@]} -eq 0 ]] || { echo "FAIL cleanup-all left session state" >&2; exit 1; }
 
+# Outside test mode the helper must not read any path or binary override:
+# smbd runs it as root, so an inherited environment must not redirect it.
+ungated=$(awk '/^if \[\[ "\$ALLOW_NON_ROOT_TEST" == "1" \]\]; then$/ {exit}
+               /\$\{SMBPROXY_/ && !/SMBPROXY_ALLOW_NON_ROOT_TEST/ {print}' "$HELPER")
+[[ -z "$ungated" ]] || { echo "FAIL: override read outside test mode: $ungated" >&2; exit 1; }
+
 echo "session-mount tests passed"

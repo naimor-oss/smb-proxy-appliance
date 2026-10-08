@@ -84,6 +84,16 @@ appliance owns the mount helper and configuration, and pins the component in
 `components/smbproxy-session-vfs.env`. Advance the component first and the
 appliance pin second.
 
+Because the module is built for one exact Samba revision, every installed
+package from Debian's `samba` source is held (`smbproxy-samba-hold apply`,
+run by `prepare-image.sh` and before every menu-driven update). Never remove
+the hold to "fix" a pending-update warning: an unheld `apt full-upgrade`
+either moves Samba past the module (the version guard then stops `smbd`) or
+removes the module package. Samba moves only through a qualified update
+bundle that releases the hold, installs the new Samba and matching module
+together, and re-applies the hold. Already-deployed units get the hold from
+`updates/samba-hold-1.0`.
+
 Distinct CIFS superblocks have distinct `st_dev` values. Without correction,
 Samba therefore treats the same backend inode as unrelated files and splits
 its share-mode and lock databases, which breaks SMB semantics and can corrupt
@@ -271,6 +281,7 @@ bash tests/domain-dns.sh
 bash tests/session-mount.sh
 bash tests/vfs-contract.sh
 bash tests/vfs-version-check.sh
+bash tests/samba-hold.sh
 ```
 
 ## Development Rules
