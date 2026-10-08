@@ -4,6 +4,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROBE="$ROOT/smbproxy-probe-backend"
 TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/smbproxy-probe-test.XXXXXX")
+# Sibling appliance-core supplies the state parser (code-review session plan 05).
+SMBPROXY_APPCORE_KVSTATE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/appliance-core/lib/kvstate.sh"
+export SMBPROXY_APPCORE_KVSTATE
 trap 'rm -rf "$TEST_ROOT"' EXIT
 mkdir -p "$TEST_ROOT/shares" "$TEST_ROOT/bin"
 

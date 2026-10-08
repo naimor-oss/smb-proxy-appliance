@@ -6,6 +6,12 @@
 set -euo pipefail
 
 SHARES_DIR="${SMBPROXY_STATE_DIR:-/var/lib/smbproxy/shares}"
+KVSTATE="${SMBPROXY_APPCORE_KVSTATE:-/usr/local/lib/appliance-core/kvstate.sh}"
+# Share state is parsed as data, never sourced (code-review session plan 05).
+if [[ -r "$KVSTATE" ]]; then
+    # shellcheck disable=SC1090
+    source "$KVSTATE"
+fi
 if [[ -n "${SMBPROXY_VFS_VERSION_FILE:-}" ]]; then
     EXPECTED_FILE="$SMBPROXY_VFS_VERSION_FILE"
 elif [[ -r /usr/share/smbproxy-session-vfs/samba-package-version ]]; then
@@ -22,8 +28,12 @@ legacy_configured=0
 shopt -s nullglob
 for state in "$SHARES_DIR"/*.env; do
     PROFILE=""
-    # shellcheck disable=SC1090
-    source "$state"
+    # A state record that cannot be parsed (or a missing parser) counts as a
+    # legacy share, so the version guard still applies: fail closed.
+    if ! declare -F appcore_kv_get >/dev/null \
+        || ! PROFILE=$(appcore_kv_get "$state" PROFILE SHARE_NAME PROFILE OFFLINE_MODE BACKEND_IP BACKEND_USER BACKEND_DOMAIN BACKEND_MOUNT BACKEND_VERS BACKEND_SEAL FRONT_GROUP FRONT_FORCE_USER LOCKING_OVERRIDE 2>/dev/null); then
+        PROFILE=legacy
+    fi
     if [[ "${PROFILE:-legacy}" == "legacy" ]]; then
         legacy_configured=1
         break

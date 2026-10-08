@@ -4,8 +4,8 @@
 # real session helper against the real /var/lib/smbproxy and /etc/samba
 # paths, so it must run as root in a DISPOSABLE container:
 #
-#   docker run --rm -v "$PWD":/src:ro -e DISPOSABLE_ROOT_TEST=1 \
-#       debian:trixie bash /src/tests/root/share-lifecycle.sh
+#   docker run --rm -v "$PWD/..":/ws:ro -e DISPOSABLE_ROOT_TEST=1 \
+#       debian:trixie bash /ws/smb-proxy-appliance/tests/root/share-lifecycle.sh
 #
 # smbd/smbcontrol/systemctl and mount/umount are fakes; no network.
 
@@ -16,6 +16,11 @@ set -euo pipefail
 }
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# The state parser comes from the sibling appliance-core checkout and is
+# installed where the image vendors it (code-review session plan 05).
+KVSTATE_SRC="$SRC/../appliance-core/lib/kvstate.sh"
+[[ -r "$KVSTATE_SRC" ]] || { echo "needs ../appliance-core next to this repo" >&2; exit 2; }
+install -D -m 0644 "$KVSTATE_SRC" /usr/local/lib/appliance-core/kvstate.sh
 T=$(mktemp -d)
 fail() { echo "FAIL: $*" >&2; exit 1; }
 pass() { echo "ok   $*"; }

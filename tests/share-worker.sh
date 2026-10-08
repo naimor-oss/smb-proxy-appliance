@@ -7,6 +7,9 @@ WORKER="${SCRIPT_DIR}/../smbproxy-share-worker"
 [[ -f "$WORKER" ]] || { echo "FAIL: $WORKER not found" >&2; exit 2; }
 
 TEST_ROOT=$(mktemp -d /tmp/smbproxy-worker-test.XXXXXX)
+# Sibling appliance-core supplies the state parser (code-review session plan 05).
+SMBPROXY_APPCORE_KVSTATE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/appliance-core/lib/kvstate.sh"
+export SMBPROXY_APPCORE_KVSTATE
 trap 'rm -rf "$TEST_ROOT"' EXIT
 
 export SMBPROXY_STATE_DIR="${TEST_ROOT}/state"
@@ -271,6 +274,18 @@ SYSTEMCTL_ACTION=""
 set_direct_automount_availability_real Direct /fixture/direct online
 check_eq "recovery restarts the idle automount" \
     "start:fixture.automount" "$SYSTEMCTL_ACTION"
+
+# Code-review session plan 05: health and share state are data, never code.
+PWNED="$TEST_ROOT/pwned"
+write_health Hostile offline no 3 0 0 0 "mount error: \"\$(touch $PWNED)\" \`id\` C:\\path"$'\n'"second line"
+check_eq "hostile error text is stored as parseable data" "0" \
+    "$(appcore_kv_load "$HEALTH_DIR/Hostile.env" "${HEALTH_KEYS[@]}" >/dev/null 2>&1; echo $?)"
+load_health Hostile
+check_eq "health counters survive a hostile error text" "3" "$HEALTH_FAILURES"
+printf 'CONSECUTIVE_FAILURES="1"$(touch %s)\n' "$PWNED" > "$HEALTH_DIR/Evil.env"
+load_health Evil
+check_eq "malformed health record restarts the counters" "0" "$HEALTH_FAILURES"
+check_eq "health record was never executed" "no" "$([[ -e "$PWNED" ]] && echo yes || echo no)"
 
 echo
 echo "summary: $PASS passed, $FAIL failed"

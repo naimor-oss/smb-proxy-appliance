@@ -314,6 +314,25 @@ Domain-level state (`REALM`, `DOMAIN_SHORT`, `DC_HOST`, `DC_IP`)
 lives in `/var/lib/smbproxy/deploy.env`; nothing share-specific is
 kept there.
 
+### Persisted state is data, never code
+
+Every state file above, plus `/etc/smbproxy/nic-roles.env`, the worker
+health records under `/var/lib/smbproxy/health/`, and the first-boot
+detection cache `/var/lib/smbproxy-init-detected.env`, is read with
+appliance-core `kvstate.sh` (`appcore_kv_load` / `appcore_kv_get`) and
+written with `appcore_kv_write`, against a fixed key list per file
+(`SHARE_STATE_KEYS`, `ROLES_KEYS`, `DEPLOY_KEYS`, `HEALTH_KEYS` in
+`smbproxy-sconfig.sh`). Nothing sources them. A malformed file fails
+closed: the session helper refuses the connect, the version guard treats
+the share as legacy (guard applies), the worker skips the share, and the
+configurator drains before changing it. If `kvstate.sh` is missing, every
+reader fails closed the same way; `prepare-image.sh` refuses to build an
+image without it. The POSIX `sh` login banner reads single keys with
+`awk` and keeps only name/MAC/domain characters.
+`configure_share_apply` validates every field (`share_fields_validate`)
+before anything is written. The frozen `updates/inplace-0.4.0/` bundle
+still sources state on the pre-0.4.0 units it targets and is not changed.
+
 ## Checks
 
 ```bash
@@ -327,10 +346,11 @@ bash tests/vfs-contract.sh
 bash tests/vfs-version-check.sh
 bash tests/samba-hold.sh
 # root-only, in a throwaway container (CI runs it):
-docker run --rm -v "$PWD":/src:ro -e DISPOSABLE_ROOT_TEST=1 \
-    debian:trixie bash /src/tests/root/share-lifecycle.sh
-docker run --rm -v "$PWD":/src:ro -e DISPOSABLE_ROOT_TEST=1 \
-    debian:trixie bash /src/tests/root/config-transaction.sh
+# (mounts the parent so ../appliance-core supplies kvstate.sh)
+docker run --rm -v "$PWD/..":/ws:ro -e DISPOSABLE_ROOT_TEST=1 \
+    debian:trixie bash /ws/smb-proxy-appliance/tests/root/share-lifecycle.sh
+docker run --rm -v "$PWD/..":/ws:ro -e DISPOSABLE_ROOT_TEST=1 \
+    debian:trixie bash /ws/smb-proxy-appliance/tests/root/config-transaction.sh
 ```
 
 ## Development Rules
@@ -362,6 +382,9 @@ docker run --rm -v "$PWD":/src:ro -e DISPOSABLE_ROOT_TEST=1 \
   directory under `/run`, mode 0600, removed when the command returns;
   secrets with leading/trailing spaces are refused because Samba trims
   them). `tests/secret-free-auth.sh` enforces this.
+- Never `source` or `.` a persisted state file, and never write one
+  with a heredoc or `printf %q`. Use `appcore_kv_load`/`appcore_kv_write`
+  with the file's key list (see "Persisted state is data, never code").
 - Add tests or scenario assertions when changing behavior.
 
 ## Important Interop Notes

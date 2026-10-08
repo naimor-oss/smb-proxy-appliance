@@ -30,11 +30,19 @@ if [[ ! -r "$ROLES_FILE" || ! -r "$DEPLOY_FILE" ]]; then
 fi
 
 DOMAIN_NIC_NAME="" REALM=""
-# Both files are root-owned configuration written by smbproxy-sconfig.
+# Parsed as data, never sourced (code-review session plan 05).
+KVSTATE="${SMBPROXY_APPCORE_KVSTATE:-/usr/local/lib/appliance-core/kvstate.sh}"
+if [[ ! -r "$KVSTATE" ]]; then
+    log "DNS refresh skipped: state parser $KVSTATE is missing"
+    exit 0
+fi
 # shellcheck disable=SC1090
-source "$ROLES_FILE"
-# shellcheck disable=SC1090
-source "$DEPLOY_FILE"
+source "$KVSTATE"
+if ! appcore_kv_load "$ROLES_FILE" DOMAIN_NIC_NAME DOMAIN_NIC_MAC LEGACY_NIC_NAME LEGACY_NIC_MAC \
+    || ! appcore_kv_load "$DEPLOY_FILE" REALM DOMAIN_SHORT DC_HOST DC_IP; then
+    log "DNS refresh skipped: NIC role or domain state is malformed"
+    exit 0
+fi
 
 if [[ -z "$DOMAIN_NIC_NAME" || -z "$REALM" ]] \
     || [[ ! "$DOMAIN_NIC_NAME" =~ ^[A-Za-z0-9_.:-]+$ ]] \

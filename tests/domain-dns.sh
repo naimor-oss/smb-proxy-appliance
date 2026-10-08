@@ -6,6 +6,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HELPER="${SCRIPT_DIR}/../smbproxy-domain-dns"
 TEST_ROOT=$(mktemp -d /tmp/smbproxy-domain-dns-test.XXXXXX)
+# Sibling appliance-core supplies the state parser (code-review session plan 05).
+SMBPROXY_APPCORE_KVSTATE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/appliance-core/lib/kvstate.sh"
+export SMBPROXY_APPCORE_KVSTATE
 trap 'rm -rf "$TEST_ROOT"' EXIT
 
 mkdir -p "$TEST_ROOT/bin"
