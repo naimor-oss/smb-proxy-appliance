@@ -532,6 +532,12 @@ if [[ -n "$LIB_SRC" ]]; then
     for libfile in "$LIB_TARGET"/*.sh; do
         bash -n "$libfile" || { err "vendored lib failed bash -n: $libfile"; exit 1; }
     done
+    # Every state reader on the appliance depends on kvstate.sh (code-review
+    # session plan 05); an image without it would fail closed everywhere.
+    [[ -f "$LIB_TARGET/kvstate.sh" ]] || {
+        err "appliance-core lib has no kvstate.sh; build from appliance-core >= 0.12.0"
+        exit 1
+    }
     log "  vendored $dst_count appliance-core lib(s) into $LIB_TARGET"
 
     PROV_FILE=/etc/appliance-core.provenance
@@ -968,6 +974,12 @@ for ifn in "${ALL_IFACES[@]}"; do
     cidr=$(ip4_for_iface "$ifn")
     dhcp=no
     is_dhcp_iface "$ifn" && dhcp=yes
+    # Only plain values reach the cache (code-review session plan 05).
+    [[ "$ifn" =~ ^[A-Za-z0-9._-]{1,15}$ ]] || { log "  skipping NIC with an unexpected name"; continue; }
+    [[ "$mac" =~ ^[0-9a-f]{2}(:[0-9a-f]{2}){5}$ ]] || mac=""
+    [[ "$state" =~ ^[a-z]{1,16}$ ]] || state=unknown
+    [[ "${cidr:-}" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$ ]] || cidr=""
+    (( nic_count < 16 )) || { log "  more than 16 NICs; ignoring $ifn"; continue; }
     nic_block+="NIC${nic_count}_NAME=\"$ifn\""$'\n'
     nic_block+="NIC${nic_count}_MAC=\"$mac\""$'\n'
     nic_block+="NIC${nic_count}_STATE=\"$state\""$'\n'
@@ -1089,7 +1101,7 @@ set -u
 # silently when absent (older images that predate the vendoring).
 APPCORE_LIBS=/usr/local/lib/appliance-core
 if [[ -d "$APPCORE_LIBS" ]]; then
-    for _lib in apt-helpers detect-net identity tui hostname netconfig timezone; do
+    for _lib in apt-helpers kvstate detect-net identity tui hostname netconfig timezone; do
         [[ -f "$APPCORE_LIBS/${_lib}.sh" ]] && source "$APPCORE_LIBS/${_lib}.sh"
     done
     unset _lib
@@ -1111,13 +1123,32 @@ WT_MENU=12
 
 DETECT_FILE=/var/lib/smbproxy-init-detected.env
 
+# Keys the first-boot detection cache may contain. It is parsed as data,
+# never sourced (code-review session plan 05).
+DETECT_KEYS=(APPCORE_DET_IP APPCORE_DET_GATEWAY APPCORE_DET_DHCP_DNS
+    APPCORE_DET_DHCP_DOMAIN APPCORE_DET_PTR_FQDN APPCORE_DET_PTR_NAME
+    APPCORE_DET_PTR_DOMAIN APPCORE_DET_EFFECTIVE_DOMAIN DET_NIC_COUNT)
+for _i in $(seq 0 15); do
+    for _f in NAME MAC STATE IP4 DHCP; do DETECT_KEYS+=("NIC${_i}_${_f}"); done
+done
+unset _i _f
+ROLES_KEYS=(DOMAIN_NIC_NAME DOMAIN_NIC_MAC LEGACY_NIC_NAME LEGACY_NIC_MAC)
+
+kv_load() {
+    if ! declare -F appcore_kv_load >/dev/null; then
+        echo "state parser (appliance-core kvstate.sh) is missing" >&2
+        return 3
+    fi
+    appcore_kv_load "$@"
+}
+
 load_detect_env() {
     DET_DEFAULT_IFACE="" DET_DEFAULT_IP="" DET_DEFAULT_GATEWAY=""
     DET_DHCP_DNS="" DET_DHCP_DOMAIN="" DET_NIC_COUNT="0"
     if [[ -f "$DETECT_FILE" ]]; then
-        # shellcheck disable=SC1090
-        source "$DETECT_FILE"
+        kv_load "$DETECT_FILE" "${DETECT_KEYS[@]}" || DET_NIC_COUNT=0
     fi
+    [[ "$DET_NIC_COUNT" =~ ^[0-9]{1,2}$ ]] && (( DET_NIC_COUNT <= 16 )) || DET_NIC_COUNT=0
     load_roles
     if command -v appcore_detect_net_init >/dev/null 2>&1; then
         appcore_detect_net_init "$DETECT_FILE" "${DOMAIN_NIC_NAME:-}" \
@@ -1134,8 +1165,7 @@ load_roles() {
     DOMAIN_NIC_NAME="" DOMAIN_NIC_MAC=""
     LEGACY_NIC_NAME="" LEGACY_NIC_MAC=""
     if [[ -f "$ROLES_FILE" ]]; then
-        # shellcheck disable=SC1090
-        source "$ROLES_FILE"
+        kv_load "$ROLES_FILE" "${ROLES_KEYS[@]}" || true
     fi
 }
 
@@ -1238,7 +1268,7 @@ show_status() {
 get_nic_field() {
     # $1 = index, $2 = field (NAME|MAC|STATE|IP4|DHCP)
     local var="NIC${1}_${2}"
-    eval echo "\${$var:-}"
+    printf '%s\n' "${!var:-}"
 }
 
 build_nic_menu_args() {
@@ -1319,16 +1349,20 @@ assign_nic_roles() {
         [[ "$n" == "$pick_leg" ]] && leg_mac="$m"
     done
 
+    # Written as data by the state library, then installed root-owned.
+    local roles_tmp
+    roles_tmp=$(mktemp -d)
+    if ! declare -F appcore_kv_write >/dev/null \
+        || ! appcore_kv_write "$roles_tmp/nic-roles.env" 0644 \
+            DOMAIN_NIC_NAME "$pick_dom" DOMAIN_NIC_MAC "$dom_mac" \
+            LEGACY_NIC_NAME "$pick_leg" LEGACY_NIC_MAC "$leg_mac"; then
+        rm -rf "$roles_tmp"
+        whiptail --title "NIC roles" --msgbox "Could not save NIC roles (state library missing or unexpected values)." 8 "$WT_WIDTH"
+        return 1
+    fi
     sudo install -d -o root -g root -m 0755 /etc/smbproxy
-    sudo bash -c "cat > $ROLES_FILE" <<RFEOF
-# NIC role mapping. Written by smbproxy-init at first boot. Consumed by
-# smbproxy-sconfig for network and firewall configuration.
-DOMAIN_NIC_NAME="$pick_dom"
-DOMAIN_NIC_MAC="$dom_mac"
-LEGACY_NIC_NAME="$pick_leg"
-LEGACY_NIC_MAC="$leg_mac"
-RFEOF
-    sudo chmod 0644 "$ROLES_FILE"
+    sudo install -o root -g root -m 0644 "$roles_tmp/nic-roles.env" "$ROLES_FILE"
+    rm -rf "$roles_tmp"
     whiptail --title "NIC roles saved" --msgbox \
         "Roles written to $ROLES_FILE:\n\n  domain: $pick_dom (mac=$dom_mac)\n  legacy: $pick_leg (mac=$leg_mac)\n\nThe network configuration step uses these. smbproxy-sconfig will read them after you finish initial setup." \
         14 "$WT_WIDTH"
@@ -1858,8 +1892,17 @@ cat > /etc/update-motd.d/15-smbproxy-net-status <<'MOTDEOF'
 #!/bin/sh
 DET=/var/lib/smbproxy-init-detected.env
 ROLES=/etc/smbproxy/nic-roles.env
-[ -r "$DET" ]   && . "$DET"   2>/dev/null
-[ -r "$ROLES" ] && . "$ROLES" 2>/dev/null
+# State files are read as data, never sourced (code-review session plan 05).
+kv() {
+    [ -r "$2" ] || return 0
+    awk -v k="$1" 'index($0, k "=") == 1 { sub(/^[^=]*=/, ""); gsub(/^"|"$/, ""); print; exit }' "$2" \
+        | tr -cd 'A-Za-z0-9._:-'
+}
+DOMAIN_NIC_NAME=$(kv DOMAIN_NIC_NAME "$ROLES")
+DOMAIN_NIC_MAC=$(kv DOMAIN_NIC_MAC "$ROLES")
+LEGACY_NIC_NAME=$(kv LEGACY_NIC_NAME "$ROLES")
+LEGACY_NIC_MAC=$(kv LEGACY_NIC_MAC "$ROLES")
+APPCORE_DET_EFFECTIVE_DOMAIN=$(kv APPCORE_DET_EFFECTIVE_DOMAIN "$DET")
 printf '\n  SMB1↔SMB3 Protocol Gateway\n'
 printf '  --------------------------\n'
 printf '  Hostname:    %s\n' "$(hostnamectl hostname 2>/dev/null || hostname)"
@@ -1877,7 +1920,7 @@ printf '  Network:\n'
 ip -br addr show 2>/dev/null | awk 'NF>0 && $1!="lo" {printf "    %s\n", $0}'
 gw=$(ip route show default 2>/dev/null | awk '/default/ {print $3" via "$5; exit}')
 [ -n "$gw" ] && printf '  Default route: %s\n' "$gw" || printf '  Default route: (none)\n'
-dns_iface="${DOMAIN_NIC_NAME:-${APPCORE_DET_IFACE:-}}"
+dns_iface="${DOMAIN_NIC_NAME:-}"
 if [ -n "$dns_iface" ]; then
     dns=$(resolvectl dns "$dns_iface" 2>/dev/null \
         | awk '/^Link [0-9]/ {for(i=4;i<=NF;i++) printf "%s ", $i}')

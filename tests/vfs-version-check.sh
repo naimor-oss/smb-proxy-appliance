@@ -6,6 +6,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CHECK="$ROOT/smbproxy-vfs-version-check"
 TEST_ROOT=$(mktemp -d /tmp/smbproxy-vfs-version-test.XXXXXX)
+# Sibling appliance-core supplies the state parser (code-review session plan 05).
+SMBPROXY_APPCORE_KVSTATE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/appliance-core/lib/kvstate.sh"
+export SMBPROXY_APPCORE_KVSTATE
 trap 'rm -rf "$TEST_ROOT"' EXIT
 
 mkdir -p "$TEST_ROOT/shares" "$TEST_ROOT/bin" "$TEST_ROOT/modules/vfs"
@@ -53,6 +56,23 @@ printf '%s\n' '1:4.22.0+dfsg-1' > "$TEST_ROOT/expected"
 rm -f "$TEST_ROOT/modules/vfs/fileid.so"
 if SMBPROXY_TEST_PACKAGE_VERSION='1:4.22.0+dfsg-1' "$CHECK" 2>/dev/null; then
     echo "FAIL missing fileid module did not fail closed" >&2
+    exit 1
+fi
+
+# Code-review session plan 05: state is data. A record that claims to be
+# modern but is malformed counts as legacy (the guard applies), and nothing
+# in it runs.
+rm -f "$TEST_ROOT/shares/Legacy.env"
+printf '%s\n' 'SHARE_NAME="Evil"' 'PROFILE="modern"$(touch '"$TEST_ROOT"'/pwned)' \
+    > "$TEST_ROOT/shares/Evil.env"
+if SMBPROXY_TEST_PACKAGE_VERSION='different' "$CHECK" 2>/dev/null; then
+    echo "FAIL malformed share state did not fail closed" >&2
+    exit 1
+fi
+[[ ! -e "$TEST_ROOT/pwned" ]] || { echo "FAIL share state was executed" >&2; exit 1; }
+if SMBPROXY_TEST_PACKAGE_VERSION='different' SMBPROXY_APPCORE_KVSTATE=/nonexistent \
+    "$CHECK" 2>/dev/null; then
+    echo "FAIL missing state parser did not fail closed" >&2
     exit 1
 fi
 

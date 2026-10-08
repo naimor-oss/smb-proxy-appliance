@@ -1,6 +1,7 @@
 #!/usr/bin/env bats
 
 setup() {
+    export SMBPROXY_APPCORE_KVSTATE="${BATS_TEST_DIRNAME}/../../appliance-core/lib/kvstate.sh"
     export SMBPROXY_ROLES_FILE="${BATS_TMPDIR}/nic-roles.env"
     export SMBPROXY_DETECT_FILE="${BATS_TMPDIR}/detected.env"
     cat > "$SMBPROXY_ROLES_FILE" <<'EOF'

@@ -4,8 +4,8 @@
 # /var/lib/smbproxy paths, with fake systemctl/testparm/wbinfo/smbd so
 # failures can be injected. Run as root in a DISPOSABLE container:
 #
-#   docker run --rm -v "$PWD":/src:ro -e DISPOSABLE_ROOT_TEST=1 \
-#       debian:trixie bash /src/tests/root/config-transaction.sh
+#   docker run --rm -v "$PWD/..":/ws:ro -e DISPOSABLE_ROOT_TEST=1 \
+#       debian:trixie bash /ws/smb-proxy-appliance/tests/root/config-transaction.sh
 
 set -euo pipefail
 [[ ${EUID} -eq 0 && "${DISPOSABLE_ROOT_TEST:-0}" == 1 ]] || {
@@ -14,6 +14,11 @@ set -euo pipefail
 }
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# The state parser comes from the sibling appliance-core checkout and is
+# installed where the image vendors it (code-review session plan 05).
+KVSTATE_SRC="$SRC/../appliance-core/lib/kvstate.sh"
+[[ -r "$KVSTATE_SRC" ]] || { echo "needs ../appliance-core next to this repo" >&2; exit 2; }
+install -D -m 0644 "$KVSTATE_SRC" /usr/local/lib/appliance-core/kvstate.sh
 T=$(mktemp -d)
 fail() { echo "FAIL: $*" >&2; exit 1; }
 pass() { echo "ok   $*"; }
@@ -138,5 +143,23 @@ share_vars Ledger legacy 192.0.2.41 ledger-secret
 configure_share || fail "re-run after recovery failed (rc=$?)"
 ! /usr/local/sbin/smbproxy-session-mount withdrawn Ledger || fail "re-run did not re-admit the share"
 pass "re-running the change after recovery commits and re-admits the share"
+
+# ---- 6. hostile field values are refused before anything is written -------
+before=$(fingerprint Files)
+for field in BACKEND_USER BACKEND_DOMAIN FRONT_GROUP BACKEND_MOUNT FRONT_FORCE_USER BACKEND_IP; do
+    share_vars Files modern 192.0.2.20 first-secret
+    printf -v "$field" '%s' 'x"$(touch /tmp/pwned)"'
+    rc=0; configure_share || rc=$?
+    [[ $rc -eq 2 ]] || fail "hostile $field accepted (rc=$rc)"
+    [[ ! -e /tmp/pwned ]] || fail "hostile $field was executed"
+    [[ "$(fingerprint Files)" == "$before" ]] || fail "hostile $field changed files"
+    [[ -z "${BACKEND_PASS+set}" ]] || fail "password still set after refusal"
+done
+share_vars Files modern 192.0.2.20 $'two\nlines'
+rc=0; configure_share || rc=$?
+[[ $rc -eq 2 ]] || fail "multi-line password accepted (rc=$rc)"
+grep -q '^FRONT_GROUP="LAB\\Accounting"$' /var/lib/smbproxy/shares/Files.env \
+    || fail "DOMAIN\\Group value not stored literally"
+pass "hostile field values are refused before any write; DOMAIN\\Group is kept"
 
 echo "config transaction tests passed"

@@ -1,6 +1,7 @@
 #!/usr/bin/env bats
 
 setup() {
+    export SMBPROXY_APPCORE_KVSTATE="${BATS_TEST_DIRNAME}/../../appliance-core/lib/kvstate.sh"
     REPO_DIR="${BATS_TEST_DIRNAME}/.."
     PREPARE="${REPO_DIR}/prepare-image.sh"
     BUILD="${REPO_DIR}/lab/build-fresh-base.sh"

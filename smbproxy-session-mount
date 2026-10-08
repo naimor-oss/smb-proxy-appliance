@@ -28,6 +28,7 @@ SHARE_LOCK_DIR=/run/lock/smbproxy-share
 # A connect stuck on an unreachable hard mount must not block a removal
 # forever; the marker is already in place, so giving up is still safe.
 BARRIER_TIMEOUT=60
+APPCORE_KVSTATE=/usr/local/lib/appliance-core/kvstate.sh
 # Path and binary overrides exist for tests only. smbd invokes this helper
 # as root; honoring them outside test mode would let an inherited
 # environment redirect a root mount to other credentials or binaries.
@@ -43,6 +44,15 @@ if [[ "$ALLOW_NON_ROOT_TEST" == "1" ]]; then
     LIFECYCLE_DIR="${SMBPROXY_LIFECYCLE_DIR:-$LIFECYCLE_DIR}"
     SHARE_LOCK_DIR="${SMBPROXY_SHARE_LOCK_DIR:-$SHARE_LOCK_DIR}"
     BARRIER_TIMEOUT="${SMBPROXY_BARRIER_TIMEOUT:-$BARRIER_TIMEOUT}"
+    APPCORE_KVSTATE="${SMBPROXY_APPCORE_KVSTATE:-$APPCORE_KVSTATE}"
+fi
+# Share state is parsed as data, never sourced (code-review session plan 05).
+# Without the parser every connect fails closed.
+if [[ -r "$APPCORE_KVSTATE" ]]; then
+    # shellcheck disable=SC1090
+    source "$APPCORE_KVSTATE"
+else
+    appcore_kv_load() { return 3; }
 fi
 
 die() { echo "smbproxy-session-mount: $*" >&2; exit 2; }
@@ -63,8 +73,8 @@ load_share() {
     [[ -r "$state" ]] || die "share state not found: $state"
 
     SHARE_NAME="" PROFILE="" BACKEND_IP="" FRONT_FORCE_USER=""
-    # shellcheck disable=SC1090
-    source "$state"
+    appcore_kv_load "$state" SHARE_NAME PROFILE OFFLINE_MODE BACKEND_IP BACKEND_USER BACKEND_DOMAIN BACKEND_MOUNT BACKEND_VERS BACKEND_SEAL FRONT_GROUP FRONT_FORCE_USER LOCKING_OVERRIDE \
+        || die "share state is malformed or the state parser is missing: $state"
     [[ "$SHARE_NAME" == "$requested" ]] || die "share state/name mismatch"
     [[ "${PROFILE:-legacy}" == "legacy" ]] || die "share '$requested' is not legacy profile"
     [[ -n "$BACKEND_IP" && -n "$FRONT_FORCE_USER" ]] || die "share state is incomplete"

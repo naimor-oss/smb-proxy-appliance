@@ -7,6 +7,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HELPER="${SCRIPT_DIR}/../smbproxy-session-mount"
 TEST_ROOT=$(mktemp -d /tmp/smbproxy-session-test.XXXXXX)
+# Sibling appliance-core supplies the state parser (code-review session plan 05).
+SMBPROXY_APPCORE_KVSTATE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/appliance-core/lib/kvstate.sh"
+export SMBPROXY_APPCORE_KVSTATE
 trap 'rm -rf "$TEST_ROOT"' EXIT
 
 mkdir -p "$TEST_ROOT/shares" "$TEST_ROOT/creds" "$TEST_ROOT/bin"
@@ -144,6 +147,20 @@ wait "$holder"
 
 if "$HELPER" withdraw 'Engineering$' 'two words' 2>/dev/null; then
     lifecycle_fail "free-text reason accepted"
+fi
+
+# ---- State is data, never code (session plan 05) ----------------------------
+printf '%s\n' 'SHARE_NAME="Evil"' "BACKEND_IP=\"192.0.2.10\"\$(touch $TEST_ROOT/pwned)" \
+    'PROFILE="legacy"' 'FRONT_FORCE_USER="root"' > "$TEST_ROOT/shares/Evil.env"
+cp "$TEST_ROOT/creds/.creds-Engineering_" "$TEST_ROOT/creds/.creds-Evil"
+if "$HELPER" connect Evil 601 602 603 2>"$TEST_ROOT/err"; then
+    echo "FAIL connect accepted malformed share state" >&2; exit 1
+fi
+[[ ! -e "$TEST_ROOT/pwned" ]] || { echo "FAIL share state was executed" >&2; exit 1; }
+grep -q malformed "$TEST_ROOT/err" || { echo "FAIL refusal does not say why" >&2; exit 1; }
+! grep -q '601-602-603' "$TEST_ROOT/proc-mounts" || { echo "FAIL malformed share mounted" >&2; exit 1; }
+if SMBPROXY_APPCORE_KVSTATE=/nonexistent "$HELPER" connect 'Engineering$' 701 702 703 2>/dev/null; then
+    echo "FAIL connect succeeded without the state parser" >&2; exit 1
 fi
 
 # Outside test mode the helper must not read any path or binary override:

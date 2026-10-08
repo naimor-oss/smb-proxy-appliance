@@ -30,6 +30,18 @@ FAIL_THRESHOLD="${SMBPROXY_FAIL_THRESHOLD:-2}"
 PROBE_SECONDS="${SMBPROXY_PROBE_SECONDS:-1}"
 MOUNT_SECONDS="${SMBPROXY_MOUNT_SECONDS:-8}"
 SKIP_RELOAD="${SMBPROXY_SKIP_RELOAD:-0}"
+KVSTATE="${SMBPROXY_APPCORE_KVSTATE:-/usr/local/lib/appliance-core/kvstate.sh}"
+SHARE_STATE_KEYS=(SHARE_NAME PROFILE OFFLINE_MODE BACKEND_IP BACKEND_USER BACKEND_DOMAIN BACKEND_MOUNT BACKEND_VERS BACKEND_SEAL FRONT_GROUP FRONT_FORCE_USER LOCKING_OVERRIDE)
+HEALTH_KEYS=(MODE BACKEND_REACHABLE CONSECUTIVE_FAILURES PENDING_UPLOADS
+    PENDING_DELETES LAST_CHECK_EPOCH LAST_SUCCESS_EPOCH LAST_ERROR)
+# State is parsed as data, never sourced (code-review session plan 05).
+if [[ -r "$KVSTATE" ]]; then
+    # shellcheck disable=SC1090
+    source "$KVSTATE"
+else
+    echo "smbproxy-share-worker: state parser $KVSTATE is missing" >&2
+    exit 1
+fi
 
 MANAGED_MARKER="    # smbproxy-health: backend unavailable"
 MANAGED_AVAILABLE="    available = no"
@@ -162,8 +174,10 @@ load_health() {
     HEALTH_FAILURES=0
     HEALTH_LAST_SUCCESS=0
     if [[ -r "$file" ]]; then
-        # shellcheck disable=SC1090
-        source "$file"
+        local CONSECUTIVE_FAILURES="" LAST_SUCCESS_EPOCH=""
+        local MODE BACKEND_REACHABLE PENDING_UPLOADS PENDING_DELETES LAST_CHECK_EPOCH LAST_ERROR
+        # An unreadable record restarts the counters; it is rewritten below.
+        appcore_kv_load "$file" "${HEALTH_KEYS[@]}" 2>/dev/null || true
         HEALTH_FAILURES="${CONSECUTIVE_FAILURES:-0}"
         HEALTH_LAST_SUCCESS="${LAST_SUCCESS_EPOCH:-0}"
     fi
@@ -175,20 +189,15 @@ write_health() {
     local safe="$1" mode="$2" reachable="$3" failures="$4"
     local uploads="$5" deletes="$6" last_success="$7" error="${8:-}"
     local file="${HEALTH_DIR}/${safe}.env"
-    local tmp="${file}.new.$$"
     install -d -m 0755 "$HEALTH_DIR"
-    {
-        printf 'MODE=%q\n' "$mode"
-        printf 'BACKEND_REACHABLE=%q\n' "$reachable"
-        printf 'CONSECUTIVE_FAILURES=%q\n' "$failures"
-        printf 'PENDING_UPLOADS=%q\n' "$uploads"
-        printf 'PENDING_DELETES=%q\n' "$deletes"
-        printf 'LAST_CHECK_EPOCH=%q\n' "$(date +%s)"
-        printf 'LAST_SUCCESS_EPOCH=%q\n' "$last_success"
-        printf 'LAST_ERROR=%q\n' "$error"
-    } > "$tmp"
-    chmod 0644 "$tmp"
-    mv "$tmp" "$file"
+    # Error text can quote backend output: keep it printable and inert.
+    error=$(printf '%s' "$error" | tr -c '[:print:]' ' ' | tr '"`\\$' "''/S")
+    error="${error:0:500}"
+    appcore_kv_write "$file" 0644 \
+        MODE "$mode" BACKEND_REACHABLE "$reachable" \
+        CONSECUTIVE_FAILURES "$failures" PENDING_UPLOADS "$uploads" \
+        PENDING_DELETES "$deletes" LAST_CHECK_EPOCH "$(date +%s)" \
+        LAST_SUCCESS_EPOCH "$last_success" LAST_ERROR "$error"
 }
 
 write_manifest_entry() {
@@ -471,8 +480,12 @@ worker_run() {
     for share_file in "$SHARES_DIR"/*.env; do
         SHARE_NAME="" PROFILE="" OFFLINE_MODE="" BACKEND_IP=""
         BACKEND_MOUNT="" FRONT_FORCE_USER=""
-        # shellcheck disable=SC1090
-        source "$share_file"
+        if ! appcore_kv_load "$share_file" "${SHARE_STATE_KEYS[@]}"; then
+            # Session plan 07 decides what a malformed record does to its
+            # frontend; it is never executed and never trusted here.
+            log "skipping malformed share state ${share_file}"
+            continue
+        fi
         [[ -n "$SHARE_NAME" ]] || continue
         safe=$(share_safe_name "$SHARE_NAME")
         mode="${OFFLINE_MODE:-direct}"

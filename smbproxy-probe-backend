@@ -44,8 +44,12 @@ safe_name="${share_name//[^A-Za-z0-9_]/_}"
 env_file="${SHARES_DIR}/${safe_name}.env"
 [[ -r "$env_file" ]] || exit 1
 
-# shellcheck source=/dev/null
-. "$env_file"
+# Parsed as data, never sourced (code-review session plan 05).
+KVSTATE="${SMBPROXY_APPCORE_KVSTATE:-/usr/local/lib/appliance-core/kvstate.sh}"
+[[ -r "$KVSTATE" ]] || exit 1
+# shellcheck disable=SC1090
+source "$KVSTATE"
+BACKEND_IP=$(appcore_kv_get "$env_file" BACKEND_IP SHARE_NAME PROFILE OFFLINE_MODE BACKEND_IP BACKEND_USER BACKEND_DOMAIN BACKEND_MOUNT BACKEND_VERS BACKEND_SEAL FRONT_GROUP FRONT_FORCE_USER LOCKING_OVERRIDE 2>/dev/null) || exit 1
 [[ -n "${BACKEND_IP:-}" ]] || exit 1
 
 # Bash builtin /dev/tcp; no external dependency. timeout(1) bounds it
