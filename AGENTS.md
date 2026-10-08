@@ -306,6 +306,13 @@ bash tests/samba-hold.sh
   automation.
 - Use the headless `smbproxy-sconfig` CLI for automation instead of
   driving the whiptail UI.
+- Never put a password in a command's arguments (`--password=`,
+  `--adminpass=`, `--newpassword=`, `-U user%pass`): `/proc/<pid>/cmdline`
+  is readable by every local user. The join feeds `kinit` through a
+  pipe; `smbclient`/`net` use `run_with_auth_file` (`-A` file in a 0700
+  directory under `/run`, mode 0600, removed when the command returns;
+  secrets with leading/trailing spaces are refused because Samba trims
+  them). `tests/secret-free-auth.sh` enforces this.
 - Add tests or scenario assertions when changing behavior.
 
 ## Important Interop Notes
