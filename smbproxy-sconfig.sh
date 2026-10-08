@@ -40,6 +40,11 @@ readonly CREDS_PREFIX=".creds-"
 readonly SMB_CONF="/etc/samba/smb.conf"
 readonly SMB_CONF_LOCK="/run/lock/smbproxy-smb-conf.lock"
 readonly WORKER_LOCK="/run/lock/smbproxy-share-worker.lock"
+# First line of every frontend section this tool writes. The health worker
+# withdraws an owned section whose state record is missing or invalid and
+# never touches sections without it (code-review session plan 07). Keep the
+# text identical to OWNER_MARKER in smbproxy-share-worker.
+readonly SMB_OWNER_MARKER="    # smbproxy-managed: frontend section owned by smbproxy-sconfig"
 readonly KRB5_CONF="/etc/krb5.conf"
 readonly NFT_TEMPLATE="/etc/nftables-smbproxy.conf"
 readonly NFT_LIVE="/etc/nftables.conf"
@@ -2297,6 +2302,7 @@ configure_share_apply() {
         cat >> "$smb_conf_pending" <<EOF
 
 [${SHARE_NAME}]
+${SMB_OWNER_MARKER}
     # profile=${PROFILE}; locking=${locking_kind}; offline=${OFFLINE_MODE}
     path = ${frontend_path}
     read only = no

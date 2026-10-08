@@ -88,6 +88,8 @@ snapshots() { find /run -maxdepth 1 -name 'smbproxy-cfg.*' | wc -l; }
 share_vars Files modern 192.0.2.20 first-secret
 configure_share || fail "initial modern configure failed (rc=$?)"
 grep -q '^\[Files\]' /etc/samba/smb.conf || fail "section not published"
+awk '/^\[Files\]/ { getline; print; exit }' /etc/samba/smb.conf | grep -qxF "$SMB_OWNER_MARKER" \
+    || fail "section does not start with the ownership marker"
 grep -q ' /mnt/backend/Files cifs ' /etc/fstab || fail "fstab line not written"
 grep -q '^password=first-secret$' /etc/samba/.creds-Files || fail "creds not written"
 [[ -z "${BACKEND_PASS+set}" ]] || fail "password still set after success"
