@@ -5,15 +5,28 @@
 
 set -euo pipefail
 
-STATE_DIR="${SMBPROXY_STATE_DIR:-/var/lib/smbproxy/shares}"
-CREDS_DIR="${SMBPROXY_CREDS_DIR:-/etc/samba}"
-SESSION_ROOT="${SMBPROXY_SESSION_ROOT:-/run/smbproxy/sessions}"
-SESSION_STATE="${SMBPROXY_SESSION_STATE:-/run/smbproxy/session-state}"
-PROC_MOUNTS="${SMBPROXY_PROC_MOUNTS:-/proc/mounts}"
-MOUNT_BIN="${SMBPROXY_MOUNT_BIN:-mount}"
-UMOUNT_BIN="${SMBPROXY_UMOUNT_BIN:-umount}"
-AUDIT_LOG="${SMBPROXY_SESSION_LOG:-/var/log/smbproxy-session-mount.log}"
 ALLOW_NON_ROOT_TEST="${SMBPROXY_ALLOW_NON_ROOT_TEST:-0}"
+STATE_DIR=/var/lib/smbproxy/shares
+CREDS_DIR=/etc/samba
+SESSION_ROOT=/run/smbproxy/sessions
+SESSION_STATE=/run/smbproxy/session-state
+PROC_MOUNTS=/proc/mounts
+MOUNT_BIN=mount
+UMOUNT_BIN=umount
+AUDIT_LOG=/var/log/smbproxy-session-mount.log
+# Path and binary overrides exist for tests only. smbd invokes this helper
+# as root; honoring them outside test mode would let an inherited
+# environment redirect a root mount to other credentials or binaries.
+if [[ "$ALLOW_NON_ROOT_TEST" == "1" ]]; then
+    STATE_DIR="${SMBPROXY_STATE_DIR:-$STATE_DIR}"
+    CREDS_DIR="${SMBPROXY_CREDS_DIR:-$CREDS_DIR}"
+    SESSION_ROOT="${SMBPROXY_SESSION_ROOT:-$SESSION_ROOT}"
+    SESSION_STATE="${SMBPROXY_SESSION_STATE:-$SESSION_STATE}"
+    PROC_MOUNTS="${SMBPROXY_PROC_MOUNTS:-$PROC_MOUNTS}"
+    MOUNT_BIN="${SMBPROXY_MOUNT_BIN:-$MOUNT_BIN}"
+    UMOUNT_BIN="${SMBPROXY_UMOUNT_BIN:-$UMOUNT_BIN}"
+    AUDIT_LOG="${SMBPROXY_SESSION_LOG:-$AUDIT_LOG}"
+fi
 
 die() { echo "smbproxy-session-mount: $*" >&2; exit 2; }
 safe_name() { printf '%s' "${1//[^A-Za-z0-9_]/_}"; }
