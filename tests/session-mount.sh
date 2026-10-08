@@ -50,6 +50,8 @@ export SMBPROXY_UMOUNT_BIN="$TEST_ROOT/bin/umount"
 export SMBPROXY_SESSION_LOG="$TEST_ROOT/session.log"
 export SMBPROXY_TEST_MOUNT_ARGS="$TEST_ROOT/mount-args"
 export SMBPROXY_ALLOW_NON_ROOT_TEST=1
+export SMBPROXY_LIFECYCLE_DIR="$TEST_ROOT/lifecycle"
+export SMBPROXY_SHARE_LOCK_DIR="$TEST_ROOT/locks"
 
 "$HELPER" connect 'Engineering$' 101 202 303
 
@@ -84,6 +86,65 @@ shopt -s nullglob
 records=("$TEST_ROOT/session-state"/*.env)
 shopt -u nullglob
 [[ ${#records[@]} -eq 0 ]] || { echo "FAIL cleanup-all left session state" >&2; exit 1; }
+
+# ---- Lifecycle: withdrawal blocks new upstream sessions (session plan 02) ----
+lifecycle_fail() { echo "FAIL lifecycle: $*" >&2; exit 1; }
+"$HELPER" cleanup-all
+"$HELPER" withdraw 'Engineering$' remove
+"$HELPER" withdrawn 'Engineering$' || lifecycle_fail "withdrawn did not report the marker"
+grep -q '^reason=remove$' "$TEST_ROOT/lifecycle/Engineering_.withdrawn" || lifecycle_fail "marker lacks reason"
+if "$HELPER" connect 'Engineering$' 401 402 403 2>"$TEST_ROOT/err"; then
+    lifecycle_fail "connect succeeded on a withdrawn share"
+fi
+grep -q 'withdrawn' "$TEST_ROOT/err" || lifecycle_fail "refusal does not say why"
+! grep -q ' /.*401-402-403 ' "$TEST_ROOT/proc-mounts" || lifecycle_fail "withdrawn connect mounted anyway"
+"$HELPER" unwithdraw 'Engineering$'
+! "$HELPER" withdrawn 'Engineering$' || lifecycle_fail "marker survived unwithdraw"
+"$HELPER" connect 'Engineering$' 401 402 403 || lifecycle_fail "connect refused after unwithdraw"
+"$HELPER" disconnect 'Engineering$' 401 402 403
+
+# Barrier: a connect already past the marker check (slow mount) must finish
+# before withdraw returns; a connect after withdraw must be refused.
+cp "$TEST_ROOT/bin/mount" "$TEST_ROOT/bin/mount.fast"
+cat > "$TEST_ROOT/bin/mount" <<'SLOW'
+#!/usr/bin/env bash
+set -euo pipefail
+sleep 2
+printf '%s\n' "$*" >> "$SMBPROXY_TEST_MOUNT_ARGS"
+printf '%s %s cifs %s 0 0\n' "$3" "$4" "$6" >> "$SMBPROXY_PROC_MOUNTS"
+SLOW
+chmod +x "$TEST_ROOT/bin/mount"
+"$HELPER" connect 'Engineering$' 501 502 503 &
+inflight=$!
+sleep 0.5
+start=$SECONDS
+"$HELPER" withdraw 'Engineering$' reconfigure
+[[ -f "$TEST_ROOT/session-state/501-502-503.env" ]] \
+    || lifecycle_fail "withdraw returned before the in-flight connect finished"
+(( SECONDS - start >= 1 )) || lifecycle_fail "withdraw did not wait on the barrier"
+wait "$inflight" || lifecycle_fail "in-flight connect failed"
+if "$HELPER" connect 'Engineering$' 601 602 603 2>/dev/null; then
+    lifecycle_fail "connect after withdraw succeeded"
+fi
+mv "$TEST_ROOT/bin/mount.fast" "$TEST_ROOT/bin/mount"
+"$HELPER" cleanup-share 'Engineering$'
+
+# Barrier timeout: a connect that never finishes cannot hold up removal
+# forever, and the share stays withdrawn when withdraw gives up.
+"$HELPER" unwithdraw 'Engineering$'
+( exec 8>"$TEST_ROOT/locks/Engineering_.lock"; flock -s 8; sleep 4 ) &
+holder=$!
+sleep 0.5
+if SMBPROXY_BARRIER_TIMEOUT=1 "$HELPER" withdraw 'Engineering$' remove 2>/dev/null; then
+    lifecycle_fail "withdraw ignored a stuck connect"
+fi
+"$HELPER" withdrawn 'Engineering$' || lifecycle_fail "share not left withdrawn after barrier timeout"
+wait "$holder"
+"$HELPER" unwithdraw 'Engineering$'
+
+if "$HELPER" withdraw 'Engineering$' 'two words' 2>/dev/null; then
+    lifecycle_fail "free-text reason accepted"
+fi
 
 # Outside test mode the helper must not read any path or binary override:
 # smbd runs it as root, so an inherited environment must not redirect it.

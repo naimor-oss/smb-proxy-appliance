@@ -740,18 +740,54 @@ EOF
     chmod 0644 "$f"
 }
 
+# Close every frontend tree on a withdrawn legacy share and release its
+# upstream SMB1 sessions. The share must already be withdrawn (no new
+# connect can start). Fails, rather than force-unmounting, if a session is
+# still in use when the wait expires: a hard SMB1 mount with open files is
+# never torn down underneath a client.
+share_drain() {
+    local name="$1" wait_s="${SMBPROXY_DRAIN_SECONDS:-30}" i
+    smbcontrol smbd close-share "$name" 2>/dev/null || true
+    for ((i = 0; i < wait_s; i++)); do
+        [[ "$(legacy_session_count "$name")" == "0" ]] && break
+        sleep 1
+    done
+    if ! "$SESSION_HELPER" cleanup-share "$name"; then
+        echo "share '$name': upstream sessions are still in use after ${wait_s}s" >&2
+        return 1
+    fi
+}
+
+# Reload smbd so the live service matches smb.conf. Inactive smbd (pre-join)
+# is fine; a running smbd that can neither reload nor restart is not.
+reload_smbd_checked() {
+    systemctl is-active --quiet smbd 2>/dev/null || return 0
+    systemctl reload smbd 2>/dev/null && return 0
+    systemctl restart smbd 2>/dev/null && return 0
+    echo "smbd could not be reloaded or restarted" >&2
+    return 1
+}
+
 # remove_share tears down everything for one share: state file, creds
-# file, fstab line, smb.conf section. Caller must confirm. Returns 0
-# even if some pieces were already absent — idempotent.
+# file, fstab line, smb.conf section, queued delivery history.
+#
+# Lifecycle (code-review session plan 02), legacy profile:
+#   withdraw (durable marker + connect barrier) -> close trees and drain ->
+#   release upstream sessions -> strip smb.conf section and reload ->
+#   delete state and credentials -> unwithdraw.
+# The marker means no new SMB1 session can start at any point after the
+# first step, even though the section is still published while draining.
+# Every step that decides correctness is checked. On failure the share
+# stays withdrawn with its state and credentials intact, so the operator
+# can fix the cause and re-run the removal; success is returned only when
+# nothing of the share remains live. Idempotent for already-absent pieces.
 remove_share() {
     local name="$1"
     [[ -n "$name" ]] || return 2
 
-    # Best-effort unmount before stripping the fstab line — otherwise
-    # an active mount lingers without a way to be referenced.
-    local mount_path queued_state="" share_profile=""
-    if load_share "$name" 2>/dev/null && [[ -n "$BACKEND_MOUNT" ]]; then
-        mount_path="$BACKEND_MOUNT"
+    local mount_path="" queued_state="" share_profile=""
+    if load_share "$name" 2>/dev/null; then
+        mount_path="${BACKEND_MOUNT:-}"
         share_profile="${PROFILE:-$PROFILE_LEGACY}"
         if [[ "${OFFLINE_MODE:-$OFFLINE_DIRECT}" == "$OFFLINE_QUEUED" ]]; then
             if ! data_mount_ready; then
@@ -767,18 +803,22 @@ remove_share() {
             echo "cannot remove legacy share '$name': session helper is missing" >&2
             return 4
         fi
-        # Close active trees first so every open/FID and backend lock is
-        # released before the corresponding SMB1 session is unmounted.
-        smbcontrol smbd close-share "$name" 2>/dev/null || true
-        local _wait
-        for _wait in 1 2 3 4 5; do
-            [[ "$(legacy_session_count "$name")" == "0" ]] && break
-            sleep 1
-        done
-        if ! "$SESSION_HELPER" cleanup-share "$name"; then
-            echo "cannot remove legacy share '$name': upstream sessions are still active" >&2
+        if ! "$SESSION_HELPER" withdraw "$name" remove; then
+            echo "cannot remove legacy share '$name': withdrawal did not complete; it stays withdrawn" >&2
             return 4
         fi
+        if ! share_drain "$name"; then
+            echo "share '$name' is withdrawn (no new connections) but not removed." >&2
+            echo "Disconnect its clients, then run: smbproxy-sconfig --remove-share '$name'" >&2
+            return 4
+        fi
+    elif [[ -n "$share_profile" ]]; then
+        smbcontrol smbd close-share "$name" 2>/dev/null || true
+    fi
+    if [[ -z "$share_profile" && -x "$SESSION_HELPER" ]]; then
+        # State already gone (an earlier removal was interrupted after
+        # deleting it): clear a leftover withdrawal marker too.
+        "$SESSION_HELPER" unwithdraw "$name" 2>/dev/null || true
     fi
 
     local worker_lock_fd smb_lock_fd
@@ -786,17 +826,18 @@ remove_share() {
     exec {worker_lock_fd}>"$WORKER_LOCK"
     flock -x "$worker_lock_fd"
 
-    if [[ -n "${mount_path:-}" ]]; then
+    if [[ -n "$mount_path" ]]; then
         if [[ "$share_profile" != "$PROFILE_LEGACY" ]] \
-            && backend_mount_active "$mount_path" 2>/dev/null; then
-            umount "$mount_path" 2>/dev/null || true
+            && backend_mount_active "$mount_path" 2>/dev/null \
+            && ! umount "$mount_path" 2>/dev/null; then
+            echo "cannot remove share '$name': $mount_path is still in use; nothing was deleted" >&2
+            exec {worker_lock_fd}>&-
+            return 5
         fi
         # Also removes a pre-session-design legacy line during upgrade/removal.
         sed -i "\| ${mount_path} cifs |d" /etc/fstab 2>/dev/null || true
     fi
 
-    # Strip the [SHARE_NAME] section from smb.conf, if present and
-    # smb.conf exists.
     if [[ -f "$SMB_CONF" ]]; then
         exec {smb_lock_fd}>"$SMB_CONF_LOCK"
         flock -x "$smb_lock_fd"
@@ -809,6 +850,12 @@ remove_share() {
         chmod 0644 "$SMB_CONF" 2>/dev/null || true
         exec {smb_lock_fd}>&-
     fi
+    systemctl daemon-reload 2>/dev/null || true
+    if ! reload_smbd_checked; then
+        echo "share '$name': section removed from smb.conf but smbd did not reload; state kept" >&2
+        exec {worker_lock_fd}>&-
+        return 6
+    fi
 
     rm -f "$(share_state_file "$name")"
     rm -f "$(share_creds_file "$name")"
@@ -817,9 +864,8 @@ remove_share() {
     if [[ -n "$queued_state" ]]; then
         rm -rf -- "$queued_state"
     fi
-    systemctl daemon-reload 2>/dev/null || true
-    if systemctl is-active --quiet smbd 2>/dev/null; then
-        systemctl reload smbd 2>/dev/null || systemctl restart smbd 2>/dev/null || true
+    if [[ "$share_profile" == "$PROFILE_LEGACY" ]]; then
+        "$SESSION_HELPER" unwithdraw "$name"
     fi
     exec {worker_lock_fd}>&-
     return 0
@@ -1822,6 +1868,10 @@ shares_list_status() {
                 printf '  mount point:    %s' "${BACKEND_MOUNT:-?}"
                 if [[ "${PROFILE:-$PROFILE_LEGACY}" == "$PROFILE_LEGACY" ]]; then
                     printf '  [dynamic sessions=%s]\n' "$(legacy_session_count "$n")"
+                    if [[ -x "$SESSION_HELPER" ]] && "$SESSION_HELPER" withdrawn "$n" 2>/dev/null; then
+                        printf '  status:         WITHDRAWN - an earlier change or removal did not finish;\n'
+                        printf '                  new connections are refused. Re-run the edit or removal.\n'
+                    fi
                 elif backend_mount_active "${BACKEND_MOUNT:-/dev/null}" 2>/dev/null; then
                     printf '  [mounted]\n'
                 else
@@ -1885,6 +1935,47 @@ shares_list_status() {
 # testparm) run BEFORE any persistent writes (creds, fstab, smb.conf,
 # share-state). A non-zero return therefore leaves the filesystem
 # unchanged from the call's pre-state.
+# True when an existing legacy share is being changed in a way that would
+# leave active trees on the old backend, identity, credentials, or locking
+# (code-review session plan 02). A frontend-only change (AD group) does not
+# require a drain. Compares against the saved state and creds file.
+share_requires_drain() {
+    local f creds old new expected
+    f=$(share_state_file "$SHARE_NAME")
+    [[ -f "$f" ]] || return 1
+    # shellcheck disable=SC1090 # session plan 05 replaces sourcing state
+    old=$(
+        PROFILE="" BACKEND_IP="" BACKEND_USER="" BACKEND_DOMAIN="" FRONT_FORCE_USER=""
+        OFFLINE_MODE="" LOCKING_OVERRIDE="" BACKEND_VERS="" BACKEND_SEAL=""
+        source "$f"
+        printf '%s|' "${PROFILE:-$PROFILE_LEGACY}" "$BACKEND_IP" "$BACKEND_USER" \
+            "$BACKEND_DOMAIN" "$FRONT_FORCE_USER" "${OFFLINE_MODE:-$OFFLINE_DIRECT}" \
+            "$LOCKING_OVERRIDE" "$BACKEND_VERS" "$BACKEND_SEAL"
+    )
+    [[ "${old%%|*}" == "$PROFILE_LEGACY" ]] || return 1
+    new=$(printf '%s|' "$PROFILE" "$BACKEND_IP" "$BACKEND_USER" "$BACKEND_DOMAIN" \
+        "$FRONT_FORCE_USER" "$OFFLINE_MODE" "${LOCKING_OVERRIDE:-}" \
+        "${BACKEND_VERS:-}" "${BACKEND_SEAL:-}")
+    [[ "$old" == "$new" ]] || return 0
+    creds=$(share_creds_file "$SHARE_NAME")
+    expected=$(printf 'username=%s\npassword=%s\ndomain=%s' \
+        "$BACKEND_USER" "$BACKEND_PASS" "$BACKEND_DOMAIN")
+    [[ -f "$creds" && "$(<"$creds")" == "$expected" ]] || return 0
+    return 1
+}
+
+# Edit-menu wrapper: before a change that drains a live legacy share, say how
+# many sessions will be closed and let the operator back out.
+configure_share_tui() {
+    local live
+    live=$(legacy_session_count "$SHARE_NAME")
+    if (( live > 0 )) && share_requires_drain; then
+        yesno "Share: ${SHARE_NAME}\n\nThis change affects the backend connection. ${live} connected session(s) will be closed before it is applied; users reconnect on their next access.\n\nContinue?" \
+            || return 130
+    fi
+    configure_share
+}
+
 configure_share() {
     [[ -n "$SHARE_NAME" && -n "$BACKEND_IP" && -n "$BACKEND_USER" \
         && -n "${BACKEND_PASS:-}" && -n "$BACKEND_DOMAIN" \
@@ -2039,6 +2130,27 @@ configure_share() {
     local mount_opts; mount_opts=$(backend_mount_opts "$PROFILE")
     local fstab_line="//${BACKEND_IP}/${SHARE_NAME} ${BACKEND_MOUNT} cifs ${mount_opts} 0 0"
 
+    # A live legacy share whose backend, identity, credentials, or locking
+    # changes is withdrawn and drained first, so no tree keeps running on
+    # the old generation after this reports success. Lock ordering is
+    # per-share lifecycle -> worker -> smb.conf; the drain holds no lock.
+    # If a later validation fails, the share is un-withdrawn: its old
+    # configuration is still untouched, so clients simply reconnect.
+    local drained=0
+    if [[ -x "$SESSION_HELPER" ]] && share_requires_drain; then
+        log_share "reconfiguring live legacy share '${SHARE_NAME}': withdrawing and draining clients"
+        if ! "$SESSION_HELPER" withdraw "$SHARE_NAME" reconfigure; then
+            log_share "ERROR: could not withdraw '${SHARE_NAME}'; it stays withdrawn. Re-run the change."
+            return 13
+        fi
+        if ! share_drain "$SHARE_NAME"; then
+            "$SESSION_HELPER" unwithdraw "$SHARE_NAME"
+            log_share "ERROR: clients of '${SHARE_NAME}' could not be drained; nothing was changed."
+            return 13
+        fi
+        drained=1
+    fi
+
     # Keep the periodic worker from observing a half-written transition
     # between direct and queued state. Lock ordering is worker -> smb.conf,
     # matching the worker itself and remove_share().
@@ -2062,6 +2174,7 @@ configure_share() {
             log_share "ERROR: cannot resolve AD group '${FRONT_GROUP}' to a SID via winbind."
             log_share "ERROR: is the group name correct? Is winbind reachable? (try 'wbinfo --name-to-sid=\"${FRONT_GROUP}\"')"
             exec {worker_lock_fd}>&-
+            (( drained == 0 )) || "$SESSION_HELPER" unwithdraw "$SHARE_NAME"
             return 6
         fi
 
@@ -2113,6 +2226,7 @@ EOF
             rm -f "$smb_conf_pending"
             exec {smb_lock_fd}>&-
             exec {worker_lock_fd}>&-
+            (( drained == 0 )) || "$SESSION_HELPER" unwithdraw "$SHARE_NAME"
             return 4
         fi
     fi
@@ -2156,6 +2270,11 @@ EOF
     fi
 
     BACKEND_PASS=""; unset BACKEND_PASS
+    # The new generation is live: re-admit connections. This also clears a
+    # marker left by an interrupted earlier change or removal.
+    if [[ -x "$SESSION_HELPER" ]]; then
+        "$SESSION_HELPER" unwithdraw "$SHARE_NAME" 2>/dev/null || true
+    fi
     exec {worker_lock_fd}>&-
     return 0
 }
@@ -2680,7 +2799,7 @@ shares_add_wizard() {
         fi
     else
         local rc=$?
-        info "configure_share failed (rc=$rc).\n  rc=2: missing required field / bad --locking value\n  rc=4: testparm rejected the smb.conf — see /tmp/smbproxy-tp.*\n  rc=5: no /etc/passwd entry for the force-user\n  rc=6: AD group could not be resolved to a SID (winbind down? group missing?)\n  rc=7: legacy profile but no legacy NIC role assigned\n  rc=8: invalid profile value\n  rc=9: AD-name collision — '${FRONT_FORCE_USER}' also exists in AD\n  rc=10: invalid offline mode (queued requires modern profile)\n  rc=11: queued mode requires the secondary data disk\n  rc=12: session VFS missing or built for another Samba version."
+        info "configure_share failed (rc=$rc).\n  rc=2: missing required field / bad --locking value\n  rc=4: testparm rejected the smb.conf — see /tmp/smbproxy-tp.*\n  rc=5: no /etc/passwd entry for the force-user\n  rc=6: AD group could not be resolved to a SID (winbind down? group missing?)\n  rc=7: legacy profile but no legacy NIC role assigned\n  rc=8: invalid profile value\n  rc=9: AD-name collision — '${FRONT_FORCE_USER}' also exists in AD\n  rc=10: invalid offline mode (queued requires modern profile)\n  rc=11: queued mode requires the secondary data disk\n  rc=12: session VFS missing or built for another Samba version.\n  rc=13: connected clients could not be drained; nothing was changed."
     fi
     BACKEND_PASS=""
 }
@@ -2729,7 +2848,7 @@ shares_edit_picker() {
                     3>&1 1>&2 2>&3) || continue
                 [[ "$p1" == "$p2" ]] || { info "Passwords don't match."; continue; }
                 BACKEND_PASS="$p1"
-                if configure_share; then
+                if configure_share_tui; then
                     info "Password updated for '$name'."
                 else
                     info "configure_share failed (rc=$?)"
@@ -2760,7 +2879,7 @@ shares_edit_picker() {
                     --passwordbox "${body_ctx}\n\nRe-enter backend password to apply (creds file is\nrewritten to keep state consistent):" 13 64 \
                     3>&1 1>&2 2>&3) || continue
                 BACKEND_PASS="$p"
-                configure_share && info "AD group updated for '$name'." || info "configure_share failed (rc=$?)"
+                configure_share_tui && info "AD group updated for '$name'." || info "configure_share failed (rc=$?)"
                 BACKEND_PASS=""
                 ;;
             3)
@@ -2772,7 +2891,7 @@ shares_edit_picker() {
                     --passwordbox "${body_ctx}\n\nRe-enter backend password to apply:" 12 64 \
                     3>&1 1>&2 2>&3) || continue
                 BACKEND_PASS="$p"
-                configure_share && info "Force-user updated for '$name'." || info "configure_share failed (rc=$?)"
+                configure_share_tui && info "Force-user updated for '$name'." || info "configure_share failed (rc=$?)"
                 BACKEND_PASS=""
                 ;;
             4)
@@ -2784,7 +2903,7 @@ shares_edit_picker() {
                     --passwordbox "${body_ctx}\n\nRe-enter backend password to apply:" 12 64 \
                     3>&1 1>&2 2>&3) || continue
                 BACKEND_PASS="$p"
-                configure_share && info "Backend IP updated for '$name'." || info "configure_share failed (rc=$?)"
+                configure_share_tui && info "Backend IP updated for '$name'." || info "configure_share failed (rc=$?)"
                 BACKEND_PASS=""
                 ;;
             5)
@@ -2796,7 +2915,7 @@ shares_edit_picker() {
                     --passwordbox "${body_ctx}\n\nNew password for ${BACKEND_USER}:" 12 64 \
                     3>&1 1>&2 2>&3) || continue
                 BACKEND_PASS="$p"
-                configure_share && info "Backend user updated for '$name'." || info "configure_share failed (rc=$?)"
+                configure_share_tui && info "Backend user updated for '$name'." || info "configure_share failed (rc=$?)"
                 BACKEND_PASS=""
                 ;;
             6)
@@ -2808,7 +2927,7 @@ shares_edit_picker() {
                     --passwordbox "${body_ctx}\n\nRe-enter backend password to apply:" 12 64 \
                     3>&1 1>&2 2>&3) || continue
                 BACKEND_PASS="$p"
-                configure_share && info "Backend domain updated for '$name'." || info "configure_share failed (rc=$?)"
+                configure_share_tui && info "Backend domain updated for '$name'." || info "configure_share failed (rc=$?)"
                 BACKEND_PASS=""
                 ;;
             7)
@@ -2850,7 +2969,7 @@ shares_edit_picker() {
                     --passwordbox "${body_ctx}\n\nRe-enter backend password to apply:" 12 64 \
                     3>&1 1>&2 2>&3) || continue
                 BACKEND_PASS="$p"
-                configure_share && info "Backend version updated for '$name' (vers=${BACKEND_VERS})." \
+                configure_share_tui && info "Backend version updated for '$name' (vers=${BACKEND_VERS})." \
                     || info "configure_share failed (rc=$?)"
                 BACKEND_PASS=""
                 ;;

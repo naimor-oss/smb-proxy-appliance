@@ -2,6 +2,15 @@
 # Create and release one upstream SMB1 CIFS mount for a Samba tree connection.
 # Invoked as root by vfs_smbproxy_session; may also be used with `probe SHARE`
 # for credential/reachability diagnostics.
+#
+# Share lifecycle (code-review session plan 02). A share being removed or
+# reconfigured is first *withdrawn*: a durable marker under LIFECYCLE_DIR
+# makes every new connect fail closed, and `withdraw` then takes the
+# per-share lock exclusively once, as a barrier, so it returns only after
+# any connect already in flight has finished. connect holds the same lock
+# shared while it checks the marker and mounts. Nothing holds the lock while
+# waiting for sessions to drain, so a disconnect never waits on it.
+# Lock order everywhere: per-share lifecycle -> share worker -> smb.conf.
 
 set -euo pipefail
 
@@ -14,6 +23,11 @@ PROC_MOUNTS=/proc/mounts
 MOUNT_BIN=mount
 UMOUNT_BIN=umount
 AUDIT_LOG=/var/log/smbproxy-session-mount.log
+LIFECYCLE_DIR=/var/lib/smbproxy/lifecycle
+SHARE_LOCK_DIR=/run/lock/smbproxy-share
+# A connect stuck on an unreachable hard mount must not block a removal
+# forever; the marker is already in place, so giving up is still safe.
+BARRIER_TIMEOUT=60
 # Path and binary overrides exist for tests only. smbd invokes this helper
 # as root; honoring them outside test mode would let an inherited
 # environment redirect a root mount to other credentials or binaries.
@@ -26,6 +40,9 @@ if [[ "$ALLOW_NON_ROOT_TEST" == "1" ]]; then
     MOUNT_BIN="${SMBPROXY_MOUNT_BIN:-$MOUNT_BIN}"
     UMOUNT_BIN="${SMBPROXY_UMOUNT_BIN:-$UMOUNT_BIN}"
     AUDIT_LOG="${SMBPROXY_SESSION_LOG:-$AUDIT_LOG}"
+    LIFECYCLE_DIR="${SMBPROXY_LIFECYCLE_DIR:-$LIFECYCLE_DIR}"
+    SHARE_LOCK_DIR="${SMBPROXY_SHARE_LOCK_DIR:-$SHARE_LOCK_DIR}"
+    BARRIER_TIMEOUT="${SMBPROXY_BARRIER_TIMEOUT:-$BARRIER_TIMEOUT}"
 fi
 
 die() { echo "smbproxy-session-mount: $*" >&2; exit 2; }
@@ -60,6 +77,40 @@ load_share() {
     [[ -n "$FU_UID" && -n "$FU_GID" ]] || die "force-user has no local uid/gid"
 }
 
+withdraw_marker() {
+    printf '%s/%s.withdrawn' "$LIFECYCLE_DIR" "$(safe_name "$1")"
+}
+
+# Open the per-share lifecycle lock on fd 8.
+open_share_lock() {
+    install_root_dir "$SHARE_LOCK_DIR"
+    exec 8>"${SHARE_LOCK_DIR}/$(safe_name "$1").lock"
+}
+
+withdraw_share() {
+    local name="$1" reason="$2" marker tmp
+    [[ "$reason" =~ ^[A-Za-z0-9_.:-]+$ ]] || die "withdraw reason must be a single word"
+    install_root_dir "$LIFECYCLE_DIR"
+    marker=$(withdraw_marker "$name")
+    tmp="${marker}.tmp.$$"
+    printf 'share=%s\nreason=%s\nsince=%s\n' "$name" "$reason" \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$tmp"
+    mv -f "$tmp" "$marker"
+    open_share_lock "$name"
+    flock -x -w "$BARRIER_TIMEOUT" 8 \
+        || die "a connect to '$name' is still in progress after ${BARRIER_TIMEOUT}s; share stays withdrawn"
+    exec 8>&-
+    SHARE_NAME="$name" PID="-" VUID="-" CNUM="-" MOUNTPOINT="-"
+    audit "WITHDRAW:${reason}"
+}
+
+unwithdraw_share() {
+    local name="$1"
+    rm -f "$(withdraw_marker "$name")"
+    SHARE_NAME="$name" PID="-" VUID="-" CNUM="-" MOUNTPOINT="-"
+    audit UNWITHDRAW
+}
+
 mount_active() {
     local mountpoint="$1"
     awk -v mp="$mountpoint" '$2 == mp && $3 == "cifs" { found=1 } END { exit !found }' "$PROC_MOUNTS"
@@ -91,6 +142,10 @@ audit() {
 }
 
 connect_session() {
+    open_share_lock "$SHARE_ARG"
+    flock -s 8
+    [[ ! -e "$(withdraw_marker "$SHARE_ARG")" ]] \
+        || die "share '$SHARE_ARG' is withdrawn for a configuration change"
     load_share "$SHARE_ARG"
     MOUNTPOINT=$(session_mountpoint "$PID" "$VUID" "$CNUM")
     local record; record=$(session_state_file "$PID" "$VUID" "$CNUM")
@@ -214,12 +269,24 @@ case "$ACTION" in
         [[ $# -eq 1 ]] || die "usage: $0 cleanup-all"
         cleanup_all
         ;;
+    withdraw)
+        [[ $# -eq 3 ]] || die "usage: $0 withdraw SHARE REASON"
+        withdraw_share "$2" "$3"
+        ;;
+    unwithdraw)
+        [[ $# -eq 2 ]] || die "usage: $0 unwithdraw SHARE"
+        unwithdraw_share "$2"
+        ;;
+    withdrawn)
+        [[ $# -eq 2 ]] || die "usage: $0 withdrawn SHARE"
+        [[ -e "$(withdraw_marker "$2")" ]]
+        ;;
     probe)
         [[ $# -eq 2 ]] || die "usage: $0 probe SHARE"
         SHARE_ARG="$2"
         probe_share
         ;;
     *)
-        die "usage: $0 {connect|disconnect} SHARE PID VUID CNUM | cleanup-share SHARE | cleanup-all | probe SHARE"
+        die "usage: $0 {connect|disconnect} SHARE PID VUID CNUM | cleanup-share SHARE | cleanup-all | probe SHARE | withdraw SHARE REASON | unwithdraw SHARE | withdrawn SHARE"
         ;;
 esac

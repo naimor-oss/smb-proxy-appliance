@@ -179,6 +179,39 @@ share. If a session exists or session state cannot be read, cleanup is deferred
 and retried. Recovery starts the automount and must pass a bounded backend
 mount/list probe before the share is published again.
 
+## Share lifecycle (add, reconfigure, remove)
+
+Code-review session plan 02. A legacy share is never changed or removed
+underneath live SMB1 sessions:
+
+1. **Withdraw.** `smbproxy-session-mount withdraw SHARE REASON` writes a
+   durable marker (`/var/lib/smbproxy/lifecycle/<safe>.withdrawn`) and then
+   takes the per-share lock (`/run/lock/smbproxy-share/<safe>.lock`)
+   exclusively once, as a barrier. Every VFS `connect` holds that lock
+   shared while it checks the marker and mounts, so once `withdraw`
+   returns no new upstream session can start.
+2. **Drain.** `share_drain` closes the share's trees and waits
+   (`SMBPROXY_DRAIN_SECONDS`, default 30) for their sessions to end, then
+   releases the upstream mounts. A session still in use is never
+   force-unmounted; the operation fails instead.
+3. **Commit.** Removal strips the section, reloads `smbd` (checked), and
+   deletes state and credentials. A reconfigure writes the new generation.
+4. **Unwithdraw.** Only after the commit succeeds.
+
+Lock order everywhere: per-share lifecycle → share worker → smb.conf.
+Nothing holds a lock while waiting for clients to disconnect.
+
+Failure behavior: a removal that cannot drain returns non-zero, keeps
+state and credentials, and leaves the share **withdrawn** (connections
+refused) with the exact re-run command. A reconfigure that cannot drain
+changes nothing and re-admits clients. The marker survives a reboot, so
+an interrupted change fails closed; the share status shows `WITHDRAWN`.
+Re-running the removal or the change clears it. Only backend, identity,
+credential, profile, offline-mode, or locking changes drain; an AD-group
+change does not. `tests/root/share-lifecycle.sh` (root, disposable
+container; CI runs it) reproduces the old removal race and proves the
+new ordering.
+
 ## Offline behavior
 
 `PROFILE` selects backend protocol, caching, and locking. `OFFLINE_MODE`
@@ -282,6 +315,9 @@ bash tests/session-mount.sh
 bash tests/vfs-contract.sh
 bash tests/vfs-version-check.sh
 bash tests/samba-hold.sh
+# root-only, in a throwaway container (CI runs it):
+docker run --rm -v "$PWD":/src:ro -e DISPOSABLE_ROOT_TEST=1 \
+    debian:trixie bash /src/tests/root/share-lifecycle.sh
 ```
 
 ## Development Rules
