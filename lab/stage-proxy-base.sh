@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 #===============================================================================
-# stage-proxy-base.sh - Mac-side staging for the SMB1<->SMB3 proxy appliance
+# stage-proxy-base.sh - Workstation-side staging (WSL2 or macOS) for the SMB1<->SMB3 proxy appliance
 #
-# Produces two files on the ISO share (/Volumes/ISO by default,
+# Produces two files on the ISO share (lab-kit lab_iso_dir: /mnt/d/ISO
+# on WSL2, /Volumes/ISO on macOS,
 # = D:\ISO\ on the Hyper-V host):
 #
 #   debian-13-smbproxy-base.vhdx  ~1.2 GB - Debian genericcloud qcow2 converted.
@@ -17,7 +18,7 @@
 # cloud-init; smbproxy-init's role wizard sets its static IP later.
 #
 # A VM created from these two files boots, applies cloud-init once, and
-# is immediately reachable over SSH from the Mac on its dnsmasq-reserved
+# is immediately reachable over SSH from the workstation on its dnsmasq-reserved
 # IP. No vmconnect clicks, no Debian installer wait, no manual
 # sudoers / authorized_keys setup.
 #
@@ -31,10 +32,18 @@
 #===============================================================================
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Workstation portability (WSL2 on Windows 11, or macOS): ISO share path,
+# seed ISO builder, checksums. lab-kit is a sibling checkout.
+LAB_KIT_DIR="${LAB_KIT_DIR:-$SCRIPT_DIR/../../lab-kit}"
+# shellcheck disable=SC1091
+source "$LAB_KIT_DIR/lib/lab-host.sh" 2>/dev/null \
+    || { echo "error: lab-kit not found at $LAB_KIT_DIR (clone it next to this repo)" >&2; exit 1; }
+
 HOSTNAME='smbproxy-1'
 DOMAIN='lab.test'
 USERNAME='debadmin'
-STAGE_DIR='/Volumes/ISO'
+STAGE_DIR="$(lab_iso_dir)"   # D:\ISO on the Hyper-V host
 ARCH='amd64'           # only amd64 implemented today; arm64 expected per dev-commons/CONTEXT.md
 DEBIAN_URL=''           # derived from $ARCH after arg parse
 
@@ -108,8 +117,7 @@ case "$ARCH" in
     *)     die "unsupported --arch: $ARCH (allowed: amd64, arm64)" ;;
 esac
 
-command -v qemu-img >/dev/null || die "qemu-img not on PATH (brew install qemu)"
-command -v hdiutil  >/dev/null || die "hdiutil missing (built-in on macOS)"
+lab_need_tool qemu-img qemu-utils qemu
 command -v curl     >/dev/null || die "curl not on PATH"
 [[ -d "$STAGE_DIR" ]]              || die "stage dir not mounted: $STAGE_DIR"
 [[ -d "$SEED_SRC" ]]               || die "seed templates dir not found: $SEED_SRC"
@@ -178,7 +186,8 @@ if [[ ! -f "$OUT_VHDX" ]]; then
         echo "-> using cached qcow2 at $CACHE_QCOW2"
     fi
 
-    # qemu-img cannot lock across SMB on macOS; convert in /tmp then move.
+    # qemu-img cannot lock files on an SMB share (macOS) or DrvFs (WSL2
+    # /mnt/d); convert in /tmp then copy.
     echo "-> converting qcow2 -> vhdx (~60s)"
     tmp_qcow=$(mktemp /tmp/smbproxy-base-XXXX.qcow2)
     tmp_vhdx=$(mktemp /tmp/smbproxy-base-XXXX.vhdx)
@@ -224,11 +233,8 @@ awk '
 substitute "$SEED_SRC/meta-data.tpl"        > "$SEED_BUILD_DIR/meta-data"
 substitute "$SEED_SRC/network-config.tpl"   > "$SEED_BUILD_DIR/network-config"
 
-# hdiutil makehybrid won't overwrite — clear any prior copy first.
 rm -f "$SEED_OUT"
-hdiutil makehybrid -iso -joliet \
-    -default-volume-name CIDATA \
-    -o "$SEED_OUT" "$SEED_BUILD_DIR" >/dev/null
+lab_make_seed_iso "$SEED_OUT" "$SEED_BUILD_DIR"
 
 rm -rf "$SEED_BUILD_DIR"
 echo "-> wrote $SEED_OUT ($(du -h "$SEED_OUT" | cut -f1))"
