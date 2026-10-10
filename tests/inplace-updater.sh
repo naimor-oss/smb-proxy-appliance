@@ -11,8 +11,8 @@ cat > "$TEST_ROOT/smb.conf" <<'EOF'
 [global]
     workgroup = LAB
 
-[TPSData]
-    path = /mnt/legacy/TPSData
+[AppData]
+    path = /mnt/legacy/AppData
     read only = no
     vfs objects = acl_xattr
     # preserve this operator comment
@@ -26,13 +26,13 @@ cat > "$TEST_ROOT/smb.conf" <<'EOF'
 EOF
 cat > "$TEST_ROOT/fstab" <<'EOF'
 UUID=abc / ext4 defaults 0 1
-//172.29.137.1/TPSData /mnt/legacy/TPSData cifs credentials=/etc/samba/.creds-TPSData,vers=1.0,cache=none,nobrl,hard,x-systemd.automount 0 0
-//172.29.137.1/TPSData /mnt/legacy/TPSData cifs credentials=/etc/samba/.creds-TPSData,vers=1.0,cache=none,nobrl,hard,x-systemd.automount 0 0
+//172.20.50.1/AppData /mnt/legacy/AppData cifs credentials=/etc/samba/.creds-AppData,vers=1.0,cache=none,nobrl,hard,x-systemd.automount 0 0
+//172.20.50.1/AppData /mnt/legacy/AppData cifs credentials=/etc/samba/.creds-AppData,vers=1.0,cache=none,nobrl,hard,x-systemd.automount 0 0
 //10.10.10.50/CNC /mnt/backend/CNC cifs credentials=/etc/samba/.creds-CNC,vers=2.1,x-systemd.automount,soft,echo_interval=10,x-systemd.mount-timeout=4 0 0
 EOF
-cat > "$TEST_ROOT/shares/TPSData.env" <<'EOF'
-SHARE_NAME="TPSData"
-BACKEND_MOUNT="/mnt/legacy/TPSData"
+cat > "$TEST_ROOT/shares/AppData.env" <<'EOF'
+SHARE_NAME="AppData"
+BACKEND_MOUNT="/mnt/legacy/AppData"
 EOF
 cat > "$TEST_ROOT/shares/CNC.env" <<'EOF'
 SHARE_NAME="CNC"
@@ -58,7 +58,7 @@ grep -qF 'fileid:algorithm = fsname' "$TEST_ROOT/smb.conf"
 grep -qF '# preserve this operator comment' "$TEST_ROOT/smb.conf"
 grep -qF 'root preexec = /usr/local/sbin/smbproxy-probe-backend "%S"' "$TEST_ROOT/smb.conf"
 grep -qF 'root preexec close = yes' "$TEST_ROOT/smb.conf"
-if grep -qF '/mnt/legacy/TPSData cifs' "$TEST_ROOT/fstab"; then
+if grep -qF '/mnt/legacy/AppData cifs' "$TEST_ROOT/fstab"; then
     echo "FAIL legacy fstab mount survived migration" >&2
     exit 1
 fi

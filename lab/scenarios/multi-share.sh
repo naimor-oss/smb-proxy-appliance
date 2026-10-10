@@ -47,7 +47,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/join-domain.sh"
 source "$(dirname "${BASH_SOURCE[0]}")/backend-mount.sh"
 
 # Two distinct share configurations against the SAME backend.
-SC_BACKEND_IP="${SC_BACKEND_IP:-172.29.137.1}"
+SC_BACKEND_IP="${SC_BACKEND_IP:-172.20.50.1}"
 SC_BACKEND_DOMAIN="${SC_BACKEND_DOMAIN:-LEGACY}"
 
 SC_SHARE_A="${SC_SHARE_A:-Engineering\$}"

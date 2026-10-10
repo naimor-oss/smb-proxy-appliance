@@ -1489,7 +1489,7 @@ config_network() {
     local leg_cidr_pre leg_cidr
     leg_cidr_pre=$(ip -o -4 addr show dev "$LEGACY_NIC_NAME" scope global 2>/dev/null | awk 'NR==1 {print $4}')
     leg_cidr=$(whiptail --inputbox \
-        "Legacy NIC static IPv4 with CIDR (gateway-less, no DHCP, no DNS).\n\nExample: 172.29.137.5/24" \
+        "Legacy NIC static IPv4 with CIDR (gateway-less, no DHCP, no DNS).\n\nExample: 172.20.50.5/24" \
         12 "$WT_WIDTH" "${leg_cidr_pre:-}" 3>&1 1>&2 2>&3) || return
     if [[ -z "$leg_cidr" ]]; then
         whiptail --msgbox "The Legacy NIC requires a static IPv4/CIDR on its private VM-to-VM link." 9 "$WT_WIDTH"

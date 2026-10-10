@@ -9,7 +9,7 @@
       - the *domain* NIC, attached to Lab-NAT, MAC pinned so router1's
         dnsmasq hands it the reserved 10.10.10.30 lease;
       - the *legacy* NIC, attached to the LegacyZone private switch
-        carrying the 172.29.137.0/24 SMB1 backend subnet. No IP is
+        carrying the 172.20.50.0/24 SMB1 backend subnet. No IP is
         configured by cloud-init for this NIC; smbproxy-init's role
         wizard sets the static IP on the appliance side after
         first boot.

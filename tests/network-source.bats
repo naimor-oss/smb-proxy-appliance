@@ -56,12 +56,12 @@ setup() {
     }
 
     write_netplan_yaml static "10.20.30.40/24" "10.20.30.1" \
-        "10.20.30.10" "factory.example" "172.29.137.5/24"
+        "10.20.30.10" "factory.example" "172.20.50.5/24"
 
     grep -q 'addresses: \[10.20.30.40/24\]' "$rendered"
     grep -q 'addresses: \[10.20.30.10\]' "$rendered"
     grep -q 'search: \[factory.example\]' "$rendered"
-    grep -q 'addresses: \[172.29.137.5/24\]' "$rendered"
+    grep -q 'addresses: \[172.20.50.5/24\]' "$rendered"
     [ "$(grep -c 'to: default' "$rendered")" -eq 1 ]
     [ "$(grep -c 'nameservers:' "$rendered")" -eq 1 ]
     grep -q 'link-local: \[\]' "$rendered"

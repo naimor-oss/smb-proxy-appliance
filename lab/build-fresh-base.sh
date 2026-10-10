@@ -50,7 +50,7 @@ VM_NAME="${VM_NAME:-smbproxy-1}"
 VM_IP="${VM_IP:-10.10.10.30}"
 VM_USER="${VM_USER:-debadmin}"
 HV_HOST="${HV_HOST:-server}"
-HV_USER="${HV_USER:-nmadmin}"
+HV_USER="${HV_USER:-labadmin}"
 # Workstation view of D:\ISO (the *_MAC names are kept for compatibility).
 STAGE_DIR_MAC="${LAB_STAGE_DIR:-$(lab_iso_dir)/lab-scripts}"
 STAGE_DIR_HOST="${LAB_HOST_STAGE_DIR:-D:\\ISO\\lab-scripts}"

@@ -39,7 +39,7 @@ Five VMs run on the Hyper-V host:
 | `WS2025-DC1` | Windows Server 2025 first DC for `lab.test` | 10.10.10.10 |
 | `samba-dc1` | Samba AD DC appliance under test (sibling repo) | 10.10.10.20 |
 | `smbproxy-1` | Proxy appliance under test (this repo) | 10.10.10.30 |
-| legacy SMB1 backend | Persistent legacy file server | `172.29.137.1` (LegacyZone) |
+| legacy SMB1 backend | Persistent legacy file server | `172.20.50.1` (LegacyZone) |
 
 The Mac mounts an SMB share from the Hyper-V host (typically
 `/Volumes/ISO` on the Mac = `D:\ISO\` on the host). This share is where
@@ -52,7 +52,7 @@ If you already followed the `samba-addc-appliance` SETUP guide, the
 only proxy-specific items you still need are:
 
 1. **`LegacyZone` private virtual switch** with the legacy SMB1 server
-   attached (172.29.137.0/24). This is persistent infrastructure — see
+   attached (172.20.50.0/24). This is persistent infrastructure — see
    [LegacyZone vSwitch](#legacyzone-vswitch) below.
 2. **dnsmasq reservation for the proxy's domain NIC**. Add
    `00:15:5D:0A:0A:1E,smbproxy-1,10.10.10.30` to your lab-router config
@@ -110,9 +110,9 @@ New-VMSwitch -Name 'LegacyZone' -SwitchType Private
 ```
 
 Attach the legacy SMB1 staging server to it and pin the Windows side
-to `172.29.137.1/24` with **no gateway, no DNS**. The proxy's legacy
+to `172.20.50.1/24` with **no gateway, no DNS**. The proxy's legacy
 NIC is configured later from `smbproxy-init` to a static address on
-the same subnet (e.g. `172.29.137.10/24`, again no gateway, no DNS).
+the same subnet (e.g. `172.20.50.10/24`, again no gateway, no DNS).
 
 This switch is persistent infrastructure. Do not delete or rename it
 casually; every diagnostic and lab scenario in this repo assumes it
@@ -137,7 +137,7 @@ in `New-SmbProxyTestVM.ps1` and the IP in `lab/proxy.env`.
 ### Backend credentials
 
 A legacy SMB1 backend on the LegacyZone subnet (e.g. at
-`172.29.137.1` with a share named `Engineering$`, NetBIOS domain
+`172.20.50.1` with a share named `Engineering$`, NetBIOS domain
 `LEGACY`, user `engineering_user` — names are operator-chosen) is
 the assumed test fixture. Lab scenarios take the share/user/domain
 as inputs (`SC_SHARE_NAME`, `SC_BACKEND_USER`, `SC_BACKEND_DOMAIN`)
@@ -171,7 +171,7 @@ The defaults match the original developer's environment. Touch points:
 | Setting | Default | Change in |
 | --- | --- | --- |
 | Hyper-V host DNS name | `server` | `lab/proxy.env` (`LAB_HV_HOST`) |
-| Host SSH user | `nmadmin` | `lab/proxy.env` (`LAB_HV_USER`) |
+| Host SSH user | `labadmin` | `lab/proxy.env` (`LAB_HV_USER`) |
 | Mac-side ISO share path | `/Volumes/ISO/lab-scripts` | `lab/proxy.env` (`LAB_STAGE_DIR`) |
 | Host-side ISO share path | `D:\ISO\lab-scripts` | `lab/proxy.env` (`LAB_HOST_STAGE_DIR`) |
 | VM admin user | `debadmin` | `lab/proxy.env` (`LAB_VM_USER`) and stager `-u` |
@@ -204,13 +204,13 @@ done && echo "mac tools OK"
 [[ -f ~/.ssh/id_ed25519.pub ]] && echo "ssh key OK"
 
 # 4. SSH to the Hyper-V host and confirm both switches exist.
-ssh nmadmin@server 'pwsh -Command "Get-VMSwitch | Where-Object Name -in @(\"Lab-NAT\",\"LegacyZone\") | Select-Object Name,SwitchType"'
+ssh labadmin@server 'pwsh -Command "Get-VMSwitch | Where-Object Name -in @(\"Lab-NAT\",\"LegacyZone\") | Select-Object Name,SwitchType"'
 
 # 5. ISO share is mounted and writable.
 touch /Volumes/ISO/.write-test && rm /Volumes/ISO/.write-test && echo "ISO share OK"
 
 # 6. legacy backend reachable from the Hyper-V host.
-ssh nmadmin@server 'Test-NetConnection -ComputerName 172.29.137.1 -Port 445 -InformationLevel Quiet'
+ssh labadmin@server 'Test-NetConnection -ComputerName 172.20.50.1 -Port 445 -InformationLevel Quiet'
 
 # 7. Syntax check the proxy scripts.
 bash -n prepare-image.sh smbproxy-sconfig.sh smbproxy-session-mount \
