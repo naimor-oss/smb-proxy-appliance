@@ -142,7 +142,7 @@ What it does:
 - Writes `/etc/smbproxy/nic-roles.env` in the format the wizard
   produces.
 - Writes `/etc/netplan/60-smbproxy-init.yaml` with the legacy NIC
-  pinned to `SC_LEGACY_CIDR` (default 172.29.137.10/24, gateway-less,
+  pinned to `SC_LEGACY_CIDR` (default 172.20.50.10/24, gateway-less,
   DNS-less). Domain NIC stanza keeps DHCP.
 - `netplan apply`.
 

@@ -154,4 +154,4 @@ ROLLBACK_NEEDED=0
 log "Update complete"
 echo "Configuration backup: $BACKUP_DIR/config.tar"
 echo "Rollback command: sudo $BACKUP_DIR/rollback.sh $BACKUP_DIR"
-echo "Required acceptance: downstream large-file hash, CIFS error log, and two-user ProfitFab test"
+echo "Required acceptance: downstream large-file hash, CIFS error log, and two-user application test"

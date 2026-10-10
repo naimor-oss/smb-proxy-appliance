@@ -31,7 +31,7 @@
 source "$(dirname "${BASH_SOURCE[0]}")/bootstrap-network.sh"
 
 SC_SHARE_NAME="${SC_SHARE_NAME:-Engineering\$}"
-SC_BACKEND_IP="${SC_BACKEND_IP:-172.29.137.1}"
+SC_BACKEND_IP="${SC_BACKEND_IP:-172.20.50.1}"
 SC_BACKEND_USER="${SC_BACKEND_USER:-engineering_user}"
 SC_BACKEND_DOMAIN="${SC_BACKEND_DOMAIN:-LEGACY}"
 SC_BACKEND_MOUNT="${SC_BACKEND_MOUNT:-/mnt/legacy/Engineering_}"

@@ -10,7 +10,7 @@
 #   - Identifies the legacy NIC as the other (and only other) ethernet.
 #   - Writes /etc/smbproxy/nic-roles.env (matches the wizard's format).
 #   - Writes /etc/netplan/60-smbproxy-init.yaml with the legacy NIC
-#     pinned to SC_LEGACY_CIDR (default 172.29.137.10/24, gateway-less,
+#     pinned to SC_LEGACY_CIDR (default 172.20.50.10/24, gateway-less,
 #     DNS-less). The domain NIC stanza keeps DHCP — the wizard's
 #     "static after join" step is a separate concern.
 #   - netplan apply, then verifies LegacyZone reachability.
@@ -19,10 +19,10 @@
 # backend-mount, and frontend-share.
 #
 # Overridable via env:
-#   SC_LEGACY_CIDR   default 172.29.137.10/24
+#   SC_LEGACY_CIDR   default 172.20.50.10/24
 
-SC_LEGACY_CIDR="${SC_LEGACY_CIDR:-172.29.137.10/24}"
-SC_LEGACY_GW_IP="${SC_LEGACY_GW_IP:-172.29.137.1}"
+SC_LEGACY_CIDR="${SC_LEGACY_CIDR:-172.20.50.10/24}"
+SC_LEGACY_GW_IP="${SC_LEGACY_GW_IP:-172.20.50.1}"
 
 # Idempotent helper: does the role assignment + netplan write + apply.
 # Designed to be safe to call multiple times (the wizard equivalent is

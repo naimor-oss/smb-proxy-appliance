@@ -125,8 +125,8 @@ switch named `LegacyZone` carrying the dedicated SMB1 backend subnet.
 | --- | --- | --- | --- |
 | Gateway / DHCP / DNS forwarder | `router1` | `10.10.10.0/24` | From `lab-router`. |
 | First Windows DC | `WS2025-DC1` | `10.10.10.10` | Owns the test forest. |
-| Legacy SMB1 backend | (existing) | `172.29.137.1` (LegacyZone) | Static, gateway-less. Test data only. |
-| SMB1↔SMB3 proxy | `smbproxy-1` | domain NIC: DHCP→static, legacy NIC: `172.29.137.x/24` | Debian 13 appliance candidate. |
+| Legacy SMB1 backend | (existing) | `172.20.50.1` (LegacyZone) | Static, gateway-less. Test data only. |
+| SMB1↔SMB3 proxy | `smbproxy-1` | domain NIC: DHCP→static, legacy NIC: `172.20.50.x/24` | Debian 13 appliance candidate. |
 
 The lab assumes an actual legacy SMB1 server reachable on LegacyZone is
 the authoritative source — the lab does **not** stand up a synthetic

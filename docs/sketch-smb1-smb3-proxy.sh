@@ -26,7 +26,7 @@ set -euo pipefail
 # CONFIGURATION VARIABLES - Edit these before running
 # ==============================================================================
 # Legacy SMB1 backend
-BACKEND_IP="172.29.137.1"    # Dedicated Link IP
+BACKEND_IP="172.20.50.1"    # Dedicated Link IP
 BACKEND_SHARE="Engineering$"
 BACKEND_DOMAIN="LEGACY"
 BACKEND_USER="engineering_user"
@@ -35,7 +35,7 @@ BACKEND_PASS="<ROTATED-2026-05-01-see-internal-vault>"  # original literal remov
 # Modern AD Forest (Frontend)
 DOMAIN_FQDN="example.lan"
 DOMAIN_SHORT="EXAMPLE"     # NetBIOS name (pre-Windows 2000 domain name)
-DC_IP="192.168.0.18"       # Domain Network IP
+DC_IP="192.0.2.18"       # Domain Network IP
 AD_ADMIN_USER="Administrator"
 
 # Proxy Configuration

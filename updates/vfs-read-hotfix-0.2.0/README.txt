@@ -27,4 +27,4 @@ Acceptance requires all of the following after installation:
   * copy a file larger than 64 KiB through the downstream SMB3 share and
     verify its hash;
   * confirm no new "SMB signature verification returned error" messages;
-  * run two ProfitFab users and verify shared seat state and record locking.
+  * run two application users and verify shared seat state and record locking.
