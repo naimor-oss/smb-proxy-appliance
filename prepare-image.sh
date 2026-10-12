@@ -1124,10 +1124,18 @@ WT_MENU=12
 DETECT_FILE=/var/lib/smbproxy-init-detected.env
 
 # Keys the first-boot detection cache may contain. It is parsed as data,
-# never sourced (code-review session plan 05).
-DETECT_KEYS=(APPCORE_DET_IP APPCORE_DET_GATEWAY APPCORE_DET_DHCP_DNS
-    APPCORE_DET_DHCP_DOMAIN APPCORE_DET_PTR_FQDN APPCORE_DET_PTR_NAME
-    APPCORE_DET_PTR_DOMAIN APPCORE_DET_EFFECTIVE_DOMAIN DET_NIC_COUNT)
+# never sourced (code-review session plan 05). kvstate refuses unknown keys,
+# so the library's own key list is used: a key the library adds later would
+# otherwise make the whole file unreadable and lose the NIC enumeration.
+if declare -p APPCORE_DET_CACHE_KEYS >/dev/null 2>&1; then
+    DETECT_KEYS=("${APPCORE_DET_CACHE_KEYS[@]}" DET_NIC_COUNT)
+else
+    # Libraries older than 0.14.0 do not export the list: use the full set.
+    DETECT_KEYS=(APPCORE_DET_IFACE APPCORE_DET_IP APPCORE_DET_GATEWAY
+        APPCORE_DET_DHCP_DNS APPCORE_DET_DHCP_DOMAIN APPCORE_DET_PTR_FQDN
+        APPCORE_DET_PTR_NAME APPCORE_DET_PTR_DOMAIN APPCORE_DET_EFFECTIVE_DOMAIN
+        APPCORE_DET_EFFECTIVE_DOMAIN_SOURCE DET_NIC_COUNT)
+fi
 for _i in $(seq 0 15); do
     for _f in NAME MAC STATE IP4 DHCP; do DETECT_KEYS+=("NIC${_i}_${_f}"); done
 done
