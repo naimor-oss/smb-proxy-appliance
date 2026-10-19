@@ -1,4 +1,3 @@
-#Requires -RunAsAdministrator
 #Requires -Modules Hyper-V
 <#
 .SYNOPSIS

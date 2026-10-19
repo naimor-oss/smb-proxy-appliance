@@ -33,6 +33,9 @@
 #
 # Overridable via env (defaults track the sketch + lab.test):
 #   SC_GROUP   default LAB\Domain Users  (zero-setup choice; every joined user)
+#   SC_FRONT_HOST  default LAB_VM_IP; the name the Kerberos clients connect
+#              to. Samba's client won't use Kerberos to a bare IP, so set it
+#              to the proxy's FQDN when the lab has no other way to map it.
 # Plus everything inherited from join-domain.sh and backend-mount.sh
 # (SC_SHARE_NAME, SC_BACKEND_*, SC_FORCE_USER, SC_REALM, SC_PASS, ...).
 
@@ -43,6 +46,11 @@ source "$(dirname "${BASH_SOURCE[0]}")/backend-mount.sh"
 # pass --group through to --configure-share, which in turn writes
 # the per-share smb.conf section.
 SC_GROUP="${SC_GROUP:-LAB\\Domain Users}"
+SC_FRONT_HOST="${SC_FRONT_HOST:-$LAB_VM_IP}"
+
+# appliance-core kvstate writes each value as a shell double-quoted string,
+# so \ $ " and ` arrive escaped in the state files.
+kv_escape() { sed 's/[\\$"`]/\\&/g' <<< "$1"; }
 
 do_apply_firewall() {
     ssh_vm 'sudo smbproxy-sconfig --apply-firewall'
@@ -132,7 +140,8 @@ verify() {
     local sid_in_smb sid_resolved
     sid_in_smb=$(grep -oE 'valid users[[:space:]]*=[[:space:]]*S-1-[0-9-]+' <<< "$out" | awk -F= '{gsub(/^[[:space:]]+|[[:space:]]+$/,"",$2); print $2}')
     if [[ -n "$sid_in_smb" ]]; then
-        sid_resolved=$(ssh_vm "sudo wbinfo --sid-to-name='$sid_in_smb' 2>/dev/null | awk '{print \$1}'" || true)
+        # "LAB\domain users 2": the name may hold spaces; drop the type.
+        sid_resolved=$(ssh_vm "sudo wbinfo --sid-to-name='$sid_in_smb' 2>/dev/null | sed 's/ [0-9]*\$//'" || true)
         if [[ -n "$sid_resolved" ]] && ! grep -qiF "${SC_GROUP##*\\\\}" <<< "$sid_resolved"; then
             say "SID $sid_in_smb resolved to '$sid_resolved' which does not look like ${SC_GROUP}"
             rc=1
@@ -168,13 +177,13 @@ verify() {
     # would take, just without crossing a network boundary. A future
     # cross-host check from WS2025-DC1 / samba-dc1 belongs in a
     # Verify-FrontendShare.ps1 helper.
-    out=$(ssh_vm "sudo bash -c 'echo \"$SC_PASS\" | kinit \"$SC_ADMIN@$SC_REALM_UC\" && smbclient -k -L //$LAB_VM_IP -m SMB3'" 2>&1 || true)
+    out=$(ssh_vm "sudo bash -c 'echo \"$SC_PASS\" | kinit \"$SC_ADMIN@$SC_REALM_UC\" && smbclient -k -L //$SC_FRONT_HOST -m SMB3'" 2>&1 || true)
     echo "$out"
     grep -qE "Sharename|Disk\|" <<< "$out" || { say "smbclient -L returned no shares"; rc=1; }
     grep -qF "$SC_SHARE_NAME" <<< "$out" || { say "advertised share list does not include $SC_SHARE_NAME"; rc=1; }
 
     say "SMB3 tree connect reaches the backend through a dynamic SMB1 session"
-    out=$(ssh_vm "sudo bash -c 'echo \"$SC_PASS\" | kinit \"$SC_ADMIN@$SC_REALM_UC\" && smbclient -k //$LAB_VM_IP/$SC_SHARE_NAME -m SMB3 -c ls'" 2>&1 || true)
+    out=$(ssh_vm "sudo bash -c 'echo \"$SC_PASS\" | kinit \"$SC_ADMIN@$SC_REALM_UC\" && smbclient -k //$SC_FRONT_HOST/$SC_SHARE_NAME -m SMB3 -c ls'" 2>&1 || true)
     echo "$out"
     grep -qiE 'NT_STATUS|tree connect failed|session setup failed' <<< "$out" \
         && { say "SMB3 tree connect failed"; rc=1; }
@@ -185,8 +194,8 @@ verify() {
     say "per-share state file persisted the frontend coordinates"
     out=$(ssh_vm "sudo cat '$state'" 2>&1 || true)
     echo "$out"
-    grep -qF "SHARE_NAME=\"${SC_SHARE_NAME}\""   <<< "$out" || { say "SHARE_NAME wrong"; rc=1; }
-    grep -qF "FRONT_GROUP=\"${SC_GROUP}\""        <<< "$out" || { say "FRONT_GROUP wrong"; rc=1; }
+    grep -qF "SHARE_NAME=\"$(kv_escape "$SC_SHARE_NAME")\"" <<< "$out" || { say "SHARE_NAME wrong"; rc=1; }
+    grep -qF "FRONT_GROUP=\"$(kv_escape "$SC_GROUP")\""     <<< "$out" || { say "FRONT_GROUP wrong"; rc=1; }
     grep -qF "FRONT_FORCE_USER=\"${SC_FORCE_USER}\"" <<< "$out" || { say "FRONT_FORCE_USER wrong"; rc=1; }
 
     # End-to-end coverage of the --check-share diagnostic. After a

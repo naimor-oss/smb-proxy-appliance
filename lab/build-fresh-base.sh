@@ -49,12 +49,18 @@ trap cleanup EXIT
 VM_NAME="${VM_NAME:-smbproxy-1}"
 VM_IP="${VM_IP:-10.10.10.30}"
 VM_USER="${VM_USER:-debadmin}"
+# HV_HOST=local: this workstation is the Hyper-V host (WSL2 on it); host
+# commands go to powershell.exe and the VM is reached without -J.
 HV_HOST="${HV_HOST:-server}"
 HV_USER="${HV_USER:-labadmin}"
 # Workstation view of D:\ISO (the *_MAC names are kept for compatibility).
 STAGE_DIR_MAC="${LAB_STAGE_DIR:-$(lab_iso_dir)/lab-scripts}"
 STAGE_DIR_HOST="${LAB_HOST_STAGE_DIR:-D:\\ISO\\lab-scripts}"
 ISO_DIR_MAC="${ISO_DIR_MAC:-$(lab_iso_dir)}"
+# Host views of the ISO folder (base VHDX, seed ISOs) and the VM folder.
+ISO_DIR_HOST="${LAB_HOST_ISO_DIR:-D:\\ISO}"
+LAB_PATH_HOST="${LAB_HOST_VM_DIR:-D:\\Lab}"
+VM_MEMORY_GB="${VM_MEMORY_GB:-2}"
 DOMAIN="${DOMAIN:-lab.test}"
 # Empty by default so the stager picks up lab/keys/*.pub (the
 # documented multi-key path). Operators can still pin a single key
@@ -93,8 +99,9 @@ Flags:
                          testing in a different hypervisor environment.
   -h, --help             Show this
 
-Environment overrides: HV_HOST, HV_USER, ISO_DIR_MAC, GOLDEN_CHECKPOINT,
-LAB_STAGE_DIR, LAB_HOST_STAGE_DIR, VFS_REPO.
+Environment overrides: HV_HOST (or local), HV_USER, ISO_DIR_MAC,
+GOLDEN_CHECKPOINT, LAB_STAGE_DIR, LAB_HOST_STAGE_DIR, LAB_HOST_ISO_DIR,
+LAB_HOST_VM_DIR, VM_MEMORY_GB, VFS_REPO.
 USAGE
 }
 
@@ -120,8 +127,17 @@ step() { echo
          echo "=== $*"
          echo "=============================================================="; }
 
-ssh_host() { ssh "${HV_USER}@${HV_HOST}" "$@"; }
-ssh_vm()   { ssh -J "${HV_USER}@${HV_HOST}" \
+JUMP=(-J "${HV_USER}@${HV_HOST}")
+if [[ "$HV_HOST" == local ]]; then
+    command -v powershell.exe >/dev/null 2>&1 \
+        || { echo "HV_HOST=local needs WSL2 on the Hyper-V host (no powershell.exe)" >&2; exit 1; }
+    JUMP=()
+    ssh_host() { powershell.exe -NoProfile -NonInteractive -Command "$*" | tr -d '\r'
+                 return "${PIPESTATUS[0]}"; }
+else
+    ssh_host() { ssh "${HV_USER}@${HV_HOST}" "$@"; }
+fi
+ssh_vm()   { ssh "${JUMP[@]}" \
                  -o IdentitiesOnly=yes -o IdentityAgent=none \
                  -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
                  "${VM_USER}@${VM_IP}" "$@"; }
@@ -134,7 +150,7 @@ if [[ $FORCE -eq 1 ]]; then
     step "0. force flag set: tearing down existing $VM_NAME if present"
     ssh_host "Stop-VM -Name '$VM_NAME' -Force -ErrorAction SilentlyContinue; \
               Remove-VM -Name '$VM_NAME' -Force -ErrorAction SilentlyContinue; \
-              Remove-Item -LiteralPath 'D:\\Lab\\$VM_NAME' -Recurse -Force -ErrorAction SilentlyContinue; \
+              Remove-Item -LiteralPath '${LAB_PATH_HOST}\\$VM_NAME' -Recurse -Force -ErrorAction SilentlyContinue; \
               Write-Host 'cleaned'"
 fi
 
@@ -178,7 +194,9 @@ LEGACY_ARG=""
 [[ -n "$LEGACY_STATIC_MAC" ]] && LEGACY_ARG="-LegacyStaticMacAddress '$LEGACY_STATIC_MAC'"
 ssh_host "pwsh -File ${STAGE_DIR_HOST}\\New-SmbProxyTestVM.ps1 \
             -VMName '$VM_NAME' \
-            -SeedIso 'D:\\ISO\\${VM_NAME}-seed.iso' \
+            -BaseVhdxPath '${ISO_DIR_HOST}\\debian-13-smbproxy-base.vhdx' \
+            -SeedIso '${ISO_DIR_HOST}\\${VM_NAME}-seed.iso' \
+            -LabPath '${LAB_PATH_HOST}' -MemoryGB ${VM_MEMORY_GB} \
             -DomainStaticMacAddress '$DOMAIN_STATIC_MAC' \
             $LEGACY_ARG \
             -Start"
@@ -189,7 +207,7 @@ for _ in $(seq 1 90); do
     if ssh -o ConnectTimeout=3 -o BatchMode=yes \
            -o IdentitiesOnly=yes -o IdentityAgent=none \
            -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-           -J "${HV_USER}@${HV_HOST}" "${VM_USER}@${VM_IP}" true 2>/dev/null; then
+           "${JUMP[@]}" "${VM_USER}@${VM_IP}" true 2>/dev/null; then
         ssh_up=1
         break
     fi
@@ -200,7 +218,7 @@ ssh_vm 'hostname; ip -4 addr show | grep -E "inet " | head -3; \
         test -f /var/log/smbproxy-base-ready.marker && cat /var/log/smbproxy-base-ready.marker'
 
 step "5. push appliance scripts, pinned VFS component, and appliance-core lib/ to the VM"
-scp -J "${HV_USER}@${HV_HOST}" \
+scp "${JUMP[@]}" \
     -o IdentitiesOnly=yes -o IdentityAgent=none \
     -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
     "$REPO_DIR/prepare-image.sh" "$REPO_DIR/smbproxy-sconfig.sh" \
@@ -232,7 +250,7 @@ fi
 VFS_PAYLOAD_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/smbproxy-vfs-payload.XXXXXX")
 "$VFS_REPO/scripts/export-appliance-payload.sh" \
     "$VFS_PAYLOAD_ROOT/smbproxy-session-vfs" >/dev/null
-scp -J "${HV_USER}@${HV_HOST}" -r \
+scp "${JUMP[@]}" -r \
     -o IdentitiesOnly=yes -o IdentityAgent=none \
     -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
     "$VFS_PAYLOAD_ROOT/smbproxy-session-vfs" \
@@ -248,7 +266,7 @@ if [[ ! -d "$APPCORE_REPO/lib" ]]; then
     say "set \$APPCORE_REPO if the sibling lives elsewhere"
     exit 1
 fi
-scp -J "${HV_USER}@${HV_HOST}" -r \
+scp "${JUMP[@]}" -r \
     -o IdentitiesOnly=yes -o IdentityAgent=none \
     -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
     "$APPCORE_REPO/lib" \
@@ -316,7 +334,7 @@ for _ in $(seq 1 60); do
     if ssh -o ConnectTimeout=3 -o BatchMode=yes \
            -o IdentitiesOnly=yes -o IdentityAgent=none \
            -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-           -J "${HV_USER}@${HV_HOST}" "${VM_USER}@${VM_IP}" \
+           "${JUMP[@]}" "${VM_USER}@${VM_IP}" \
            'test -f /var/lib/smbproxy-firstboot.done' 2>/dev/null; then
         done_marker=1
         break

@@ -1468,6 +1468,12 @@ do_domain_join() {
     [[ -n "$REALM" && -n "$DOMAIN_SHORT" && -n "$DC_HOST" && -n "$AD_USER" && -n "${AD_PASS:-}" ]] \
         || { log_join "missing parameters"; return 2; }
 
+    # smb.conf binds SMB to the domain NIC; --join-domain gets here without
+    # the menu having loaded the NIC roles.
+    load_roles
+    [[ -n "$DOMAIN_NIC_NAME" ]] \
+        || { log_join "ERROR: no domain NIC in ${ROLES_FILE}; assign NIC roles first"; return 2; }
+
     log_join "starting join: realm=$REALM short=$DOMAIN_SHORT dc=$DC_HOST user=$AD_USER"
 
     if ! DC_IP=$(resolve_dc_ip "$DC_HOST"); then
