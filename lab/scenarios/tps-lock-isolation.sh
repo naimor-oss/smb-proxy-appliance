@@ -42,17 +42,26 @@ devices=/tmp/smbproxy-lock-devices.out
 status=/tmp/smbproxy-lock-status.json
 rm -f "\$result" "\$snapshot" "\$devices" "\$status"
 
-smbtorture '//$SC_FRONT_HOST/$SC_SHARE_NAME' smb2.lock.overlap \
-    --use-kerberos=required --use-krb5-ccache="\$ccache" \
-    --user='$SC_ADMIN' --no-pass \
-    --option='client min protocol=SMB3' \
-    --option='client max protocol=SMB3' >"\$result" 2>&1 &
-torture_pid=\$!
+# Two sessions that keep the same probe file open: the session and identity
+# proofs watch these. smbtorture's two-connection tests finish in well under a
+# second, too fast to observe reliably.
+probe=smbproxy-lock-probe.txt
+smb() {
+    smbclient '//$SC_FRONT_HOST/$SC_SHARE_NAME' --use-kerberos=required \
+        --use-krb5-ccache="\$ccache" -m SMB3 "\$@"
+}
+smb -c "put /etc/hostname \$probe" >/dev/null 2>&1
+holders=()
+for _ in 1 2; do
+    { echo "open \$probe"; sleep 12; echo quit; } | smb >/dev/null 2>&1 &
+    holders+=(\$!)
+done
 
 seen=0
 identity_ok=0
-for _ in \$(seq 1 200); do
+for _ in \$(seq 1 100); do
     count=0
+    : > "\$snapshot"; : > "\$devices"
     shopt -s nullglob
     for state in /run/smbproxy/session-state/*.env; do
         share=\$(sed -n 's/^SHARE_NAME="\\(.*\\)"\$/\\1/p' "\$state" | head -1)
@@ -65,52 +74,50 @@ for _ in \$(seq 1 200); do
         fi
     done
     shopt -u nullglob
-    if (( count >= 2 )); then
-        seen=\$count
-        if smbstatus -B --json > "\$status" 2>/dev/null && python3 - "\$status" <<'PY'
+    (( count > seen )) && seen=\$count
+    # Normalised identity: Samba keeps one share-mode record per file id, so
+    # the probe file shows as one entry with opens from two smbd processes
+    # (two client sessions, each on its own CIFS mount).
+    if (( count >= 2 )) && smbstatus -L --json > "\$status" 2>/dev/null && python3 - "\$status" "\$probe" <<'PY'
 import json
 import sys
 
 with open(sys.argv[1], encoding="utf-8") as stream:
     status = json.load(stream)
-
-by_name = {}
 for opened in status.get("open_files", {}).values():
-    service_path = str(opened.get("service_path", ""))
-    if not service_path.startswith("/run/smbproxy/sessions/"):
+    if opened.get("filename") != sys.argv[2]:
         continue
-    name = str(opened.get("filename", ""))
-    fileid = opened.get("fileid", {})
-    identity = (fileid.get("devid"), fileid.get("inode"), fileid.get("extid"))
-    by_name.setdefault(name, []).append((service_path, identity))
-
-for name, rows in by_name.items():
-    paths = {path for path, _identity in rows}
-    identities = {identity for _path, identity in rows}
-    if len(paths) >= 2 and len(identities) == 1:
-        print(f"NORMALIZED_SAMBA_FILE_ID={name}:{next(iter(identities))}")
+    if not str(opened.get("service_path", "")).startswith("/run/smbproxy/sessions/"):
+        continue
+    pids = {key.split("/")[0] for key in opened.get("opens", {})}
+    if len(pids) >= 2:
+        fileid = opened.get("fileid", {})
+        print(f"NORMALIZED_SAMBA_FILE_ID={sys.argv[2]}:{fileid.get('devid')}:{fileid.get('inode')} opens from {len(pids)} sessions")
         raise SystemExit(0)
 raise SystemExit(1)
 PY
-        then
-            identity_ok=1
-            break
-        fi
+    then
+        identity_ok=1
+        break
     fi
-    kill -0 "\$torture_pid" 2>/dev/null || break
-    sleep 0.1
+    alive=0
+    for h in "\${holders[@]}"; do kill -0 "\$h" 2>/dev/null && alive=1; done
+    (( alive )) || break
+    sleep 0.2
 done
+wait "\${holders[@]}" || true
+smb -c "del \$probe" >/dev/null 2>&1 || true
 
-wait "\$torture_pid"
-cat "\$result"
+# The identity is the ticket from kinit above. --user/--no-pass would make
+# smbtorture use an empty password instead (NT_STATUS_INVALID_PARAMETER).
 for test in \
+    smb2.lock.overlap \
     smb2.sharemode.sharemode-access \
     smb2.rename.no_share_delete_but_delete_access; do
     smbtorture '//$SC_FRONT_HOST/$SC_SHARE_NAME' "\$test" \
         --use-kerberos=required --use-krb5-ccache="\$ccache" \
-        --user='$SC_ADMIN' --no-pass \
         --option='client min protocol=SMB3' \
-        --option='client max protocol=SMB3'
+        --option='client max protocol=SMB3' || true
 done
 echo "MAX_CONCURRENT_SESSION_MOUNTS=\$seen"
 echo "SAMBA_FILE_IDENTITY_NORMALIZED=\$identity_ok"
@@ -139,12 +146,12 @@ REMOTE
         say "SMB3 overlap test or upstream-session proof failed"
         rc=1
     fi
-    grep -qF 'smb2.lock.overlap' <<< "$out" \
-        || { say "smbtorture output did not identify the overlap test"; rc=1; }
-    grep -qF 'smb2.sharemode.sharemode-access' <<< "$out" \
-        || { say "smbtorture output did not identify the share-mode test"; rc=1; }
-    grep -qF 'smb2.rename.no_share_delete_but_delete_access' <<< "$out" \
-        || { say "smbtorture output did not identify the deny-delete rename test"; rc=1; }
+    grep -qx 'success: overlap' <<< "$out" \
+        || { say "smbtorture smb2.lock.overlap did not succeed"; rc=1; }
+    grep -qx 'success: sharemode-access' <<< "$out" \
+        || { say "smbtorture smb2.sharemode.sharemode-access did not succeed"; rc=1; }
+    grep -qx 'success: no_share_delete_but_delete_access' <<< "$out" \
+        || { say "smbtorture smb2.rename.no_share_delete_but_delete_access did not succeed"; rc=1; }
     grep -qE 'MAX_CONCURRENT_SESSION_MOUNTS=[2-9][0-9]*' <<< "$out" \
         || { say "two concurrent SMB1 sessions were not observed"; rc=1; }
     grep -qE 'DISTINCT_UPSTREAM_SESSION_KEYS=[2-9][0-9]*' <<< "$out" \
