@@ -42,7 +42,7 @@ devices=/tmp/smbproxy-lock-devices.out
 status=/tmp/smbproxy-lock-status.json
 rm -f "\$result" "\$snapshot" "\$devices" "\$status"
 
-smbtorture '//$LAB_VM_IP/$SC_SHARE_NAME' smb2.lock.overlap \
+smbtorture '//$SC_FRONT_HOST/$SC_SHARE_NAME' smb2.lock.overlap \
     --use-kerberos=required --use-krb5-ccache="\$ccache" \
     --user='$SC_ADMIN' --no-pass \
     --option='client min protocol=SMB3' \
@@ -56,7 +56,7 @@ for _ in \$(seq 1 200); do
     shopt -s nullglob
     for state in /run/smbproxy/session-state/*.env; do
         share=\$(sed -n 's/^SHARE_NAME="\\(.*\\)"\$/\\1/p' "\$state" | head -1)
-        [[ "\$share" == '$SC_SHARE_NAME' ]] || continue
+        [[ "\$share" == '$SC_SHARE_NAME' || "\$share" == '$(kv_escape "$SC_SHARE_NAME")' ]] || continue
         mountpoint=\$(sed -n 's/^MOUNTPOINT="\\(.*\\)"\$/\\1/p' "\$state" | head -1)
         if awk -v mp="\$mountpoint" '\$2==mp && \$3=="cifs" {found=1} END {exit !found}' /proc/mounts; then
             count=\$((count + 1))
@@ -106,7 +106,7 @@ cat "\$result"
 for test in \
     smb2.sharemode.sharemode-access \
     smb2.rename.no_share_delete_but_delete_access; do
-    smbtorture '//$LAB_VM_IP/$SC_SHARE_NAME' "\$test" \
+    smbtorture '//$SC_FRONT_HOST/$SC_SHARE_NAME' "\$test" \
         --use-kerberos=required --use-krb5-ccache="\$ccache" \
         --user='$SC_ADMIN' --no-pass \
         --option='client min protocol=SMB3' \
