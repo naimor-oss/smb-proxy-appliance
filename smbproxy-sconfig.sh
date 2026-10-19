@@ -537,7 +537,7 @@ resolve_locking_kind() {
 # version, caching, locking, and encryption options diverge.
 backend_mount_opts() {
     local profile="$1"
-    local common="credentials=${CREDS},nosharesock,serverino,uid=${FU_UID},gid=${FU_GID},file_mode=0660,dir_mode=0770,_netdev,x-systemd.automount,x-systemd.requires=network-online.target"
+    local common="credentials=${CREDS},nosharesock,serverino,uid=${FU_UID},gid=${FU_GID},file_mode=0770,dir_mode=0770,_netdev,x-systemd.automount,x-systemd.requires=network-online.target"
     case "$profile" in
         modern)
             # cache=strict is the kernel default for cifs and is correct
@@ -604,7 +604,7 @@ backend_mount_opts() {
             # `hard` is explicit because the deployed Debian CIFS client
             # otherwise reports a soft mount; TPS writes must wait rather
             # than turn a transient backend outage into an I/O error.
-            echo "credentials=${CREDS},vers=1.0,cache=none,hard,nosharesock,serverino,uid=${FU_UID},gid=${FU_GID},file_mode=0660,dir_mode=0770"
+            echo "credentials=${CREDS},vers=1.0,cache=none,hard,nosharesock,serverino,uid=${FU_UID},gid=${FU_GID},file_mode=0770,dir_mode=0770"
             ;;
     esac
 }
