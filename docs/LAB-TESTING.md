@@ -431,17 +431,24 @@ design with a force-user that the appliance refuses.
 
 Purpose: release gate for the hard legacy-locking guarantee. It runs Samba's
 SMB2 byte-range, share-mode, and rename/delete-exclusion torture cases over
-independent downstream sessions.
+independent downstream sessions, and requires `success:` for each
+(`smb2.lock.overlap`, `smb2.sharemode.sharemode-access`,
+`smb2.rename.no_share_delete_but_delete_access`). They authenticate with the
+Kerberos ticket from the scenario's `kinit` only: `--user`/`--no-pass` would
+override it with an empty password.
 
-While those sessions are alive, the scenario also requires:
+Those cases finish in well under a second, too fast to observe. So two
+`smbclient` sessions also hold one probe file open for a few seconds, and
+while they are alive the scenario requires:
 
 - Two distinct VFS lifecycle keys built from the serving PID, authenticated
   session wire ID, and tree wire ID.
 - Two concurrent CIFS mounts under `/run/smbproxy/sessions/`.
 - Distinct filesystem device IDs for those mounts, proving distinct upstream
   CIFS superblocks/transports.
-- One normalized Samba file ID for the same test file across those mounts,
-  proving Samba's frontend share modes and lock database remain coherent.
+- One normalized Samba file ID for the probe file across those mounts: Samba
+  shows a single open-file record with opens from two `smbd` processes,
+  proving its frontend share modes and lock database remain coherent.
 - `vers=1.0`, `cache=none`, and `nosharesock` on the live mounts, with no
   `nobrl`.
 

@@ -250,8 +250,12 @@ echo "== backend_mount_opts =="
 CREDS="/etc/samba/.creds-X"
 FU_UID="1002"
 FU_GID="1002"
-COMMON="credentials=/etc/samba/.creds-X,nosharesock,serverino,uid=1002,gid=1002,file_mode=0660,dir_mode=0770,_netdev,x-systemd.automount,x-systemd.requires=network-online.target"
-LEGACY="credentials=/etc/samba/.creds-X,vers=1.0,cache=none,hard,nosharesock,serverino,uid=1002,gid=1002,file_mode=0660,dir_mode=0770"
+# file_mode keeps the owner's x bit: Samba maps rwx to full control (acl map
+# full control), so without it every open asking for FILE_EXECUTE,
+# FILE_DELETE_CHILD or WRITE_OWNER (any SEC_RIGHTS_FILE_ALL open of an
+# existing file, and every program run from the share) gets ACCESS_DENIED.
+COMMON="credentials=/etc/samba/.creds-X,nosharesock,serverino,uid=1002,gid=1002,file_mode=0770,dir_mode=0770,_netdev,x-systemd.automount,x-systemd.requires=network-online.target"
+LEGACY="credentials=/etc/samba/.creds-X,vers=1.0,cache=none,hard,nosharesock,serverino,uid=1002,gid=1002,file_mode=0770,dir_mode=0770"
 
 check_eq "legacy: exact dynamic-session options" \
     "$LEGACY" \

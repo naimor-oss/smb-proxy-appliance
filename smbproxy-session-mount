@@ -166,7 +166,7 @@ connect_session() {
     fi
 
     local options
-    options="credentials=${CREDS},vers=1.0,cache=none,hard,nosharesock,serverino,uid=${FU_UID},gid=${FU_GID},file_mode=0660,dir_mode=0770"
+    options="credentials=${CREDS},vers=1.0,cache=none,hard,nosharesock,serverino,uid=${FU_UID},gid=${FU_GID},file_mode=0770,dir_mode=0770"
     if ! "$MOUNT_BIN" -t cifs "//${BACKEND_IP}/${SHARE_NAME}" "$MOUNTPOINT" -o "$options"; then
         rmdir "$MOUNTPOINT" 2>/dev/null || true
         die "CIFS session mount failed: $MOUNTPOINT"
