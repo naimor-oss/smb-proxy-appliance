@@ -220,7 +220,7 @@ an interrupted change fails closed; the share status shows `WITHDRAWN`.
 Re-running the removal or the change clears it. Only backend, identity,
 credential, profile, offline-mode, or locking changes drain; an AD-group
 change does not. `tests/root/share-lifecycle.sh` (root, disposable
-container; CI runs it) reproduces the old removal race and proves the
+container; `dev-commons/bin/root-tests.sh` runs it) reproduces the old removal race and proves the
 new ordering.
 
 ## Offline behavior
@@ -382,14 +382,9 @@ bash tests/session-mount.sh
 bash tests/vfs-contract.sh
 bash tests/vfs-version-check.sh
 bash tests/samba-hold.sh
-# root-only, in a throwaway container (CI runs it):
-# (mounts the parent so ../appliance-core supplies kvstate.sh)
-docker run --rm -v "$PWD/..":/ws:ro -e DISPOSABLE_ROOT_TEST=1 \
-    debian:trixie bash /ws/smb-proxy-appliance/tests/root/share-lifecycle.sh
-docker run --rm -v "$PWD/..":/ws:ro -e DISPOSABLE_ROOT_TEST=1 \
-    debian:trixie bash /ws/smb-proxy-appliance/tests/root/config-transaction.sh
-docker run --rm -v "$PWD/..":/ws:ro -e DISPOSABLE_ROOT_TEST=1 \
-    debian:trixie bash /ws/smb-proxy-appliance/tests/root/update-bundle.sh
+# root-only, in throwaway containers (needs Docker; GitHub doesn't run it;
+# mounts the parent so ../appliance-core supplies kvstate.sh):
+../dev-commons/bin/root-tests.sh smb-proxy-appliance
 ```
 
 ## Development Rules
